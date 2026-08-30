@@ -50,8 +50,10 @@ import { WakeStampPool } from './wakestamps.js';
 import { shallowWaterSediment, sedimentPlumeRadius } from './sediment.js';
 import { bindPageLifecycle } from './pagelifecycle.js';
 import { CHASE_CAMERA_SAMPLES, chaseCameraBoomLimit, chaseCameraBoomStep } from './chasecamera.js';
-import { SkyEnvironmentMap } from './environmentmap.js';
+import { environmentCaptureAllowed, SkyEnvironmentMap } from './environmentmap.js';
 import { sampleWakeFields } from './wakefield.js';
+import { warmDeferredShaders } from './shaderwarmup.js';
+import { GAMEPAD_BUTTON, STANDARD_GAMEPAD_BUTTONS, StandardGamepadInput, gamepadActionCode, gamepadBoatInput } from './gamepad.js';
 
 const app = document.getElementById('app');
 const loadingProgress = (message, value) => window.__loadingScreen?.progress?.(message, value);
@@ -90,7 +92,7 @@ async function init() {
   const startupTiming = {
     terrainPrimedMs: 0, landmarksReadyMs: 0, vegetationReadyMs: 0, renderTargetsReadyMs: 0,
     livingWorldReadyMs: 0, directorsReadyMs: 0, environmentMapMs: 0, environmentMapReadyMs: 0,
-    loopReadyMs: 0, warmupReadyMs: 0, terrainWaitMs: 0, localTerrainReadyMs: 0, titleReadyMs: 0,
+    loopReadyMs: 0, warmupReadyMs: 0, deferredShaderWarmupMs: 0, terrainWaitMs: 0, localTerrainReadyMs: 0, titleReadyMs: 0,
   };
   let terrainReadinessState = { ready: false, timedOut: false, visibleAtStart: false, settled: false, queued: 0, finalizing: 0, inFlight: 0, visible: 0, building: '' };
   const markStartup = key => { startupTiming[key] = performance.now() - startupStartedAt; };
@@ -102,6 +104,7 @@ async function init() {
     idleTimeoutMs: startup.modelIdleTimeoutMs,
     pressureMaxWaitMs: startup.modelPressureMaxWaitMs,
     disabled: startup.disabledModels,
+    prepare: (root) => typeof renderer.compileAsync === 'function' ? renderer.compileAsync(root, camera, scene) : renderer.compile(root, camera, scene),
   });
   // ---- sky & lighting ----
   const sky = new Sky(SUN_DIR, renderProfile);
@@ -403,16 +406,25 @@ async function init() {
       mapMarkers: game.mapMarkerPool.stats(game.mapMarkers.length),
     },
   }) : null;
-  window.__dbg = { renderer, camera, scene, terrain, phys, water, pipeline, sky, veg, boat, audio, spray, plume, game, tricks, gators, skiff, waders, manatees, dolphins, fishing, anchor, nocturnal, marshFire, world, worldMap, life, birds, environment, environmentReflections, currents, regions, encounters, incidents, story, contracts: story.contracts, aftermath, discoveries, navigationAids, directedNavigationLights, outboardMix, condition, ecology, reputation, law, hazards, radio, startup, startupMetrics: () => ({ ...startupTiming, terrainPrime, terrainRetarget, terrainFocus: { ...terrainFocus }, terrainReadiness: { ...terrainReadinessState }, environmentMap: environmentReflections.resourceStats() }), debugSceneGraphStats, debugResourceSnapshot, mode: 'full', renderQuality: () => ({
+  let deferredShaderWarmup = { objects: 0, materials: 0, variants: 0, completed: 0, failures: 0, durationMs: 0 };
+  let controller = null;
+  window.__dbg = { renderer, camera, scene, terrain, phys, water, pipeline, sky, veg, boat, audio, spray, plume, game, tricks, gators, skiff, waders, manatees, dolphins, fishing, anchor, nocturnal, marshFire, world, worldMap, life, birds, environment, environmentReflections, currents, regions, encounters, incidents, story, contracts: story.contracts, aftermath, discoveries, navigationAids, directedNavigationLights, outboardMix, condition, ecology, reputation, law, hazards, radio, startup, modelStats: modelLoadingStats, startupMetrics: () => ({ ...startupTiming, terrainPrime, terrainRetarget, terrainFocus: { ...terrainFocus }, terrainReadiness: { ...terrainReadinessState }, environmentMap: environmentReflections.resourceStats(), deferredShaderWarmup: { ...deferredShaderWarmup } }), debugSceneGraphStats, debugResourceSnapshot, mode: 'full', renderQuality: () => ({
     profile: renderProfile.id, preference: qualityPreference, gpuRenderer, pixelRatio: renderer.getPixelRatio(), maxDrawPixels: renderProfile.maxDrawPixels, cinematicMaxDrawPixels: MAX_DRAW_PIXELS,
     hibernated: pageHibernated, adaptive: qualityController.snapshot(), ...pipeline.memoryStats(), reflection: water.memoryStats(), estimatedShadowBytes: sun.shadow.map ? renderProfile.shadowMapSize ** 2 * 4 : 0,
-  }) };
+  }), controllerStats: () => controller?.snapshot?.() || { connected: false } };
 
   // ---- input ----
   const keys = {};
   let started = false;
+  let dispatchingControllerKey = false, activeInputMode = 'keyboard';
+  const setInputMode = mode => {
+    const next = mode === 'gamepad' ? 'gamepad' : 'keyboard';
+    if (next === activeInputMode && document.documentElement.dataset.input === next) return;
+    activeInputMode = next; document.documentElement.dataset.input = next;
+  };
+  setInputMode('keyboard');
   const reflectionState = { hour: environment.hour, sunAltitude: environment.sunDir.y, storm: environment.values.storm, cover: environment.values.cloud };
-  let reflectionCheckT = 2, reflectionIdleJob = 0, reflectionIdleKind = '';
+  let reflectionIdleJob = 0, reflectionIdleKind = '';
   const syncReflectionState = () => {
     reflectionState.hour = environment.hour; reflectionState.sunAltitude = environment.sunDir.y;
     reflectionState.storm = environment.values.storm; reflectionState.cover = environment.values.cloud;
@@ -425,9 +437,9 @@ async function init() {
   };
   const scheduleEnvironmentReflections = (reason = 'atmosphere') => {
     if (reflectionIdleJob) return false;
-    const run = deadline => {
+    const run = () => {
       reflectionIdleJob = 0; reflectionIdleKind = '';
-      if (document.hidden || pageHibernated || (!game.paused && deadline && !deadline.didTimeout && deadline.timeRemaining() < 4)) return false;
+      if (!environmentCaptureAllowed({ started, hidden: document.hidden, hibernated: pageHibernated })) return false;
       if (!environmentReflections.needsRefresh(syncReflectionState())) return false;
       return captureEnvironmentReflections(reason);
     };
@@ -446,6 +458,7 @@ async function init() {
   };
   let encounterStressRunning = false;
   window.addEventListener('keydown', e => {
+    if (!dispatchingControllerKey) setInputMode('keyboard');
     keys[e.code] = true;
     if (import.meta.env.DEV && e.code === 'F9' && e.shiftKey && !e.repeat) {
       e.preventDefault(); story.resetDebug(); if (encounters.active) encounters.finish(false, true); encounters.next = 999; return;
@@ -521,15 +534,16 @@ async function init() {
   window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
   window.addEventListener('keyup', e => { keys[e.code] = false; });
   let dragging = false, camYaw = 0, camPitch = 0, lastX = 0, lastY = 0, idle = 0, camDist = 8.2;
-  renderer.domElement.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+  renderer.domElement.addEventListener('mousedown', e => { setInputMode('keyboard'); dragging = true; lastX = e.clientX; lastY = e.clientY; });
   window.addEventListener('mouseup', () => { dragging = false; idle = 0; });
   window.addEventListener('mousemove', e => {
     if (!dragging) return;
+    setInputMode('keyboard');
     camYaw -= (e.clientX - lastX) * 0.005; camPitch += (e.clientY - lastY) * 0.003;
     camPitch = Math.max(-0.25, Math.min(0.6, camPitch));
     lastX = e.clientX; lastY = e.clientY;
   });
-  window.addEventListener('wheel', e => { camDist = Math.max(5, Math.min(20, camDist + e.deltaY * 0.01)); });
+  window.addEventListener('wheel', e => { setInputMode('keyboard'); camDist = Math.max(5, Math.min(20, camDist + e.deltaY * 0.01)); });
   let resizeTimer = 0; const drawingSize = new THREE.Vector2();
   const resize = () => {
     if (pageHibernated) return false;
@@ -543,7 +557,6 @@ async function init() {
   };
   let renderFrameNo = 0;
   const applyRenderQuality = profile => {
-    const oldEnvironmentSize = environmentReflections.targetSize;
     renderProfile = profile; pipeline.setQuality(profile); water.setQuality(profile); sky.setQuality(profile); condition.setQuality(profile); minimap.setQuality(profile); nocturnal.setQuality(profile); environment.setQuality(profile); environmentReflections.setProfile(profile);
     if (sun.shadow.mapSize.x !== profile.shadowMapSize) {
       sun.shadow.mapSize.set(profile.shadowMapSize, profile.shadowMapSize);
@@ -552,10 +565,9 @@ async function init() {
     }
     if (environmentReflections.targetSize !== profile.environmentMapSize) {
       cancelEnvironmentReflectionJob();
-      // A downgrade releases the larger target before doing the cheaper convolution. Upgrades at the title are safe
-      // to apply immediately; an in-play promotion waits for browser idle time.
-      if (profile.environmentMapSize < oldEnvironmentSize || game.paused) captureEnvironmentReflections('quality');
-      else scheduleEnvironmentReflections('quality');
+      // Keep the current map through active play. Rebuilding even a smaller PMREM is synchronous GPU work and can
+      // turn one missed frame into a multi-second quality-change cascade.
+      if (!started) scheduleEnvironmentReflections('quality');
     }
     renderFrameNo = 0; resize();
   };
@@ -599,7 +611,7 @@ async function init() {
     return profile;
   };
   const beginGame = (jobs = false) => {
-    audio.start(); started = true; game.playing = true; game.paused = false;
+    audio.start(); void audio.resume(); started = true; game.playing = true; game.paused = false;
     startEl.classList.add('hidden'); startEl.setAttribute('aria-hidden', 'true');
     scheduleDeferredModels(startup.modelReleaseDelayMs, true);
     if (jobs) game.openMenu('jobs');
@@ -611,6 +623,7 @@ async function init() {
     for (const key in keys) keys[key] = false;
     if (persist) game.persist();
     renderTitle(); startEl.classList.remove('hidden'); startEl.setAttribute('aria-hidden', 'false');
+    if (environmentReflections.needsRefresh(syncReflectionState())) scheduleEnvironmentReflections('title');
     if (startup.releaseModelsAtTitle) scheduleDeferredModels(startup.titleModelReleaseDelayMs);
     requestAnimationFrame(() => titlePrimary.focus({ preventScroll: true }));
   };
@@ -640,6 +653,46 @@ async function init() {
   };
   const fwd2 = new THREE.Vector2(), rgt2 = new THREE.Vector2(), currentFlow = new THREE.Vector2(), skiffForward = new THREE.Vector2();
   const input = { throttle: 0, steer: 0, pitch: 0 };
+  const controllerBoatInput = { throttle: 0, steer: 0, pitch: 0 };
+  const controllerActionContext = { overlay: false, fishing: false, result: false };
+  const controllerKeyCodes = new Array(STANDARD_GAMEPAD_BUTTONS).fill('');
+  const emitControllerKey = (type, code) => {
+    if (!code) return false;
+    dispatchingControllerKey = true;
+    try { return window.dispatchEvent(new KeyboardEvent(type, { code, bubbles: true, cancelable: true, repeat: false })); }
+    finally { dispatchingControllerKey = false; }
+  };
+  const moveTitleFocus = direction => {
+    const options = Array.from(startEl.querySelectorAll('[data-title-action]')).filter(button => !button.hidden);
+    if (!options.length) return false;
+    const current = options.indexOf(document.activeElement), next = current < 0 ? 0 : (current + options.length + direction) % options.length;
+    options[next].focus({ preventScroll: true }); return true;
+  };
+  controller = new StandardGamepadInput({
+    onUse: () => setInputMode('gamepad'),
+    onDisconnect: () => { if (activeInputMode === 'gamepad') setInputMode('keyboard'); },
+    onButtonDown: index => {
+      controllerKeyCodes[index] = '';
+      if (!started && !startEl.classList.contains('hidden')) {
+        if (index === GAMEPAD_BUTTON.SOUTH) (document.activeElement?.matches?.('[data-title-action]') ? document.activeElement : titlePrimary).click();
+        else if (index === GAMEPAD_BUTTON.DPAD_UP || index === GAMEPAD_BUTTON.DPAD_LEFT) moveTitleFocus(-1);
+        else if (index === GAMEPAD_BUTTON.DPAD_DOWN || index === GAMEPAD_BUTTON.DPAD_RIGHT) moveTitleFocus(1);
+        return;
+      }
+      if (index === GAMEPAD_BUTTON.RIGHT_STICK && !game.menuOpen && !game.mapOpen && !game.resultOpen) {
+        camYaw = 0; camPitch = 0; idle = 0; return;
+      }
+      controllerActionContext.overlay = game.menuOpen || game.mapOpen || game.resultOpen;
+      controllerActionContext.fishing = fishing.blocking();
+      controllerActionContext.result = game.resultOpen;
+      const code = gamepadActionCode(index, controllerActionContext);
+      controllerKeyCodes[index] = code; emitControllerKey('keydown', code);
+    },
+    onButtonUp: index => {
+      const code = controllerKeyCodes[index] || '';
+      controllerKeyCodes[index] = ''; emitControllerKey('keyup', code);
+    },
+  });
   const boatWetnessConditions = { dt: 0, rain: 0, spray: 0, splash: 0, wind: 0, speed: 0, daylight: 0, windScreen: 0 };
   const sedimentConditions = { depth: 0, speed: 0, rpm: 0, throttle: 0, wet: 0, murk: 0 };
   const clock = new THREE.Timer(); clock.connect(document);
@@ -701,6 +754,8 @@ async function init() {
     clock.update();
     const frameDelta = clock.getDelta();
     const dtRaw = Math.min(frameDelta, 0.05);
+    const controllerState = controller.poll();
+    gamepadBoatInput(controllerState, controllerBoatInput);
     reportModelFramePressure(frameDelta, started && !game.paused && !document.hidden);
     const qualityChange = qualityController.observe(frameDelta, started && !game.paused && !document.hidden);
     if (qualityChange) {
@@ -719,6 +774,11 @@ async function init() {
       if (keys.KeyA || keys.ArrowLeft) input.steer += 1;
       if (keys.KeyD || keys.ArrowRight) input.steer -= 1;
       input.pitch = ((keys.KeyS || keys.ArrowDown) ? 1 : 0) - ((keys.ShiftLeft || keys.ShiftRight) ? 1 : 0); // in the air: S leans back (nose up), Shift leans forward
+      if (controllerState.connected) {
+        if (!input.throttle) input.throttle = controllerBoatInput.throttle;
+        if (!input.steer) input.steer = controllerBoatInput.steer;
+        if (!input.pitch) input.pitch = controllerBoatInput.pitch;
+      }
     }
 
     if (started && !game.paused) {
@@ -743,6 +803,7 @@ async function init() {
       if (phys.wet > 0.25) { audio.splash(Math.min(2.4, phys.impact / 3), q === 'stuffed' || q === 'wipeout'); landingSplash(phys.impact, q); }
       else audio.thud(Math.min(1.5, phys.impact / 4));
       fovKick = Math.min(14, fovKick + phys.impact * 1.1);
+      controller.rumble(Math.min(1, 0.22 + phys.impact * 0.075), Math.min(0.82, 0.12 + phys.impact * 0.05), Math.min(280, 75 + phys.impact * 14));
       if (q === 'wipeout') { slowT = 1.0; slowK = 0.32; }
       else if (q === 'stuffed') { slowT = 0.7; slowK = 0.4; }
       else if (q === 'clean' && phys.airTime > 1.2) { slowT = 0.28; slowK = 0.5; }
@@ -753,7 +814,7 @@ async function init() {
     }
     if (phys.hit > 3) {
       audio.thud(Math.min(1.5, phys.hit / 6)); fovKick = Math.min(14, fovKick + phys.hit * 0.6);
-      if (phys.hit > 6 && slowT <= 0) { slowT = 0.22; slowK = 0.35; } // hit-stop on a real crash
+      controller.rumble(Math.min(1, 0.28 + phys.hit * 0.065), Math.min(0.85, 0.18 + phys.hit * 0.045), Math.min(260, 80 + phys.hit * 12));
       // bark and leaf litter knocked loose, plus the water thrown up by the hull slewing sideways
       const nx = phys.hitNormal.x, nz = phys.hitNormal.y; const n = Math.floor(10 + phys.hit * 4);
       for (let i = 0; i < n; i++) plume.emit(phys.pos.x - nx * 1.6 + jitter() * 1.2, 0.3 + Math.random() * 1.2, phys.pos.y - nz * 1.6 + jitter() * 1.2, nx * (1 + Math.random() * 2) + jitter() * 2, 0.5 + Math.random() * 2, nz * (1 + Math.random() * 2) + jitter() * 2, 0.2 + Math.random() * 0.3, 0.9, 0.5 + Math.random() * 0.4, 0.28);
@@ -772,6 +833,12 @@ async function init() {
     fishing.update(dtRaw, time, started && !game.paused);
 
     // camera
+    const controllerLooking = Math.abs(controllerState.lookX) > 0.001 || Math.abs(controllerState.lookY) > 0.001;
+    if (controllerLooking && started && !game.paused && !game.menuOpen && !game.mapOpen && !game.resultOpen) {
+      camYaw -= controllerState.lookX * dtRaw * 2.2;
+      camPitch += controllerState.lookY * dtRaw * 1.45;
+      camPitch = Math.max(-0.25, Math.min(0.6, camPitch)); idle = 0;
+    }
     if (!dragging) { idle += dt; if (idle > 2.5) { camYaw *= Math.exp(-dt * 1.2); camPitch *= Math.exp(-dt * 1.2); } }
     const yaw = phys.heading + camYaw;
     camBack.set(Math.sin(yaw), 0, Math.cos(yaw));
@@ -837,11 +904,6 @@ async function init() {
 
     // world updates
     sky.update(time, camera.position);
-    reflectionCheckT -= dtRaw;
-    if (reflectionCheckT <= 0) {
-      reflectionCheckT = 2;
-      if (frameDelta < 1 / 28 && environmentReflections.needsRefresh(syncReflectionState())) scheduleEnvironmentReflections();
-    }
     terrain.update(time, camera.position);
     veg.update(time, environment.lightDir, wind);
     birds.update(time, camera.position, dt);
@@ -972,7 +1034,9 @@ async function init() {
   const hibernatePage = () => {
     if (pageHibernated) return false;
     const before = attachmentBytes(), canvasBefore = minimap.memoryStats().estimatedBackingBytes + worldMap.memoryStats().estimatedBackingBytes; pageHibernated = true; renderer.setAnimationLoop(null);
-    cancelEnvironmentReflectionJob(); environmentReflections.dispose();
+    // Keep the compact static PMREM across backgrounding. Rebuilding it on return is synchronous and caused the
+    // first resumed frame to stall; the much larger post, water, shadow and chart attachments are still released.
+    cancelEnvironmentReflectionJob();
     pipeline.hibernate(); water.hibernate();
     minimap.releaseTiles(); worldMap.hibernate();
     if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; water.uniforms.shadowOn.value = 0; }
@@ -983,7 +1047,7 @@ async function init() {
   };
   const resumePage = () => {
     if (!pageHibernated || document.hidden) return false;
-    pageHibernated = false; pipeline.resume(); water.resume(); resize(); worldMap.resume(); clock.reset(); renderFrameNo = 0; void audio.resume(); renderer.setAnimationLoop(frame); scheduleEnvironmentReflections('resume');
+    pageHibernated = false; pipeline.resume(); water.resume(); resize(); worldMap.resume(); clock.reset(); renderFrameNo = 0; void audio.resume(); renderer.setAnimationLoop(frame);
     pageLifecycle.hibernated = false; pageLifecycle.resumedAt = Date.now();
     return true;
   };
@@ -993,6 +1057,12 @@ async function init() {
   };
   // Cinematic machines absorb the full shader/model warm-up behind the loading card. Lower profiles render the real
   // dock scene only and open as soon as local terrain is visible; distant terrain and optional models keep streaming.
+  // Draw the exact first-impact and waypoint paths through the real post pipeline once. A compile-only pass uses the
+  // default framebuffer and cannot cover every render-target variant that the first live spray or marker activates.
+  spray.emit(startX, water.level + 0.2, startZ, 0, 0, 0, 0.02, 8, 0.01);
+  plume.emit(startX, water.level + 0.2, startZ, 0, 0, 0, 0.02, 0, 8, 0.01);
+  game.beacon.set(startX, water.level, startZ, 0xf07a2e, true);
+  game.beacon2.set(startX + 2, water.level, startZ, 0xf3ede0, true);
   let warm = null;
   loadingProgress(startup.warmShaders ? 'Warming the storm light' : 'Checking the channel', 0.82);
   if (startup.warmShaders) {
@@ -1041,6 +1111,13 @@ async function init() {
     } else setTimeout(poll, 100);
   }; poll(); });
   await Promise.all([startup.blockingModels.length ? preload(startup.blockingModels) : Promise.resolve(), terrainReady]);
+  // Compile the small set of retained custom effects while the loading card is still covering the canvas. This
+  // includes zero-count collision spray/plume buffers and hidden mission, fire and pursuit visuals, without walking
+  // or retaining shader variants for the complete streamed map.
+  loadingProgress('Checking the emergency gear', 0.93);
+  deferredShaderWarmup = await warmDeferredShaders(renderer, camera, [scene, water.scene, fxScene]);
+  startupTiming.deferredShaderWarmupMs = deferredShaderWarmup.durationMs;
+  spray.clear(); plume.clear(); game.beacon.hide(); game.beacon2.hide();
   loadingProgress('Pulling the boat off the trailer', 0.96);
   if (startup.compileDelayMs) await new Promise(r => setTimeout(r, startup.compileDelayMs));
   if (warm) {
