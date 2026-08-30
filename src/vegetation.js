@@ -1,7 +1,9 @@
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import * as TEX from './textures.js';
 import { mulberry32 } from './noise.js';
 import { HOME_X, HOME_Z } from './heightfield.js';
+import { registerWetMaterial } from './surfacewetness.js';
 
 const WIND_GLSL_V1 = `
 uniform float uTime; uniform vec3 uWind; // xz = direction, y = strength
@@ -94,11 +96,12 @@ function patchFoliage(mat, { crownNormals = false, pin = 'bottom', pinH = 1, amp
       ${hasCrown ? 'vec3 compactCrownCenter = iPosition + iCrown.xyz;' : ''}`)
       .replace('#include <begin_vertex>', `vec3 transformed = compactRotate(vec3(position) * iScale, iQuaternion) + iPosition;`);
     vs = vs.replace('#include <project_vertex>', `
-      vec3 wBase = ${hasCrown ? 'compactCrownCenter' : 'iPosition'};
+      vec3 localBase = ${hasCrown ? 'compactCrownCenter' : 'iPosition'};
+      vec3 wBase = (modelMatrix * vec4(localBase, 1.0)).xyz;
       float keep = 1.0 - smoothstep(uFade.x, uFade.y, distance(cameraPosition, wBase));
       vec4 mvPosition = vec4(iPosition + (transformed - iPosition) * keep, 1.0);
       float hFac = ${pin === 'bottom' ? 'uv.y' : pin === 'top' ? '(1.0 - uv.y)' : pin === 'y' ? `clamp(position.y / ${pinH.toFixed(3)}, 0.0, 1.0)` : (hasCrown ? 'clamp(mvPosition.y / max(compactCrownCenter.y, 1.0), 0.0, 1.0)' : '1.0')};
-      vec3 cardOrigin = iPosition;
+      vec3 cardOrigin = (modelMatrix * vec4(iPosition, 1.0)).xyz;
       float gW = gust(wBase);
       mvPosition.xyz += windOffset(wBase, hFac, ${amp.toFixed(3)}, gW) + (windFlutter(cardOrigin, ${(amp * 0.07).toFixed(3)}, gW) + windBranch(cardOrigin, hFac, ${(amp * 0.55).toFixed(3)}, gW)) * ${hasCrown ? '1.0' : (pin === 'top' ? '(1.0 - uv.y)' : pin === 'y' ? 'hFac' : 'uv.y')};
       ${hasCrown ? `
@@ -134,6 +137,11 @@ function makeDepthMat(map, alphaTest, opts) {
 
 function cardGeo() { return new THREE.PlaneGeometry(1, 1); }
 function frondGeo() { const g = new THREE.PlaneGeometry(1, 1); g.translate(0, 0.5, 0); return g; }
+export function crossedFoliageCardGeometry() {
+  const front = frondGeo(), side = frondGeo(); side.rotateY(Math.PI / 2);
+  const crossed = mergeGeometries([front, side], false); front.dispose(); side.dispose();
+  return crossed;
+}
 
 function trunkGeo() {
   const g = new THREE.CylinderGeometry(0.55, 1.0, 1, 10, 10, false);
@@ -153,7 +161,7 @@ function trunkGeo() {
 class Kind {
   constructor(geo, texture, opts, { color = 0xffffff, alphaTest = 0.5, shadow = true, small = false } = {}) {
     this.geo = geo; this.opts = opts; this.shadow = shadow; this.small = small;
-    this.mat = new THREE.MeshStandardMaterial({ map: texture, alphaTest, side: THREE.DoubleSide, roughness: 0.92, metalness: 0, color, alphaToCoverage: true });
+    this.mat = registerWetMaterial(new THREE.MeshStandardMaterial({ map: texture, alphaTest, side: THREE.DoubleSide, roughness: 0.92, metalness: 0, color, alphaToCoverage: true }));
     patchFoliage(this.mat, opts);
     this.depth = makeDepthMat(texture, alphaTest, opts);
   }
@@ -174,7 +182,7 @@ class Batch {
     if (this.crown) { this.crown = grow(this.crown, (n + 1) * 4); const k = n * 4; if (crown) { this.crown[k] = crown.x; this.crown[k + 1] = crown.y; this.crown[k + 2] = crown.z; this.crown[k + 3] = crown.w; } else { this.crown[k] = this.crown[k + 1] = this.crown[k + 2] = 0; this.crown[k + 3] = 1; } }
     this.n++;
   }
-  build(bounds) {
+  *buildStream(bounds, slice = 1024, originX = 0, originZ = 0) {
     if (!this.n) return null;
     const k = this.kind;
     const geo = new THREE.InstancedBufferGeometry();
@@ -187,15 +195,18 @@ class Batch {
 
     // Static foliage never needs a general 4x4 matrix. Store the exact same transform as position + a
     // normalized 16-bit quaternion + half-float scale. Colour and crown data are half floats as well.
-    // A crown card falls from 92 resident bytes to 40; every placement, tint and wind response stays intact.
-    const pos = new Float32Array(this.n * 3), quat = new Int16Array(this.n * 4);
+    // A crown card falls from 92 resident bytes to 34; every placement, tint and wind response stays intact.
+    const pos = new Uint16Array(this.n * 3), quat = new Int16Array(this.n * 4);
     const scale = new Uint16Array(this.n * 3), color = new Uint16Array(this.n * 3);
     const crown = k.opts.hasCrown ? new Uint16Array(this.n * 4) : null;
     const matrix = new THREE.Matrix4(), p = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
     for (let i = 0; i < this.n; i++) {
       const mi = i * 16, pi = i * 3, qi = i * 4;
       matrix.fromArray(this.m, mi).decompose(p, q, s);
-      pos[pi] = p.x; pos[pi + 1] = p.y; pos[pi + 2] = p.z;
+      // Every vegetation group is centred on its terrain chunk. Half-float local positions retain centimetre-scale
+      // placement in the physical near ring and sub-metre placement at the 1.6 km horizon tier, while avoiding a
+      // second 32-bit world-coordinate copy for every leaf card on both the CPU and GPU.
+      pos[pi] = THREE.DataUtils.toHalfFloat(p.x - originX); pos[pi + 1] = THREE.DataUtils.toHalfFloat(p.y); pos[pi + 2] = THREE.DataUtils.toHalfFloat(p.z - originZ);
       quat[qi] = Math.round(THREE.MathUtils.clamp(q.x, -1, 1) * 32767);
       quat[qi + 1] = Math.round(THREE.MathUtils.clamp(q.y, -1, 1) * 32767);
       quat[qi + 2] = Math.round(THREE.MathUtils.clamp(q.z, -1, 1) * 32767);
@@ -206,13 +217,14 @@ class Batch {
         crown[qi] = THREE.DataUtils.toHalfFloat(this.crown[qi] - p.x); crown[qi + 1] = THREE.DataUtils.toHalfFloat(this.crown[qi + 1] - p.y);
         crown[qi + 2] = THREE.DataUtils.toHalfFloat(this.crown[qi + 2] - p.z); crown[qi + 3] = THREE.DataUtils.toHalfFloat(this.crown[qi + 3]);
       }
+      if (i > 0 && i % slice === 0) yield;
     }
     const halfAttribute = (array, itemSize) => {
       const attribute = new THREE.Float16BufferAttribute(array, itemSize);
       attribute.isInstancedBufferAttribute = true; attribute.meshPerAttribute = 1;
       return attribute;
     };
-    geo.setAttribute('iPosition', new THREE.InstancedBufferAttribute(pos, 3));
+    geo.setAttribute('iPosition', halfAttribute(pos, 3));
     geo.setAttribute('iQuaternion', new THREE.InstancedBufferAttribute(quat, 4, true));
     geo.setAttribute('iScale', halfAttribute(scale, 3));
     geo.setAttribute('iColor', halfAttribute(color, 3));
@@ -228,14 +240,21 @@ class Batch {
     mesh.customDepthMaterial = k.depth;
     return mesh;
   }
+  build(bounds, originX = 0, originZ = 0) {
+    const stream = this.buildStream(bounds, 1024, originX, originZ); let step;
+    do step = stream.next(); while (!step.done);
+    return step.value;
+  }
 }
 class SolidBatch {
   constructor(geo, mat, shadow = true, small = false) { this.geo = geo; this.mat = mat; this.shadow = shadow; this.small = small; this.m = new Float32Array(16 * 128); this.n = 0; }
   add(matrix) { this.m = grow(this.m, (this.n + 1) * 16); this.m.set(matrix.elements, this.n * 16); this.n++; }
-  build(bounds) {
+  build(bounds, originX = 0, originZ = 0) {
     if (!this.n) return null;
     const mesh = new THREE.InstancedMesh(this.geo, this.mat, this.n);
-    mesh.instanceMatrix.array.set(this.m.subarray(0, this.n * 16)); mesh.instanceMatrix.needsUpdate = true;
+    const packed = mesh.instanceMatrix.array; packed.set(this.m.subarray(0, this.n * 16));
+    for (let i = 0; i < this.n; i++) { packed[i * 16 + 12] -= originX; packed[i * 16 + 14] -= originZ; }
+    mesh.instanceMatrix.needsUpdate = true;
     mesh.castShadow = this.shadow; mesh.receiveShadow = true;
     mesh.boundingSphere = bounds; mesh.frustumCulled = true;
     if (this.small) mesh.layers.set(1);
@@ -246,10 +265,22 @@ class SolidBatch {
 const CELL = 100; // placement cell: the level-0 chunk size. Every LOD places the same trees from the same seeds.
 const hash2 = (i, j) => { let h = (i * 374761393 + j * 668265263) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); return (h ^ (h >>> 16)) >>> 0; };
 
+export function normalizeFoliageDetail(value = 1) {
+  const detail = Number(value);
+  return Math.max(0.25, Math.min(1, Number.isFinite(detail) ? detail : 1));
+}
+
+export function foliageInstanceCount(count, detail = 1, minimum = 1) {
+  const available = Math.max(0, Math.ceil(Number(count) || 0));
+  if (!available) return 0;
+  const floor = Math.max(0, Math.min(available, Math.ceil(Number(minimum) || 0)));
+  return Math.min(available, Math.max(floor, Math.ceil(available * normalizeFoliageDetail(detail) - 1e-9)));
+}
+
 function chunkBounds(chunk) {
   const half = chunk.size / 2;
   return new THREE.Sphere(
-    new THREE.Vector3(chunk.x0 + half, (chunk.minH + chunk.maxH) / 2 + 12, chunk.z0 + half),
+    new THREE.Vector3(0, (chunk.minH + chunk.maxH) / 2 + 12, 0),
     Math.hypot(half, half, (chunk.maxH - chunk.minH) / 2 + 12) + 30,
   );
 }
@@ -267,19 +298,29 @@ function disposeChunkMesh(mesh) {
 }
 
 export class Vegetation {
-  constructor(terrain, exclusions = []) {
+  constructor(terrain, exclusions = [], options = {}) {
+    const setupStartedAt = performance.now(), setupTimings = {};
+    const timed = (key, create) => { const startedAt = performance.now(), value = create(); setupTimings[key] = performance.now() - startedAt; return value; };
     this.terrain = terrain;
     this.exclusions = exclusions; // [{x,z,r}] (home area only)
-    const texCyp = TEX.cypressFoliage(), texOak = TEX.oakFoliage(), texPalm = TEX.palmFrond(), texMoss = TEX.mossStrands();
-    const texGrass = TEX.grassClump(13, false), texReed = TEX.grassClump(17, true), texBark = TEX.bark();
-    const card = cardGeo(), frond = frondGeo();
+    this.detail = normalizeFoliageDetail(options.detail);
+    const texCyp = timed('cypressTextureMs', () => TEX.cypressFoliage());
+    const texOak = timed('oakTextureMs', () => TEX.oakFoliage());
+    const texPalm = timed('palmTextureMs', () => TEX.palmFrond());
+    const texMoss = timed('mossTextureMs', () => TEX.mossStrands());
+    const texGrass = timed('grassTextureMs', () => TEX.grassClump(13, false));
+    const texReed = timed('reedTextureMs', () => TEX.grassClump(17, true));
+    const texBark = timed('barkTextureMs', () => TEX.bark());
+    const card = cardGeo(), frond = frondGeo(), crossedFrond = crossedFoliageCardGeometry();
     this.cyp = new Kind(card, texCyp, { crownNormals: true, pin: 'crown', amp: 0.34, hasCrown: true, trans: 0.6 });
     this.oak = new Kind(card, texOak, { crownNormals: true, pin: 'crown', amp: 0.22, hasCrown: true, trans: 0.4 });
     this.palm = new Kind(frond, texPalm, { pin: 'bottom', amp: 0.4 });
     this.palmetto = new Kind(frond, texPalm, { pin: 'bottom', amp: 0.14, fade: [560, 680] }, { color: 0xd8e6c0, small: true });
     this.moss = new Kind(frond, texMoss, { pin: 'top', amp: 0.5, fade: [560, 680] }, { color: 0xb7bfae, alphaTest: 0.35, shadow: false, small: true });
-    this.grass = new Kind(frond, texGrass, { pin: 'bottom', amp: 0.22, fade: [290, 410] }, { shadow: false, alphaTest: 0.45, small: true });
-    this.reed = new Kind(frond, texReed, { pin: 'bottom', amp: 0.3, fade: [560, 680] }, { shadow: false, alphaTest: 0.45, small: true });
+    // Ground cover is always two perpendicular cards. Baking that cross into the shared base geometry preserves both
+    // faces and triangles while each clump carries one compact transform instead of two duplicate instance records.
+    this.grass = new Kind(crossedFrond, texGrass, { pin: 'bottom', amp: 0.22, fade: [290, 410] }, { shadow: false, alphaTest: 0.45, small: true });
+    this.reed = new Kind(crossedFrond, texReed, { pin: 'bottom', amp: 0.3, fade: [560, 680] }, { shadow: false, alphaTest: 0.45, small: true });
     this.kinds = [this.cyp, this.oak, this.palm, this.palmetto, this.moss, this.grass, this.reed];
     this.solid = []; // Meshy grass clumps, instanced like the cards, only in the nearest tier
     this.solidRevision = 0;
@@ -294,7 +335,8 @@ export class Vegetation {
           vec4 mvPosition = vec4(transformed, 1.0);
           #ifdef USE_INSTANCING
             mvPosition = instanceMatrix * mvPosition;
-            vec3 wBase = (instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+            vec3 localBase = (instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+            vec3 wBase = (modelMatrix * vec4(localBase, 1.0)).xyz;
             mvPosition.xyz += windOffset(wBase, pow(clamp(position.y, 0.0, 1.0), 1.6), ${amp.toFixed(3)}, gust(wBase));
           #endif
           mvPosition = modelViewMatrix * mvPosition;
@@ -303,16 +345,18 @@ export class Vegetation {
       mat.customProgramCacheKey = () => `trunk-${amp}`;
       return mat;
     };
-    this.trunkMat = patchTrunk(new THREE.MeshStandardMaterial({ map: texBark, roughness: 0.95, metalness: 0, color: 0x8a867c }), 0.34);
-    this.branchMat = patchTrunk(new THREE.MeshStandardMaterial({ map: texBark, roughness: 0.95, color: 0x8f8375 }), 0.30);
-    this.kneeMat = new THREE.MeshStandardMaterial({ color: 0x5a4d3f, roughness: 1 });
+    this.trunkMat = registerWetMaterial(patchTrunk(new THREE.MeshStandardMaterial({ map: texBark, roughness: 0.95, metalness: 0, color: 0x8a867c }), 0.34));
+    this.branchMat = registerWetMaterial(patchTrunk(new THREE.MeshStandardMaterial({ map: texBark, roughness: 0.95, color: 0x8f8375 }), 0.30));
+    this.kneeMat = registerWetMaterial(new THREE.MeshStandardMaterial({ color: 0x5a4d3f, roughness: 1 }));
     this.trunkGeo = TEX.scaleTextureUvs(trunkGeo(), 2, 6);
     this.branchGeo = TEX.scaleTextureUvs(new THREE.CylinderGeometry(0.06, 0.16, 1, 6, 1), 2, 6); this.branchGeo.translate(0, 0.5, 0);
     this.kneeGeo = new THREE.ConeGeometry(0.18, 1, 6); this.kneeGeo.translate(0, 0.5, 0);
     this.cypTint = new THREE.Color(0.36, 0.48, 0.26); this.oakTint = new THREE.Color(0.30, 0.42, 0.25); this.palmTint = new THREE.Color(0.42, 0.55, 0.34);
     // scratch
     this._m = new THREE.Matrix4(); this._q = new THREE.Quaternion(); this._e = new THREE.Euler(); this._s = new THREE.Vector3(); this._p = new THREE.Vector3(); this._normal = new THREE.Vector3();
-    this._col = new THREE.Color(); this._tint = new THREE.Color();
+    this._col = new THREE.Color(); this._tint = new THREE.Color(); this._crown = new THREE.Vector4(); this._hsl = { h: 0, s: 0, l: 0 };
+    setupTimings.totalMs = performance.now() - setupStartedAt;
+    this.setupTimings = setupTimings;
   }
   excluded(x, z) {
     for (const e of this.exclusions) if (Math.hypot(x - e.x, z - e.z) < e.r) return true;
@@ -320,8 +364,9 @@ export class Vegetation {
     return false;
   }
 
-  // Build the vegetation for a terrain chunk. A generator: yields after each 100 m cell so the terrain can spread the
-  // work over frames. Sets chunk.veg (a Group) and chunk.colliders (trunk circles for the physics).
+  // Build the vegetation for a terrain chunk. Both the chunk and each 100 m cell are generators: expensive trees and
+  // dense ground-cover loops yield without changing their deterministic RNG sequence, so the terrain's frame budget
+  // can actually preempt the work. Sets chunk.veg (a Group) and chunk.colliders (trunk circles for the physics).
   *buildChunk(chunk) {
     const tier = chunk.level; // 0 full, 1 no grass/knees, 2 trees only (half the cards), 3 sparse big cards, 4 two crossed cards, 5 nothing
     if (chunk.level > 4) return;
@@ -333,12 +378,18 @@ export class Vegetation {
     const cells = chunk.size / CELL;
     const ci0 = Math.round(chunk.x0 / CELL), cj0 = Math.round(chunk.z0 / CELL);
     for (let cj = 0; cj < cells; cj++) for (let ci = 0; ci < cells; ci++) {
-      this.populateCell(chunk, ci0 + ci, cj0 + cj, tier, B);
+      yield* this.populateCell(chunk, ci0 + ci, cj0 + cj, tier, B);
       if (tier <= 1 || (ci & 1) === 1) yield;
     }
     const g = new THREE.Group(); g.name = 'veg';
+    const originX = chunk.x0 + chunk.size / 2, originZ = chunk.z0 + chunk.size / 2;
+    g.position.set(originX, 0, originZ);
     const bounds = chunkBounds(chunk);
-    for (const k in B) { const mesh = B[k].build(bounds); if (mesh) g.add(mesh); }
+    for (const k in B) {
+      const mesh = B[k].buildStream ? yield* B[k].buildStream(bounds, 1024, originX, originZ) : B[k].build(bounds, originX, originZ);
+      if (mesh) g.add(mesh);
+      yield;
+    }
     for (const mesh of this.buildSolidMeshes(chunk, bounds)) g.add(mesh);
     chunk.solidGrassRevision = this.solidRevision;
     chunk.veg = g;
@@ -358,8 +409,9 @@ export class Vegetation {
     const ci0 = Math.round(chunk.x0 / CELL), cj0 = Math.round(chunk.z0 / CELL);
     for (let cj = 0; cj < cells; cj++) for (let ci = 0; ci < cells; ci++) this.populateSolidCell(chunk, ci0 + ci, cj0 + cj, batches);
     const meshes = [];
+    const originX = chunk.x0 + chunk.size / 2, originZ = chunk.z0 + chunk.size / 2;
     for (const batch of batches) {
-      const mesh = batch.build(bounds);
+      const mesh = batch.build(bounds, originX, originZ);
       if (!mesh) continue;
       mesh.userData.solidGrass = true;
       meshes.push(mesh);
@@ -406,7 +458,7 @@ export class Vegetation {
     return true;
   }
 
-  populateCell(chunk, ci, cj, tier, B) {
+  *populateCell(chunk, ci, cj, tier, B) {
     const T = this.terrain, hf = T.hf;
     const x0 = ci * CELL, z0 = cj * CELL;
     const rand = mulberry32(hash2(ci + 5000, cj + 5000) ^ 0x9e3779b9);
@@ -434,13 +486,13 @@ export class Vegetation {
     };
     const tint = this._tint;
     const varyTint = (tr, base, hueSpread = 0.03, lumSpread = 0.3) => {
-      const hslv = {}; base.getHSL(hslv);
+      const hslv = this._hsl; base.getHSL(hslv);
       tint.setHSL(hslv.h + (tr() - 0.5) * hueSpread * 2, hslv.s * (0.85 + tr() * 0.3), hslv.l * (1 - lumSpread / 2 + tr() * lumSpread));
       return tint;
     };
     // crown cards; far tiers draw fewer, larger cards (the same silhouette from a distance)
     const crownCards = (tr, batch, cx, cy, cz, rx, ry, n, size, tnt) => {
-      const crown = new THREE.Vector4(cx, cy, cz, rx);
+      const crown = this._crown.set(cx, cy, cz, rx);
       if (tier >= 3) {
         const cards = tier === 4 ? 2 : 3;
         const width = tier === 4 ? rx * 3.15 : rx * 2.05, height = tier === 4 ? ry * 2.9 : ry * 2.25;
@@ -451,7 +503,10 @@ export class Vegetation {
         }
         return;
       }
-      const cnt = tier === 2 ? Math.ceil(n * 0.5) : n, sz0 = tier === 2 ? size * 1.35 : size;
+      const baseCount = tier === 2 ? Math.ceil(n * 0.5) : n;
+      const cnt = foliageInstanceCount(baseCount, this.detail, tier === 2 ? 4 : 6);
+      const coverage = Math.min(1.4, Math.sqrt(baseCount / Math.max(1, cnt)));
+      const sz0 = (tier === 2 ? size * 1.35 : size) * coverage;
       for (let i = 0; i < cnt; i++) {
         const a = tr() * Math.PI * 2, rr = Math.sqrt(tr()) * rx, yy = (tr() - 0.5) * 2 * ry * (1 - rr / rx * 0.35);
         p.set(cx + Math.cos(a) * rr, cy + yy, cz + Math.sin(a) * rr);
@@ -464,7 +519,8 @@ export class Vegetation {
     };
     const mossOn = (tr, x, y, z, r, n, lenMul = 1) => {
       if (tier > 1) return;
-      for (let i = 0; i < n; i++) {
+      const count = foliageInstanceCount(n, this.detail, 2);
+      for (let i = 0; i < count; i++) {
         const a = tr() * Math.PI * 2, rr = tr() * r;
         p.set(x + Math.cos(a) * rr, y + (tr() - 0.5) * r * 0.6, z + Math.sin(a) * rr);
         e.set(0, tr() * Math.PI, 0); q.setFromEuler(e);
@@ -473,11 +529,13 @@ export class Vegetation {
       }
     };
     const palmCrown = (tr, batch, x, y, z, n, len, tiltMin, tiltMax, tnt) => {
-      for (let i = 0; i < n; i++) {
-        const yaw = (i / n) * Math.PI * 2 + tr() * 0.5;
+      const count = foliageInstanceCount(n, this.detail, 3);
+      const coverage = Math.min(1.28, Math.sqrt(n / Math.max(1, count)));
+      for (let i = 0; i < count; i++) {
+        const yaw = (i / count) * Math.PI * 2 + tr() * 0.5;
         const tilt = tiltMin + tr() * (tiltMax - tiltMin);
         p.set(x, y, z); e.set(-tilt, yaw, 0, 'YXZ'); q.setFromEuler(e);
-        const l = len * (0.8 + tr() * 0.4); s.set(l * 0.9, l, 1); m.compose(p, q, s);
+        const l = len * coverage * (0.8 + tr() * 0.4); s.set(l * 0.9, l, 1); m.compose(p, q, s);
         col.copy(tnt).multiplyScalar(0.8 + tr() * 0.4); batch.add(m, col);
       }
     };
@@ -488,7 +546,7 @@ export class Vegetation {
       const tnt = varyTint(tr, this.cypTint, 0.035, 0.35);
       const conical = opts.conical !== undefined ? opts.conical : tr() < 0.45; // young bald cypress are pyramidal; old ones flat-topped and spreading
       const cy = h + H * (conical ? 0.58 : 0.64), crx = (conical ? 2.0 : 2.8) + H * (conical ? 0.09 : 0.14) + tr() * 1.6, cry = H * (conical ? 0.34 : 0.25);
-      if (tier <= 1) for (let b = 0; b < 5; b++) placeBranch(x, h + H * (0.4 + tr() * 0.35), z, crx * (0.7 + tr() * 0.6), r * 0.5, tr() * Math.PI * 2, 0.9 + tr() * 0.9);
+      if (tier <= 1) for (let b = 0, count = foliageInstanceCount(5, this.detail, 2); b < count; b++) placeBranch(x, h + H * (0.4 + tr() * 0.35), z, crx * (0.7 + tr() * 0.6), r * 0.5, tr() * Math.PI * 2, 0.9 + tr() * 0.9);
       if (conical) {
         crownCards(tr, B.cyp, x, cy - cry * 0.5, z, crx, cry * 0.5, 22 + Math.floor(tr() * 8), 1.6 + H * 0.05, tnt);
         if (tier < 3) {
@@ -500,7 +558,7 @@ export class Vegetation {
         if (tier < 3) crownCards(tr, B.cyp, x, cy - cry * 0.9, z, crx * 0.75, cry * 0.35, 9 + Math.floor(tr() * 5), 1.6 + H * 0.04, tnt);
       }
       mossOn(tr, x, cy - cry * 0.85, z, crx * 0.9, 8 + Math.floor(tr() * 8));
-      if (tier === 0 && h < 0.5 && h > -1.2) for (let k = 0; k < 4 + tr() * 6; k++) {
+      if (tier === 0 && h < 0.5 && h > -1.2) for (let k = 0, count = foliageInstanceCount(4 + tr() * 6, this.detail, 2); k < count; k++) {
         const a = tr() * Math.PI * 2, rr = 1.5 + tr() * 4;
         const kx = x + Math.cos(a) * rr, kz = z + Math.sin(a) * rr; const kh = grid(kx, kz);
         if (kh > 0.6) continue;
@@ -512,7 +570,7 @@ export class Vegetation {
       const H = 8 + tr() * 7, r = 0.45 + tr() * 0.35;
       placeTrunk(tr, x, h - 0.3, z, H * 0.55, r, 0.15);
       const cy = h + H * 0.62, crx = 4 + tr() * 3.5, cry = H * 0.28;
-      if (tier <= 1) for (let b = 0; b < 5; b++) placeBranch(x, h + H * (0.35 + tr() * 0.2), z, crx * (0.8 + tr() * 0.5), r * 0.6, tr() * Math.PI * 2, 1.0 + tr() * 0.7);
+      if (tier <= 1) for (let b = 0, count = foliageInstanceCount(5, this.detail, 2); b < count; b++) placeBranch(x, h + H * (0.35 + tr() * 0.2), z, crx * (0.8 + tr() * 0.5), r * 0.6, tr() * Math.PI * 2, 1.0 + tr() * 0.7);
       crownCards(tr, B.oak, x, cy, z, crx, cry, 30 + Math.floor(tr() * 8), 2.3 + tr() * 0.9, varyTint(tr, this.oakTint, 0.03, 0.3));
       mossOn(tr, x, cy - cry * 0.7, z, crx * 0.9, 9 + Math.floor(tr() * 8), 1.1);
     };
@@ -522,15 +580,22 @@ export class Vegetation {
       if (tier < 4) palmCrown(tr, B.palm, x, h + H * 0.8 - 0.2, z, tier === 3 ? 4 : 11 + Math.floor(tr() * 4), 2.6 + tr() * 1.2, 0.45, 1.7, this.palmTint);
     };
     // exact ground height for trees so every LOD agrees on where a tree stands; the grid is only a cheap prefilter
-    let placed = 0;
+    let placed = 0, streamedTreeWork = 0;
     const treeRand = () => mulberry32(hash2(ci * 31 + placed, cj * 17 + placed) ^ 0x51ed27);
     // At the horizon, one enlarged deterministic crown represents a small stand. Every placement is still evaluated
     // and occupies the same space, so stepping into a finer ring reveals the exact underlying forest instead of a
     // differently seeded one.
-    const keepTree = (x, z, salt) => tier < 4 || hash2(Math.floor(x * 4) + salt, Math.floor(z * 4) - salt) % 3 === 0;
+    const keepTree = (x, z, salt) => {
+      const hash = hash2(Math.floor(x * 4) + salt, Math.floor(z * 4) - salt);
+      if (this.detail >= 0.999) return tier < 4 || hash % 3 === 0;
+      if (tier < 3) return true; // near physical tree density and collision never change with graphics detail
+      const density = tier === 3 ? Math.max(0.42, this.detail) : Math.max(0.14, this.detail / 3);
+      return hash % 1000 < Math.round(density * 1000);
+    };
 
     // --- cypress: banks & shallows ---
     for (let t = 0; t < 64; t++) {
+      if (tier <= 1 && t > 0 && (t & 7) === 0) yield;
       const x = x0 + rand() * CELL, z = z0 + rand() * CELL;
       const hg = grid(x, z); if (hg < -1.8 || hg > 2.6) continue;
       const h = hf.compute(x, z);
@@ -541,10 +606,15 @@ export class Vegetation {
       if (!free(x, z, spacing)) continue;
       occupy(x, z, spacing);
       const tr = treeRand(); placed++;
-      if (keepTree(x, z, 131)) cypress(tr, x, z, h);
+      if (keepTree(x, z, 131)) {
+        cypress(tr, x, z, h); streamedTreeWork++;
+        if (tier <= 1 || (streamedTreeWork & 7) === 0) yield;
+      }
     }
+    yield;
     // --- live oaks: higher ground, thicker on the hammocks ---
     for (let t = 0; t < 30; t++) {
+      if (tier <= 1 && t > 0 && (t & 7) === 0) yield;
       const x = x0 + rand() * CELL, z = z0 + rand() * CELL;
       const hg = grid(x, z); if (hg < 0.5 || hg > 6.4) continue;
       if (rand() < Math.min(0.98, open * 1.25)) continue;
@@ -553,10 +623,15 @@ export class Vegetation {
       if (nearHome && Math.abs(x - T.riverCenterX(z)) > 170 && rand() < 0.7) continue;
       if (!free(x, z, 7)) continue; occupy(x, z, 7);
       const tr = treeRand(); placed++;
-      if (keepTree(x, z, 271)) oak(tr, x, z, h);
+      if (keepTree(x, z, 271)) {
+        oak(tr, x, z, h); streamedTreeWork++;
+        if (tier <= 1 || (streamedTreeWork & 7) === 0) yield;
+      }
     }
+    yield;
     // --- sabal palms ---
     for (let t = 0; t < 12; t++) {
+      if (tier <= 1 && t === 6) yield;
       const x = x0 + rand() * CELL, z = z0 + rand() * CELL;
       const hg = grid(x, z); if (hg < -0.1 || hg > 5.4) continue;
       if (rand() < Math.min(0.95, open * 1.15)) continue;
@@ -564,8 +639,12 @@ export class Vegetation {
       if (h < 0.3 || h > 5 || excl(x, z)) continue;
       if (!free(x, z, 3)) continue; occupy(x, z, 3);
       const tr = treeRand(); placed++;
-      if (keepTree(x, z, 389)) palm(tr, x, z, h);
+      if (keepTree(x, z, 389)) {
+        palm(tr, x, z, h); streamedTreeWork++;
+        if (tier <= 1 || (streamedTreeWork & 7) === 0) yield;
+      }
     }
+    yield;
     // --- the tower island: cypress at the shore, palms & oaks around the tower ---
     if (T.island.x >= x0 && T.island.x < x0 + CELL && T.island.y >= z0 && T.island.y < z0 + CELL) {
       const ir = mulberry32(4242);
@@ -578,13 +657,16 @@ export class Vegetation {
         const x = ix + Math.cos(a) * rr, z = iz + Math.sin(a) * rr; const h = hf.compute(x, z);
         if (h < -1.5 || h > 2.5 || excl(x, z)) continue;
         const H = 12 + ir() * 12;
-        cypress(mulberry32(9000 + i), x, z, h, { H, emergent: false, conical: false }); placed++;
+        cypress(mulberry32(9000 + i), x, z, h, { H, emergent: false, conical: false }); placed++; streamedTreeWork++;
+        if (tier <= 1 || (streamedTreeWork & 7) === 0) yield;
       }
       for (let i = 0; i < 14; i++) {
         const a = ir() * Math.PI * 2, rr = 9 + ir() * 14;
         const x = ix + Math.cos(a) * rr, z = iz + Math.sin(a) * rr; const h = hf.compute(x, z);
         if (h < 0.3 || excl(x, z)) continue;
         if (ir() < 0.5) palm(mulberry32(9100 + i), x, z, h); else oak(mulberry32(9200 + i), x, z, h);
+        streamedTreeWork++;
+        if (tier <= 1 || (streamedTreeWork & 7) === 0) yield;
       }
       if (tier <= 1) for (let i = 0; i < 40; i++) {
         const a = ir() * Math.PI * 2, rr = 6 + ir() * 22;
@@ -592,20 +674,26 @@ export class Vegetation {
         if (h < 0.2 || excl(x, z)) continue;
         const sz = 1.0 + ir() * 1.1;
         palmCrown(ir, B.palmetto, x, h - 0.1, z, 7 + Math.floor(ir() * 4), sz, 0.25, 1.2, this.palmTint);
+        yield;
       }
     }
+    yield;
     if (tier > 1) return;
     // --- saw palmetto ---
-    for (let t = 0; t < 16; t++) {
+    for (let t = 0, count = foliageInstanceCount(16, this.detail, 5); t < count; t++) {
+      if (t > 0 && (t & 7) === 0) yield;
       const x = x0 + rand() * CELL, z = z0 + rand() * CELL;
       const h = grid(x, z);
       if (h < 0.5 || h > 6 || excl(x, z)) continue;
       if (rand() < open * 0.6) continue;
       const sz = 1.0 + rand() * 1.1;
       palmCrown(rand, B.palmetto, x, h - 0.1, z, 7 + Math.floor(rand() * 4), sz, 0.25, 1.2, this.palmTint);
+      yield;
     }
+    yield;
     // --- understory shrubs along the banks ---
-    for (let t = 0; t < 30; t++) {
+    for (let t = 0, count = foliageInstanceCount(30, this.detail, 8); t < count; t++) {
+      if (t > 0 && (t & 7) === 0) yield;
       const x = x0 + rand() * CELL, z = z0 + rand() * CELL;
       const h = grid(x, z);
       if (h < 0.1 || h > 3.5 || excl(x, z)) continue;
@@ -613,9 +701,12 @@ export class Vegetation {
       if (rand() < Math.min(0.97, open * 1.3)) continue;
       const rr = 1.2 + rand() * 1.8;
       crownCards(rand, B.oak, x, h + rr * 0.7, z, rr, rr * 0.55, 7 + Math.floor(rand() * 5), rr * 1.3, varyTint(rand, this.oakTint, 0.04, 0.4));
+      yield;
     }
+    yield;
     // --- reeds / cattails in the shallows; across the prairie, tall sawgrass in its place ---
-    for (let t = 0; t < 700; t++) {
+    for (let t = 0, count = foliageInstanceCount(700, this.detail, 180); t < count; t++) {
+      if (t > 0 && (t & 31) === 0) yield;
       const x = x0 + rand() * CELL, z = z0 + rand() * CELL;
       const h = grid(x, z);
       if (h < -0.7 || h > 0.35 + open * 0.6 || excl(x, z)) continue;
@@ -626,11 +717,12 @@ export class Vegetation {
       if (saw) col.setHSL(0.17 + rand() * 0.04, 0.42, 0.3 + rand() * 0.16); else col.setHSL(0.19 + rand() * 0.05, 0.35, 0.22 + rand() * 0.14);
       const batch = saw ? B.grass : B.reed;
       batch.add(m, col);
-      e.set(0, e.y + Math.PI / 2, 0); q.setFromEuler(e); m.compose(p, q, s); batch.add(m, col);
     }
+    yield;
     if (tier > 0) return;
     // --- grass ---
-    for (let t = 0; t < 360; t++) {
+    for (let t = 0, count = foliageInstanceCount(360, this.detail, 100); t < count; t++) {
+      if (t > 0 && (t & 31) === 0) yield;
       const x = x0 + rand() * CELL, z = z0 + rand() * CELL;
       const h = grid(x, z);
       if (h < 0.15 || h > 6 || excl(x, z)) continue;
@@ -639,7 +731,6 @@ export class Vegetation {
       p.set(x, h - 0.05, z); e.set(0, rand() * Math.PI, 0); q.setFromEuler(e);
       const sz = 0.9 + rand() * 0.9; s.set(sz * 1.2, sz * 0.8, 1); m.compose(p, q, s);
       col.setHSL(0.23 + rand() * 0.06, 0.4, 0.2 + rand() * 0.14); B.grass.add(m, col);
-      e.set(0, e.y + Math.PI / 2, 0); q.setFromEuler(e); m.compose(p, q, s); B.grass.add(m, col);
     }
   }
 
@@ -648,8 +739,8 @@ export class Vegetation {
     let added = 0;
     for (const resource of resources) {
       if (!resource?.geo || !resource?.mat) continue;
-      const k = new Kind(resource.geo, resource.mat.map, { pin: 'y', pinH: resource.height, amp: 0.2, fade: [150, 210] }, { shadow: false, alphaTest: 0.01, small: true });
-      k.mat.side = THREE.FrontSide; k.mat.color.setHex(0xd8dcc8); this.kinds.push(k); this.solid.push(k); added++;
+      const k = new Kind(resource.geo, resource.mat.map, { pin: 'y', pinH: resource.height, amp: 0.2, fade: [150, 210] }, { color: 0xd8dcc8, shadow: false, alphaTest: 0.01, small: true });
+      k.mat.side = THREE.FrontSide; this.kinds.push(k); this.solid.push(k); added++;
     }
     if (!added) return 0;
     this.solidRevision++;
@@ -661,6 +752,7 @@ export class Vegetation {
   }
   // wind for a one-off model (a hero tree at a homestead): sway about its own origin, in metres despite the model's scale
   windMat(mat, yMin, yMax, scale, amp = 0.3) {
+    registerWetMaterial(mat);
     mat.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = { value: 0 }; shader.uniforms.uWind = { value: new THREE.Vector3(1, 1, 0) }; mat.userData.shader = shader;
       shader.vertexShader = shader.vertexShader.replace('#include <common>', `#include <common>\n${WIND_GLSL}`).replace('#include <project_vertex>', `
@@ -681,5 +773,8 @@ export class Vegetation {
     for (const k of this.kinds) k.setTime(t, sunDir, wind);
     for (const m of this.extraMats) { const sh = m.userData.shader; if (sh) { sh.uniforms.uTime.value = t; if (wind) sh.uniforms.uWind.value.copy(wind); } }
     for (const m of [this.trunkMat, this.branchMat]) { const sh = m.userData.shader; if (sh) { sh.uniforms.uTime.value = t; if (wind) sh.uniforms.uWind.value.copy(wind); } }
+  }
+  resourceStats() {
+    return { detail: this.detail, nearTreeCollisions: 1, farStandDensity: this.detail >= 0.999 ? 1 : Math.max(0.42, this.detail), allocationScratch: 2, setupTimings: { ...this.setupTimings } };
   }
 }

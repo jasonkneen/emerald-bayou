@@ -13,23 +13,23 @@ const EMERGENCY_COOLDOWN_SECONDS = 0.8;
 export const QUALITY_PROFILES = Object.freeze([
   Object.freeze({
     id: 'fallback', label: 'Fallback', maxDrawPixels: 800_000, maxDevicePixelRatio: 1,
-    msaaSamples: 0, shadowMapSize: 1024, reflectionScale: 0.25, reflectionInterval: 3,
-    reflectionMipmaps: false, wakeResolution: 192, wakeMaxStamps: 10, surfaceMist: 0, precipitationRipples: 0, lensWater: 0, fireflyPoints: 0, bloom: false, finalPass: false,
+    msaaSamples: 0, shadowMapSize: 1024, environmentMapSize: 32, environmentMapRefreshSeconds: 0, reflectionScale: 0.25, reflectionInterval: 3,
+    reflectionMipmaps: false, wakeResolution: 192, wakeMaxStamps: 10, minimapTileLimit: 160, surfaceMist: 0, heatHaze: 0, cloudShadows: 0, precipitationRipples: 0, lensWater: 0, fireflyPoints: 0, spotlightVolume: 0, skyWeatherDetail: 0, hullDamageDetail: 0, bloom: false, finalPass: false,
   }),
   Object.freeze({
     id: 'performance', label: 'Performance', maxDrawPixels: 1_250_000, maxDevicePixelRatio: 1.25,
-    msaaSamples: 0, shadowMapSize: 1024, reflectionScale: 0.32, reflectionInterval: 2,
-    reflectionMipmaps: false, wakeResolution: 256, wakeMaxStamps: 14, surfaceMist: 0, precipitationRipples: 0, lensWater: 0, fireflyPoints: 72, bloom: false, finalPass: false,
+    msaaSamples: 0, shadowMapSize: 1024, environmentMapSize: 64, environmentMapRefreshSeconds: 0, reflectionScale: 0.32, reflectionInterval: 2,
+    reflectionMipmaps: false, wakeResolution: 256, wakeMaxStamps: 14, minimapTileLimit: 192, surfaceMist: 0, heatHaze: 0, cloudShadows: 0, precipitationRipples: 0, lensWater: 0, fireflyPoints: 72, spotlightVolume: 0.42, skyWeatherDetail: 0.45, hullDamageDetail: 0.5, bloom: false, finalPass: false,
   }),
   Object.freeze({
     id: 'balanced', label: 'Balanced', maxDrawPixels: 2_000_000, maxDevicePixelRatio: 1.6,
-    msaaSamples: 2, shadowMapSize: 2048, reflectionScale: 0.4, reflectionInterval: 2,
-    reflectionMipmaps: false, wakeResolution: 384, wakeMaxStamps: 18, surfaceMist: 0.65, precipitationRipples: 0.62, lensWater: 0.62, fireflyPoints: 153, bloom: true, finalPass: false,
+    msaaSamples: 2, shadowMapSize: 2048, environmentMapSize: 128, environmentMapRefreshSeconds: 75, reflectionScale: 0.4, reflectionInterval: 2,
+    reflectionMipmaps: false, wakeResolution: 384, wakeMaxStamps: 18, minimapTileLimit: 224, surfaceMist: 0.65, heatHaze: 0.58, cloudShadows: 0.58, precipitationRipples: 0.62, lensWater: 0.62, fireflyPoints: 153, spotlightVolume: 0.75, skyWeatherDetail: 0.75, hullDamageDetail: 0.78, bloom: true, finalPass: false,
   }),
   Object.freeze({
     id: 'cinematic', label: 'Cinematic', maxDrawPixels: MAX_DRAW_PIXELS, maxDevicePixelRatio: MAX_DEVICE_PIXEL_RATIO,
-    msaaSamples: 4, shadowMapSize: 4096, reflectionScale: 0.5, reflectionInterval: 1,
-    reflectionMipmaps: true, wakeResolution: 512, wakeMaxStamps: 20, surfaceMist: 1, precipitationRipples: 1, lensWater: 1, fireflyPoints: 243, bloom: true, finalPass: true,
+    msaaSamples: 4, shadowMapSize: 4096, environmentMapSize: 256, environmentMapRefreshSeconds: 45, reflectionScale: 0.5, reflectionInterval: 1,
+    reflectionMipmaps: true, wakeResolution: 512, wakeMaxStamps: 20, minimapTileLimit: 256, surfaceMist: 1, heatHaze: 1, cloudShadows: 1, precipitationRipples: 1, lensWater: 1, fireflyPoints: 243, spotlightVolume: 1, skyWeatherDetail: 1, hullDamageDetail: 1, bloom: true, finalPass: true,
   }),
 ]);
 
@@ -54,8 +54,12 @@ export function gpuQualityCeiling(rendererName = '') {
   const geforce = name.match(/geforce\s+(gtx|gt)\s*(\d{3,4})/);
   if (geforce) {
     const model = Number(geforce[2]);
-    if (geforce[1] === 'gt' || model <= 750) return 1;
-    if (model <= 1050) return 2;
+    // Maxwell GTX 950-980 cards are now over a decade old. Their model number once looked high enough for
+    // Balanced, which also admitted a 6.4 MiB authored-model batch; start them on the procedural Performance path.
+    if (geforce[1] === 'gt' || model <= 980) return 1;
+    // Pascal GTX 1060-1080 cards are now decade-old hardware. Balanced is the safe first frame budget; Auto can
+    // still promote one after four clean windows instead of making the title prove itself with Cinematic work.
+    if (model <= 1080) return 2;
   }
   if (/radeon\s+hd\s+\d|firepro\s+[dmvw]\d/.test(name)) return 1;
   if (/radeon\s+(?:r[579]|pro\s+[45]\d\d)\b/.test(name)) return 2;
@@ -97,6 +101,17 @@ export function msaaSamplesFor(width, height, maxSamples = 4) {
   if (!Number.isFinite(maxSamples) || maxSamples <= 0) return 0;
   const preferred = Math.max(1, width) * Math.max(1, height) > FOUR_SAMPLE_MAX_PIXELS ? 2 : 4;
   return Math.min(Math.floor(maxSamples), preferred);
+}
+
+// Three.js stores a scene PMREM in a half-float CubeUV target and retains the depth attachment used while capturing
+// the sky. Its temporary ping-pong target has only half-float colour. Reporting both makes the startup and retained
+// budgets explicit without asking the renderer to allocate either target during a unit test.
+export function environmentMapBudget(requestedSize = 256) {
+  const requested = Math.max(16, Number(requestedSize) || 256);
+  const cubeSize = 2 ** Math.floor(Math.log2(requested));
+  const width = 3 * Math.max(cubeSize, 16 * 7), height = 4 * cubeSize, pixels = width * height;
+  const colorBytes = pixels * 8, depthBytes = pixels * 4;
+  return { cubeSize, width, height, pixels, colorBytes, depthBytes, retainedBytes: colorBytes + depthBytes, peakTargetBytes: colorBytes * 2 + depthBytes };
 }
 
 export class AdaptiveQualityController {

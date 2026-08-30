@@ -9,6 +9,7 @@ import { StoryResidents } from './residents.js';
 import { ResidentContracts } from './contracts.js';
 import { emitWakeStamp } from './wakestamps.js';
 import { emitMapMarker } from './mapmarkers.js';
+import { clampWakeHeight, wakeSampleAt } from './wakefield.js';
 
 const MPH = 2.23694;
 const clamp = (v, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
@@ -73,7 +74,7 @@ export class StoryDirector {
     if (!Number.isFinite(S.caseX)) S.caseX = C.search.x + Math.cos(C.search.heading + 1.2) * 6;
     if (!Number.isFinite(S.caseZ)) S.caseZ = C.search.z + Math.sin(C.search.heading + 1.2) * 6;
     this.clock = 0; this.offerT = 34; this.choiceT = 0; this.persistT = 6; this.departT = 0; this.departSpeed = 0; this.enabled = false;
-    this.departPoint = { x: 0, z: 0, heading: 0 }; this.departMesh = null; this.departCargo = []; this.departPitch = 0.86; this.obLevel = 0; this.obPitch = 0.86;
+    this.departPoint = { x: 0, z: 0, heading: 0, mesh: null, navigationLights: false }; this.departMesh = null; this.departCargo = []; this.departPitch = 0.86; this.obLevel = 0; this.obPitch = 0.86; this.obX = 0; this.obZ = 0;
     this.interact = false; this.alternate = false; this.prompting = false; this.wantInput = false; this.approachHold = 0; this.routeStart = 0; this.routeBand = this.state.routeBand;
     this.obs = [];
     this.wreckObs = { ax: 0, az: 0, bx: 0, bz: 0, r: 1.05, tag: 'maintenance skiff' };
@@ -236,7 +237,7 @@ export class StoryDirector {
     if (this.state.stage !== 'delivery') return;
     const branch = this.state.branch, recipient = branch === 'runner' ? this.rigs.lostKey : this.rigs.oldMill;
     recipient.add(this.rigs.case); this.rigs.case.position.set(0.55, 0.68, -0.9); this.rigs.case.rotation.set(0, 0.2, 0); this.rigs.case.visible = true;
-    const berth = this.destination(); this.startDeparture(recipient, berth, [this.rigs.case], branch === 'runner' ? 0.82 : 0.9);
+    const berth = this.destination(); this.startDeparture(recipient, berth, [this.rigs.case], branch === 'runner' ? 0.82 : 0.9, branch !== 'runner');
     this.state.stage = 'complete'; this.state.ending = branch; this.state.completedAt = Date.now(); this.state.consequenceAt = Date.now() + 60000; this.state.consequence = false; this.state.cargoUntil = 0;
     this.rigs.wreck.visible = false; this.phys.loaded = 0; this.clearPrompt(); this.game.wpTarget = null;
     if (branch === 'runner') {
@@ -402,9 +403,10 @@ export class StoryDirector {
     }
   }
 
-  startDeparture(mesh, point, cargo = [], pitch = 0.86) {
+  startDeparture(mesh, point, cargo = [], pitch = 0.86, navigationLights = true) {
     this.residents?.departed(mesh);
     this.departMesh = mesh; this.departCargo = cargo; this.departPitch = pitch; this.departPoint.x = point.x; this.departPoint.z = point.z; this.departPoint.heading = point.heading;
+    this.departPoint.mesh = mesh; this.departPoint.navigationLights = navigationLights;
     this.departSpeed = 0; this.departT = 10; mesh.visible = true;
   }
 
@@ -413,21 +415,46 @@ export class StoryDirector {
     this.departT -= dt; this.departSpeed += (6.6 - this.departSpeed) * (1 - Math.exp(-dt * 0.58));
     const flow = this.currents.flowAt(p.x, p.z, this._flow), fx = -Math.sin(p.heading), fz = -Math.cos(p.heading);
     p.x += (fx * this.departSpeed + flow.x) * dt; p.z += (fz * this.departSpeed + flow.y) * dt; this.placeBoat(mesh, p, t, -0.012);
-    if (this.departT <= 0) { mesh.visible = false; for (const cargo of this.departCargo) cargo.visible = false; this.departCargo.length = 0; this.departMesh = null; this.departSpeed = 0; }
+    if (this.departT <= 0) { mesh.visible = false; for (const cargo of this.departCargo) cargo.visible = false; this.departCargo.length = 0; this.departMesh = null; this.departPoint.mesh = null; this.departPoint.navigationLights = false; this.departSpeed = 0; }
   }
 
   updateAudio() {
-    this.obLevel = 0; this.obPitch = this.state.branch === 'runner' ? 0.82 : 0.9;
+    this.obLevel = 0; this.obPitch = this.state.branch === 'runner' ? 0.82 : 0.9; this.obX = 0; this.obZ = 0;
     let x = 0, z = 0, speed = 0;
     if (this.state.stage === 'delivery') { const d = this.destination(); x = d.x; z = d.z; speed = 1.25; }
     else if (this.departT > 0) { x = this.departPoint.x; z = this.departPoint.z; speed = this.departSpeed; this.obPitch = this.departPitch; }
-    if (speed > 0) { const d = Math.hypot(x - this.phys.pos.x, z - this.phys.pos.y); if (d < 145) this.obLevel = (0.16 + 0.56 * Math.min(1, speed / 6.6)) * (1 - d / 145); }
+    if (speed > 0) { const d = Math.hypot(x - this.phys.pos.x, z - this.phys.pos.y); if (d < 145) { this.obLevel = (0.16 + 0.56 * Math.min(1, speed / 6.6)) * (1 - d / 145); this.obX = x; this.obZ = z; } }
     this.passage?.updateAudio();
-    if (this.passage && this.passage.obLevel > this.obLevel) { this.obLevel = this.passage.obLevel; this.obPitch = this.passage.obPitch; }
+    if (this.passage && this.passage.obLevel > this.obLevel) { this.obLevel = this.passage.obLevel; this.obPitch = this.passage.obPitch; this.obX = this.passage.obX; this.obZ = this.passage.obZ; }
     this.stormLine?.updateAudio();
-    if (this.stormLine && this.stormLine.obLevel > this.obLevel) { this.obLevel = this.stormLine.obLevel; this.obPitch = this.stormLine.obPitch; }
+    if (this.stormLine && this.stormLine.obLevel > this.obLevel) { this.obLevel = this.stormLine.obLevel; this.obPitch = this.stormLine.obPitch; this.obX = this.stormLine.obX; this.obZ = this.stormLine.obZ; }
     this.contracts?.updateAudio();
-    if (this.contracts && this.contracts.obLevel > this.obLevel) { this.obLevel = this.contracts.obLevel; this.obPitch = this.contracts.obPitch; }
+    if (this.contracts && this.contracts.obLevel > this.obLevel) { this.obLevel = this.contracts.obLevel; this.obPitch = this.contracts.obPitch; this.obX = this.contracts.obX; this.obZ = this.contracts.obZ; }
+  }
+
+  wakeHeightAt(x, z, t) {
+    let height = this.passage?.wakeHeightAt(x, z, t) || 0;
+    height += this.stormLine?.wakeHeightAt(x, z, t) || 0;
+    height += this.contracts?.wakeHeightAt(x, z, t) || 0;
+    if (this.departT > 0 && this.departSpeed > 2.2) {
+      const p = this.departPoint;
+      height += wakeSampleAt(p.x, p.z, p.heading, this.departSpeed, 6.6, 0.09, x, z, t);
+    }
+    return clampWakeHeight(height, 0.28);
+  }
+
+  visitActiveVessels(visitor) {
+    const passageAgent = this.passage?.agent;
+    if (this.passage?.chaseActive && passageAgent?.active) visitor(passageAgent.x, passageAgent.z, passageAgent.speed, 'skiff', passageAgent);
+    const stormAgents = this.stormLine?.agents;
+    if (stormAgents) for (let i = 0; i < stormAgents.length; i++) {
+      const agent = stormAgents[i]; if (agent.active) visitor(agent.x, agent.z, agent.speed, 'skiff', agent);
+    }
+    const contractAgents = this.contracts?.agents;
+    if (contractAgents) for (let i = 0; i < contractAgents.length; i++) {
+      const agent = contractAgents[i]; if (agent.active) visitor(agent.x, agent.z, agent.speed, 'skiff', agent);
+    }
+    if (this.departT > 0) visitor(this.departPoint.x, this.departPoint.z, this.departSpeed, 'skiff', this.departPoint);
   }
 
   stamps(out) {

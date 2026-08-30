@@ -16,9 +16,19 @@ const ROOT = 3200, LEVELS = 6, FAR = 7200;
 const SEGS_BY_LEVEL = [64, 32, 32, 32, 16, 8];
 // how far (in multiples of its size) a node of each level keeps subdividing: the fine rings are tight, the far ones wide
 const SPLIT_K = [0, 2.2, 1.8, 1.4, 1.2, 1.0]; // full detail to 440 m, mid to 720 m, trees-only to 1.1 km, sparse to 1.9 km, crossed cards to 3.2 km
-const PREFETCH = 1.35; // children are built this far ahead of the ring reaching them
+const DEFAULT_PREFETCH = 1.35; // children are built this far ahead of the ring reaching them
+const DEFAULT_FINALIZE_BUDGET_MS = 4;
 const SIZE = (l) => ROOT / (1 << (LEVELS - 1 - l));
 const L0 = SIZE(0);
+
+export function normalizeTerrainStreamOptions(options = {}) {
+  const prefetch = Number(options.prefetch), finalizeBudgetMs = Number(options.finalizeBudgetMs), workerLimit = Number(options.workerLimit);
+  return {
+    prefetch: Math.max(1.05, Math.min(1.5, Number.isFinite(prefetch) ? prefetch : DEFAULT_PREFETCH)),
+    finalizeBudgetMs: Math.max(0.75, Math.min(6, Number.isFinite(finalizeBudgetMs) ? finalizeBudgetMs : DEFAULT_FINALIZE_BUDGET_MS)),
+    workerLimit: Math.max(1, Math.min(4, Math.trunc(Number.isFinite(workerLimit) ? workerLimit : 4))),
+  };
+}
 
 export function compareTerrainBuildPriority(a, b) {
   const ap = Number.isFinite(a?.prio) ? a.prio : Infinity, bp = Number.isFinite(b?.prio) ? b.prio : Infinity;
@@ -33,9 +43,9 @@ export function shouldPreemptTerrainBuild(active, next, paused = null) {
 }
 
 class WorkerPool {
-  constructor(seed) {
+  constructor(seed, workerLimit = 4) {
     this.seed = seed;
-    const n = Math.min(4, Math.max(1, (navigator.hardwareConcurrency || 4) - 2));
+    const n = Math.min(workerLimit, 4, Math.max(1, (navigator.hardwareConcurrency || 4) - 2));
     this.workers = []; this.pending = new Map(); this.id = 0; this.rr = 0; this.inFlight = 0; this.respawns = 0;
     for (let i = 0; i < n; i++) this.workers.push(this.spawn(i));
     this.capacity = n * 2;
@@ -81,7 +91,7 @@ class Chunk {
     this.level = level; this.i = i; this.j = j; this.size = SIZE(level); this.segs = SEGS_BY_LEVEL[level]; this.x0 = i * this.size; this.z0 = j * this.size;
     this.key = `${level}:${i}:${j}`;
     this.h = null; this.nrm = null; this.bio = null; this.mesh = null; this.veg = null; this.colliders = [];
-    this.requested = false; this.groundReady = false; this.ready = false; this.used = 0; this.prio = 0; this.build = null;
+    this.requested = false; this.groundReady = false; this.ready = false; this.used = 0; this.prio = 0; this.prioBias = 0; this.build = null;
   }
   sample(x, z, arr = this.h) {
     const n = this.segs, step = this.size / n;
@@ -96,12 +106,16 @@ class Chunk {
 }
 
 export class Terrain {
-  constructor(seed = 7) {
+  constructor(seed = 7, options = {}) {
+    const stream = normalizeTerrainStreamOptions(options);
     this.hf = new WorldHeight(seed);
     this.bars = this.hf.bars;
     this.lagoon = new THREE.Vector2(this.hf.lagoon.x, this.hf.lagoon.y);
     this.island = new THREE.Vector2(this.hf.island.x, this.hf.island.y);
-    this.pool = new WorkerPool(seed);
+    this.pool = new WorkerPool(seed, stream.workerLimit);
+    this.prefetch = stream.prefetch;
+    this.finalizeBudgetMs = stream.finalizeBudgetMs;
+    this.workerLimit = stream.workerLimit;
     this.chunks = new Map();
     this.group = new THREE.Group(); this.group.name = 'terrain';
     this.hooks = { ready: null, done: null, dispose: null };
@@ -110,7 +124,9 @@ export class Terrain {
     this.visible = new Set(); this.nextVisible = new Set();
     this.streamNodes = []; this.streamNodeCount = 0;
     this.stats = { chunks: 0, visible: 0, inFlight: 0 };
+    this.finalizerTiming = { steps: 0, totalStepMs: 0, maxStepMs: 0, longSteps: 0, lastStepMs: 0 };
     this.indices = new Map();
+    this.surfaceWetness = 0; this.surfaceWaterLevel = 0;
   }
   // ---- queries ----
   heightAt(x, z) {
@@ -166,14 +182,16 @@ export class Terrain {
       shader.uniforms.tSand = { value: tex.sand };
       shader.uniforms.tNoise = { value: tex.noise };
       shader.uniforms.uTime = { value: 0 };
+      shader.uniforms.uSurfaceWetness = { value: this.surfaceWetness };
+      shader.uniforms.uWaterLevel = { value: this.surfaceWaterLevel };
       this.uniforms = shader.uniforms;
       shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nvarying vec3 vWPos;')
-        .replace('#include <worldpos_vertex>', '#include <worldpos_vertex>\nvWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+        .replace('#include <common>', '#include <common>\nvarying vec3 vWPos; varying float vWorldUp;')
+        .replace('#include <worldpos_vertex>', '#include <worldpos_vertex>\nvWPos = (modelMatrix * vec4(transformed, 1.0)).xyz; vWorldUp = normalize(mat3(modelMatrix) * normal).y;');
       shader.fragmentShader = shader.fragmentShader
         .replace('#include <common>', `#include <common>
-          varying vec3 vWPos;
-          uniform sampler2D tGrass, tMud, tSand, tNoise; uniform float uTime;
+          varying vec3 vWPos; varying float vWorldUp;
+          uniform sampler2D tGrass, tMud, tSand, tNoise; uniform float uTime, uSurfaceWetness, uWaterLevel;
           float caustic(vec2 p, float t) {
             float a = texture2D(tNoise, p * 0.55 + vec2(t * 0.021, t * 0.017)).g;
             float b = texture2D(tNoise, p * 0.62 - vec2(t * 0.019, -t * 0.023) + 0.37).b;
@@ -194,22 +212,32 @@ export class Terrain {
           vec3 sandB = texture2D(tSand, tuv * 0.031 + 0.2).rgb;
           sand = mix(sand, sandB, 0.5) * 0.75;
           float h = vWPos.y;
-          float slope = 1.0 - clamp(normalize(vNormal).z, 0.0, 1.0);
+          float slope = 1.0 - clamp(vWorldUp, 0.0, 1.0);
           float wMud = smoothstep(1.9, 0.2, h + macro2 * 1.2);
           float wSand = smoothstep(-0.05, -0.9, h);
           wSand = max(wSand, smoothstep(0.7, 0.15, abs(h - 0.45)) * smoothstep(0.3, 0.55, macro) * (1.0 - slope * 3.0));
           vec3 col = mix(grass, mud, wMud);
           col = mix(col, sand, wSand);
           col *= mix(0.45, 1.0, smoothstep(-0.25, 1.2, h));
+          float shorelineDamp = 1.0 - smoothstep(uWaterLevel + 0.1, uWaterLevel + 1.1, h);
+          float wetFilm = clamp((uSurfaceWetness + shorelineDamp * 0.38) * smoothstep(0.2, 0.82, vWorldUp), 0.0, 1.0);
+          col *= mix(1.0, 0.72, wetFilm);
           if (h < 0.05) {
             float c = caustic(tuv, uTime);
             col *= 1.0 + c * 0.75 * smoothstep(-6.0, -0.3, h) * smoothstep(0.05, -0.15, h);
           }
-          diffuseColor.rgb *= col;`);
+          diffuseColor.rgb *= col;`)
+        .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix(roughnessFactor, 0.2, wetFilm * wetFilm);');
     };
-    mat.customProgramCacheKey = () => 'terrain';
+    mat.customProgramCacheKey = () => 'terrain-wet-v1';
     this.material = mat;
     return this.group;
+  }
+
+  setSurfaceWetness(wetness = 0, waterLevel = 0) {
+    this.surfaceWetness = Math.max(0, Math.min(1, Number(wetness) || 0));
+    this.surfaceWaterLevel = Number.isFinite(Number(waterLevel)) ? Number(waterLevel) : 0;
+    if (this.uniforms) { this.uniforms.uSurfaceWetness.value = this.surfaceWetness; this.uniforms.uWaterLevel.value = this.surfaceWaterLevel; }
   }
   makeGeometry(c) {
     const n = c.segs, w = n + 1, step = c.size / n, shared = this.indexFor(n), count = w * w + shared.skirtCount;
@@ -245,8 +273,17 @@ export class Terrain {
     return Math.hypot(dx, dz);
   }
   request(c, dist) {
+    c.prioBias = Math.max(0, dist - this.boxDist(c.x0, c.z0, c.size)) / c.size;
     c.prio = dist / c.size;
     if (!c.requested) { c.requested = true; this.queue.push(c); }
+  }
+  reprioritizePending() {
+    const update = c => { if (c) c.prio = this.boxDist(c.x0, c.z0, c.size) / c.size + (c.prioBias || 0); };
+    for (const c of this.queue) update(c);
+    for (const c of this.finalize) update(c);
+    update(this.building); update(this.pausedBuilding);
+    this.queue.sort(compareTerrainBuildPriority);
+    this.finalize.sort(compareTerrainBuildPriority);
   }
   streamNode() {
     let node = this.streamNodes[this.streamNodeCount++];
@@ -272,7 +309,8 @@ export class Terrain {
         if (level < LEVELS - 1) { const pc = this.ensure(level + 1, i >> 1, j >> 1); pc.used = now; if (!pc.ready) this.request(pc, d); }
       }
       // build the children before the ring reaches them, so the split never waits (and never needs a fallback)
-      if (level > 0 && d < size * SPLIT_K[level] * PREFETCH) for (let a = 0; a < 2; a++) for (let b = 0; b < 2; b++) {
+      const prefetch = this.prefetch || DEFAULT_PREFETCH;
+      if (level > 0 && d < size * SPLIT_K[level] * prefetch) for (let a = 0; a < 2; a++) for (let b = 0; b < 2; b++) {
         const cs = size / 2, cx0 = (i * 2 + a) * cs, cz0 = (j * 2 + b) * cs;
         if (cx0 >= WORLD_HALF || cz0 >= WORLD_HALF || cx0 + cs <= -WORLD_HALF || cz0 + cs <= -WORLD_HALF) continue;
         const cc = this.ensure(level - 1, i * 2 + a, j * 2 + b); cc.used = now; if (!cc.ready) this.request(cc, this.boxDist(cx0, cz0, cs) + size);
@@ -322,7 +360,15 @@ export class Terrain {
       if (this.building === c) continue;
       this.dispose(c);
     }
-    this.queue.sort((a, b) => a.prio - b.prio);
+    // A resumed save can move the camera away from the dock while its first grids are still queued. Re-score all
+    // unfinished work against the current focus so stale zero-distance dock chunks cannot starve the boat's tile.
+    this.reprioritizePending();
+  }
+  // Begin the worker-side height grids while the main thread is still preparing lighting, boats and shaders. Results
+  // remain in the normal finalization queue, so ground and foliage ownership is unchanged when the frame loop starts.
+  prime(x, z, now = performance.now()) {
+    this.camPos.set(x, z); this.streamT = now; this.stream(now); this.pump();
+    return { queued: this.queue.length, inFlight: this.pool.inFlight };
   }
   dispose(c) {
     this.chunks.delete(c.key);
@@ -358,7 +404,7 @@ export class Terrain {
       this.pausedBuilding = this.building; this.building = null;
     }
     // finalize grids into meshes + vegetation, within a per-frame time budget
-    const budget = now + 4;
+    const budget = now + (this.finalizeBudgetMs || DEFAULT_FINALIZE_BUDGET_MS);
     while (performance.now() < budget) {
       if (!this.building) {
         let c = null;
@@ -376,7 +422,13 @@ export class Terrain {
         if (!c.build) { this.finish(c); continue; }
       }
       const c = this.building;
+      const stepStartedAt = performance.now();
       const r = c.build.next();
+      const stepMs = performance.now() - stepStartedAt;
+      const timing = this.finalizerTiming ||= { steps: 0, totalStepMs: 0, maxStepMs: 0, longSteps: 0, lastStepMs: 0 };
+      timing.steps++; timing.totalStepMs += stepMs; timing.lastStepMs = stepMs;
+      timing.maxStepMs = Math.max(timing.maxStepMs, stepMs);
+      if (stepMs > (this.finalizeBudgetMs || DEFAULT_FINALIZE_BUDGET_MS)) timing.longSteps++;
       if (r.done) this.finish(c);
     }
     this.stats.chunks = this.chunks.size; this.stats.visible = this.visible.size; this.stats.inFlight = this.pool.inFlight;
@@ -402,7 +454,8 @@ export class Terrain {
       terrainGrid += grid; terrainGeometry += geometry; vegetation += veg; vegetationInstances += instances; vegetationMeshes += meshes; colliders += c.colliders.length;
       l.terrainGrid += grid; l.terrainGeometry += geometry; l.vegetation += veg; l.vegetationInstances += instances; l.vegetationMeshes += meshes; l.colliders += c.colliders.length;
     }
-    return { chunks: this.chunks.size, visible: this.visible.size, terrainGrid, terrainGeometry, vegetation, vegetationInstances, vegetationMeshes, colliders, finalization: { queued: this.finalize.length, building: this.building?.key || '', paused: this.pausedBuilding?.key || '' }, streamNodes: { active: this.streamNodeCount, capacity: this.streamNodes.length }, levels };
+    const timing = this.finalizerTiming ||= { steps: 0, totalStepMs: 0, maxStepMs: 0, longSteps: 0, lastStepMs: 0 };
+    return { chunks: this.chunks.size, visible: this.visible.size, terrainGrid, terrainGeometry, vegetation, vegetationInstances, vegetationMeshes, colliders, streamBudget: { prefetch: this.prefetch || DEFAULT_PREFETCH, finalizeBudgetMs: this.finalizeBudgetMs || DEFAULT_FINALIZE_BUDGET_MS, workerLimit: this.workerLimit || 4, workerCapacity: this.pool.capacity }, finalization: { queued: this.finalize.length, building: this.building?.key || '', paused: this.pausedBuilding?.key || '', steps: timing.steps, averageStepMs: timing.steps ? timing.totalStepMs / timing.steps : 0, maxStepMs: timing.maxStepMs, longSteps: timing.longSteps, lastStepMs: timing.lastStepMs }, streamNodes: { active: this.streamNodeCount, capacity: this.streamNodes.length }, levels };
   }
   finish(c) {
     this.building = null; c.build = null; c.ready = true;

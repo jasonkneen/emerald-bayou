@@ -1,7 +1,12 @@
 import * as THREE from 'three';
+import { anchorConstraintForce } from './anchor.js';
 import * as TEX from './textures.js';
 import { WORLD_HALF } from './heightfield.js';
 import { loadModel } from './models.js';
+import { HullDamageMaterial } from './hulldamage.js';
+import { person } from './folk.js';
+import { mulberry32 } from './noise.js';
+import { registerWetMaterial } from './surfacewetness.js';
 
 // Boat local frame: +X starboard, +Y up, -Z forward (bow at -Z).
 // The player boat and scheduled traffic use the same detailed hull. Keep one immutable render template so its
@@ -36,13 +41,14 @@ export function airboatWetnessStep(current = 0, { rain = 0, spray = 0, splash = 
 // immutable traffic template, while the retained records let every frame update uniforms without a scene traversal.
 export function prepareAirboatWetSurfaces(group) {
   if (!group?.traverse) return EMPTY_WET_SURFACES;
-  const clones = new Map(), surfaces = [];
-  const wetMaterial = original => {
+  const clones = new Map(), damageClones = new Map(), surfaces = [];
+  const wetMaterial = (original, damageSurface = false) => {
     if (!original?.isMeshStandardMaterial) return original;
-    const found = clones.get(original); if (found) return found.material;
+    const registry = damageSurface ? damageClones : clones;
+    const found = registry.get(original); if (found) return found.material;
     const material = original.clone(), metalness = unit(material.metalness), dryRoughness = unit(material.roughness);
     const record = {
-      material,
+      material, damageSurface,
       dryRoughness,
       minRoughness: Math.min(dryRoughness, 0.16),
       roughnessDrop: 0.44 + (1 - metalness) * 0.18,
@@ -53,12 +59,13 @@ export function prepareAirboatWetSurfaces(group) {
       dryNormalX: material.normalMap ? material.normalScale.x : 0,
       dryNormalY: material.normalMap ? material.normalScale.y : 0,
     };
-    clones.set(original, record); surfaces.push(record); return material;
+    registry.set(original, record); surfaces.push(record); return material;
   };
   group.traverse(object => {
     if (!object.isMesh) return;
-    if (Array.isArray(object.material)) object.material = object.material.map(wetMaterial);
-    else object.material = wetMaterial(object.material);
+    const damageSurface = object.userData.hullDamageSurface === true;
+    if (Array.isArray(object.material)) object.material = object.material.map(material => wetMaterial(material, damageSurface));
+    else object.material = wetMaterial(object.material, damageSurface);
   });
   return surfaces;
 }
@@ -82,6 +89,24 @@ export function setAirboatWetness(boat, value = 0) {
 
 export function updateAirboatWetness(boat, conditions) {
   return setAirboatWetness(boat, airboatWetnessStep(boat?.surfaceWetness, conditions));
+}
+
+// Persistent world airboats share the immutable template's PBR materials, so one global storm-film registration
+// makes every copy react to rain, hail and dew without per-boat clones. The player keeps its independent spray film.
+export function registerAirboatEnvironmentWetness(group) {
+  if (!group?.traverse || group.userData?.airboatDynamicWetness) return 0;
+  const materials = new Set();
+  group.traverse(object => {
+    if (!object.isMesh || !object.material) return;
+    const source = Array.isArray(object.material) ? object.material : [object.material];
+    for (let i = 0; i < source.length; i++) {
+      const material = source[i];
+      if (!material?.isMeshStandardMaterial || materials.has(material)) continue;
+      materials.add(material); registerWetMaterial(material);
+    }
+  });
+  group.userData.airboatEnvironmentWetSurfaces = materials.size;
+  return materials.size;
 }
 
 function createAirboatTemplate() {
@@ -124,7 +149,8 @@ function createAirboatTemplate() {
   const hullGeo = new THREE.ExtrudeGeometry(shape, { depth: 0.58, bevelEnabled: true, bevelThickness: 0.05, bevelSize: 0.05, bevelSegments: 2 });
   hullGeo.rotateX(-Math.PI / 2);
   boxUV(hullGeo, 0.42);
-  const hull = new THREE.Mesh(hullGeo, hullMat); hull.castShadow = true; hull.receiveShadow = true; g.add(hull);
+  const hull = new THREE.Mesh(hullGeo, hullMat); hull.name = 'airboat hull'; hull.userData.hullDamageSurface = true;
+  hull.castShadow = true; hull.receiveShadow = true; g.add(hull);
   // polymer bottom sheet (slightly proud of the hull, lighter grey)
   const polyGeo = new THREE.ExtrudeGeometry(shape, { depth: 0.05, bevelEnabled: false }); polyGeo.rotateX(-Math.PI / 2); polyGeo.translate(0, -0.055, 0); boxUV(polyGeo, 0.42);
   const poly = new THREE.Mesh(polyGeo, new THREE.MeshStandardMaterial({ color: 0x6d7174, roughness: 0.55, metalness: 0.1 })); poly.scale.set(1.012, 1, 1.006); g.add(poly);
@@ -261,7 +287,7 @@ function createAirboatTemplate() {
   return { group: g, prop, blur, rudders, cage };
 }
 
-export function buildAirboat({ dynamicWetness = false, initialWetness = 0.06 } = {}) {
+export function buildAirboat({ dynamicWetness = false, initialWetness = 0.06, profile = {} } = {}) {
   if (!airboatTemplate) airboatTemplate = createAirboatTemplate();
   const group = airboatTemplate.group.clone(true);
   const prop = group.getObjectByName('airboat propeller');
@@ -271,9 +297,12 @@ export function buildAirboat({ dynamicWetness = false, initialWetness = 0.06 } =
   // Opacity is driven independently by each engine's RPM. Ambient boats keep every PBR material shared; only the
   // player requests the small unique set whose roughness and colour respond to rain and spray.
   blur.material = blur.material.clone();
-  const boat = { group, prop, blur, rudders, cage, wetSurfaceMaterials: EMPTY_WET_SURFACES, surfaceWetness: 0 };
+  group.userData.airboatDynamicWetness = dynamicWetness;
+  const boat = { group, prop, blur, rudders, cage, wetSurfaceMaterials: EMPTY_WET_SURFACES, surfaceWetness: 0, hullDamage: null };
   if (dynamicWetness) {
     boat.wetSurfaceMaterials = prepareAirboatWetSurfaces(group);
+    const damageSurface = boat.wetSurfaceMaterials.find(surface => surface.damageSurface);
+    if (damageSurface) boat.hullDamage = new HullDamageMaterial(damageSurface.material, profile);
     setAirboatWetness(boat, initialWetness);
   }
   return boat;
@@ -284,7 +313,7 @@ export function buildAirboat({ dynamicWetness = false, initialWetness = 0.06 } =
 let driverTemplatePromise = null;
 function driverTemplate() {
   if (!driverTemplatePromise) driverTemplatePromise = loadModel('driver').then(root => {
-    if (!root) throw new Error('driver model unavailable');
+    if (!root) return null;
     root.name = 'seated driver template';
     root.traverse(o => {
       if (!o.isMesh) return;
@@ -295,15 +324,153 @@ function driverTemplate() {
   });
   return driverTemplatePromise;
 }
-export function loadDriver(group, { scale = 0.65, position = [0, 1.7, 0.4], yaw = Math.PI } = {}) {
-  return driverTemplate().then(root => {
-    const m = root.clone(true); m.name = 'seated driver'; m.scale.setScalar(scale); m.rotation.y = yaw; m.position.fromArray(position); m.userData.baseYaw = yaw; group.add(m); return m;
+export function createSeatedDriverMount(root, { scale = 0.65, position = [0, 1.7, 0.4], yaw = Math.PI } = {}) {
+  // Keep the authored yaw/scale below a boat-local mount. The source is a single static mesh, so this retained
+  // mount gives the player a convincing seated-body response without another model, material, draw call or mixer.
+  const mount = new THREE.Group(); mount.name = 'seated driver'; mount.position.fromArray(position); mount.userData.baseYaw = 0;
+  const model = root.clone(true); model.name = 'seated driver model'; model.scale.setScalar(scale); model.rotation.y = yaw;
+  mount.userData.model = model; mount.add(model); return mount;
+}
+
+let proceduralDriverSeatResources = null, proceduralDriverSerial = 0;
+function fallbackDriverSeatResources() {
+  if (!proceduralDriverSeatResources) proceduralDriverSeatResources = {
+    cushionGeometry: new THREE.BoxGeometry(0.58, 0.12, 0.52),
+    pedestalGeometry: new THREE.CylinderGeometry(0.075, 0.1, 0.5, 8),
+    cushionMaterial: new THREE.MeshStandardMaterial({ color: 0x242625, roughness: 0.88 }),
+    pedestalMaterial: new THREE.MeshStandardMaterial({ color: 0x4c5150, roughness: 0.4, metalness: 0.72 }),
+  };
+  return proceduralDriverSeatResources;
+}
+
+// Fallback and Performance deliberately skip the optional 563 kB driver GLB. Keep a real operator at the helm on
+// those tiers by reusing the jointed resident body resources; only the tiny seat cushion and pedestal are unique.
+export function createProceduralDriverMount({ seed = 0x51a7b0a7, position = [0, 1.7, 0.4], yaw = Math.PI } = {}) {
+  const root = new THREE.Group(); root.name = 'procedural seated driver root';
+  const operator = person(mulberry32(Number(seed) >>> 0), { pose: 'sit', drive: true, hat: true, vest: true });
+  operator.name = 'procedural airboat operator';
+  // The authored model's mount stays fixed. These child offsets put the hips on the 1.62 m seat and the boots over
+  // the existing footrest, letting an eventual GLB swap preserve the whole-body spring state without a visible pop.
+  operator.position.set(0, -0.55, -0.22); root.add(operator);
+  const resources = fallbackDriverSeatResources();
+  const cushion = new THREE.Mesh(resources.cushionGeometry, resources.cushionMaterial); cushion.name = 'procedural driver seat'; cushion.position.set(0, -0.14, -0.3); cushion.castShadow = true; root.add(cushion);
+  const pedestal = new THREE.Mesh(resources.pedestalGeometry, resources.pedestalMaterial); pedestal.name = 'procedural driver pedestal'; pedestal.position.set(0, -0.41, -0.3); pedestal.castShadow = true; root.add(pedestal);
+  const mount = createSeatedDriverMount(root, { scale: 1, position, yaw });
+  mount.userData.fallback = true; mount.userData.operator = mount.userData.model.getObjectByName('procedural airboat operator');
+  return mount;
+}
+
+export function replaceSeatedDriverModel(mount, root, { scale = 0.65, yaw = Math.PI } = {}) {
+  if (!mount?.isGroup || !root) return null;
+  const previous = mount.userData.model, model = root.clone(true);
+  model.name = 'seated driver model'; model.scale.setScalar(scale); model.rotation.y = yaw;
+  if (previous) mount.remove(previous);
+  mount.add(model); mount.userData.model = model; mount.userData.operator = null; mount.userData.fallback = false;
+  return model;
+}
+
+// Installs a visible operator synchronously, then upgrades that same animated mount if the authored model is allowed
+// to load. The retained promise is cleared after settlement so low-memory sessions do not keep loader bookkeeping.
+export function installDriver(group, options = {}) {
+  const seed = Number.isFinite(Number(options.seed)) ? Number(options.seed) : 0x51a7b0a7 + proceduralDriverSerial++ * 977;
+  const position = options.position || [0, 1.7, 0.4], yaw = Number.isFinite(Number(options.yaw)) ? Number(options.yaw) : Math.PI;
+  const mount = createProceduralDriverMount({ seed, position, yaw }); group.add(mount);
+  const ready = driverTemplate().then(root => {
+    if (root) replaceSeatedDriverModel(mount, root, { scale: options.scale, yaw });
+    mount.userData.modelReady = null; return mount;
+  }).catch(error => {
+    mount.userData.modelReady = null; mount.userData.modelLoadFailed = true;
+    console.warn('driver model upgrade failed', error); return mount;
   });
+  mount.userData.modelReady = ready; return mount;
+}
+
+export function loadDriver(group, options = {}) {
+  return driverTemplate().then(root => {
+    if (!root) return null;
+    const mount = createSeatedDriverMount(root, options); group.add(mount); return mount;
+  });
+}
+
+const poseNumber = value => Number.isFinite(Number(value)) ? Number(value) : 0;
+const poseClamp = (value, lo, hi) => Math.max(lo, Math.min(hi, value));
+
+// Boat-local targets: +pitch braces aft under acceleration, +roll leans to port, and +yaw looks into a port turn.
+// `out` is caller-owned because the player pose is evaluated every active frame.
+export function seatedDriverPoseTargets(physics = {}, acceleration = 0, out = {}) {
+  const steer = poseClamp(poseNumber(physics.steer), -1, 1);
+  const turn = poseClamp(steer * 0.34 + poseNumber(physics.angVel) * 0.46, -1, 1);
+  const apparentWind = poseClamp(poseNumber(physics.apparentWind) / 50, 0, 1);
+  const wipeout = poseClamp(poseNumber(physics.wipeT) / 1.4, 0, 1);
+  out.pitch = poseClamp(poseNumber(acceleration) * 0.009 - poseNumber(physics.pitch) * 0.2 - apparentWind * 0.022 - wipeout * 0.035, -0.12, 0.12);
+  out.roll = poseClamp(turn * 0.085 - poseNumber(physics.roll) * 0.3, -0.13, 0.13);
+  out.yaw = poseClamp(turn * 0.052 + steer * 0.024, -0.08, 0.08);
+  out.height = physics.airborne ? -poseClamp(poseNumber(physics.airTime) * 0.008, 0, 0.014) : 0;
+  return out;
+}
+
+function seatedDriverPoseState(driver, physics) {
+  const state = {
+    baseX: driver.position.x, baseY: driver.position.y, baseZ: driver.position.z,
+    basePitch: driver.rotation.x, baseYaw: driver.rotation.y, baseRoll: driver.rotation.z,
+    pitch: 0, roll: 0, yaw: 0, height: 0,
+    pitchVelocity: 0, rollVelocity: 0, yawVelocity: 0, heightVelocity: 0,
+    acceleration: 0, previousSpeed: poseNumber(physics?.speed), target: { pitch: 0, roll: 0, yaw: 0, height: 0 },
+  };
+  driver.rotation.order = 'YXZ'; driver.userData.seatedDriverPose = state; return state;
+}
+
+function seatedDriverSpring(state, valueKey, velocityKey, target, stiffness, damping, dt, limit) {
+  state[velocityKey] += ((target - state[valueKey]) * stiffness - state[velocityKey] * damping) * dt;
+  state[valueKey] = poseClamp(state[valueKey] + state[velocityKey] * dt, -limit, limit);
+}
+
+// One retained state object and one retained target record are reused for the life of each animated driver. Callers
+// apply animation LOD before invoking this for ambient operators, so distant traffic pays no pose update cost.
+export function updateSeatedDriverPose(driver, physics = {}, dt = 0, time = 0) {
+  if (!driver) return null;
+  const step = poseClamp(poseNumber(dt), 0, 0.05);
+  const state = driver.userData.seatedDriverPose || seatedDriverPoseState(driver, physics);
+  if (!step) return state;
+
+  const speed = Math.max(0, poseNumber(physics.speed));
+  const rawAcceleration = poseClamp((speed - state.previousSpeed) / step, -10, 8);
+  state.previousSpeed = speed;
+  state.acceleration += (rawAcceleration - state.acceleration) * (1 - Math.exp(-step * 4.5));
+  seatedDriverPoseTargets(physics, state.acceleration, state.target);
+
+  const impact = Math.max(0, poseNumber(physics.impact)), hit = Math.max(0, poseNumber(physics.hit));
+  if (impact > 0.5) {
+    state.pitchVelocity -= Math.min(0.24, impact * 0.012);
+    state.heightVelocity -= Math.min(0.42, impact * 0.026);
+  }
+  if (hit > 1.5) {
+    state.pitchVelocity -= Math.min(0.4, hit * 0.028);
+    const heading = poseNumber(physics.heading), normalX = poseNumber(physics.hitNormal?.x), normalZ = poseNumber(physics.hitNormal?.y);
+    const side = normalX * -Math.cos(heading) + normalZ * Math.sin(heading);
+    state.rollVelocity -= poseClamp(side * hit * 0.032, -0.34, 0.34);
+    state.yawVelocity -= poseClamp(side * hit * 0.016, -0.18, 0.18);
+  }
+
+  seatedDriverSpring(state, 'pitch', 'pitchVelocity', state.target.pitch, 42, 11.5, step, 0.17);
+  seatedDriverSpring(state, 'roll', 'rollVelocity', state.target.roll, 46, 12.5, step, 0.18);
+  seatedDriverSpring(state, 'yaw', 'yawVelocity', state.target.yaw, 36, 10.5, step, 0.11);
+  seatedDriverSpring(state, 'height', 'heightVelocity', state.target.height, 68, 14.5, step, 0.035);
+
+  const seconds = poseNumber(time), rpm = poseClamp(poseNumber(physics.rpm), 0, 1);
+  const breathing = Math.sin(seconds * 1.2) * 0.0018;
+  const enginePulse = Math.sin(seconds * (18 + rpm * 8)) * rpm * 0.0009;
+  driver.position.set(state.baseX, state.baseY + state.height + breathing + enginePulse, state.baseZ);
+  driver.rotation.set(state.basePitch + state.pitch + enginePulse * 0.45, state.baseYaw + state.yaw, state.baseRoll + state.roll, 'YXZ');
+  return state;
 }
 
 // ---------------- physics ----------------
 const DRAFT = 0.32; // hull bottom sits this far below the hull reference point
 const G = 9.8;
+const HULL_COLLISION_CIRCLES = [0, -1.7, 1.2, 0, 0, 1.3, 0, 1.6, 1.25];
+const hullHeightAt = (terrain, px, pz, right, forward, ox, oz) => terrain.heightAt(px + right.x * ox + forward.x * (-oz), pz + right.y * ox + forward.y * (-oz));
+const springStep = (value, target, velocity, stiffness, damping, dt) => velocity + ((target - value) * stiffness - velocity * damping) * dt;
 
 export class AirboatPhysics {
   constructor(terrain, x = 0, z = 60, heading = 0) {
@@ -335,8 +502,11 @@ export class AirboatPhysics {
     this.noseIn = 0; this.tailIn = 0; this.wipeT = 0; this.stuffT = 0;
     this.lastSurfVel = 0; this.spinIn = 0;
     this.topSpeed = 0;
+    this.windHeel = 0; this.apparentWind = 0; this.crosswind = 0;
     this.current = new THREE.Vector2(); this.waterSpeed = 0;
-    this._g = new THREE.Vector2(); this._n = new THREE.Vector2();
+    this.anchorConstraint = null;
+    this._anchorForce = { x: 0, z: 0, force: 0, load: 0, distance: 0, extension: 0, taut: false };
+    this._g = new THREE.Vector2(); this._n = new THREE.Vector2(); this._f = new THREE.Vector2(); this._r = new THREE.Vector2();
   }
   forward(out = new THREE.Vector2()) { return out.set(-Math.sin(this.heading), -Math.cos(this.heading)); }
   right(out = new THREE.Vector2()) { return out.set(-Math.cos(this.heading), Math.sin(this.heading)); }
@@ -364,10 +534,42 @@ export class AirboatPhysics {
     }
     return out;
   }
+  resolveCircle(cx, cz, radius, obstacle, forward) {
+    for (let i = 0; i < HULL_COLLISION_CIRCLES.length; i += 3) {
+      const ox = HULL_COLLISION_CIRCLES[i], oz = HULL_COLLISION_CIRCLES[i + 1], circleRadius = HULL_COLLISION_CIRCLES[i + 2];
+      const hx = this.pos.x + forward.x * (-oz) + this._r.x * ox, hz = this.pos.y + forward.y * (-oz) + this._r.y * ox;
+      const dx = hx - cx, dz = hz - cz, distance = Math.hypot(dx, dz), combinedRadius = radius + circleRadius;
+      if (distance >= combinedRadius) continue;
+      const nx = dx / (distance || 1), nz = dz / (distance || 1), penetration = combinedRadius - distance;
+      this.pos.x += nx * penetration; this.pos.y += nz * penetration;
+      const into = this.vel.x * nx + this.vel.y * nz;
+      if (into >= 0) continue;
+      this.vel.x -= into * nx * 1.35; this.vel.y -= into * nz * 1.35;
+      if (-into >= this.hit) { this.hit = -into; this.hitNormal.set(nx, nz); this.hitTag = obstacle && obstacle.tag || ''; this.hitObj = obstacle; }
+      if (obstacle && obstacle.onHit) obstacle.onHit(-into, nx, nz, this);
+      // Glancing contact turns the hull about the point that struck the obstacle.
+      const lx = hx - this.pos.x, lz = hz - this.pos.y;
+      this.angVel += (lx * (-into * nz) - lz * (-into * nx)) * 0.12;
+      this.vel.multiplyScalar(0.82);
+    }
+  }
+  resolveObstacle(obstacle, forward) {
+    let cx = obstacle.x, cz = obstacle.z;
+    if (obstacle.ax !== undefined) {
+      const abx = obstacle.bx - obstacle.ax, abz = obstacle.bz - obstacle.az, lengthSq = abx * abx + abz * abz;
+      let along = ((this.pos.x - obstacle.ax) * abx + (this.pos.y - obstacle.az) * abz) / (lengthSq || 1);
+      along = Math.max(0, Math.min(1, along)); cx = obstacle.ax + abx * along; cz = obstacle.az + abz * along;
+    }
+    if (Math.abs(cx - this.pos.x) > 12 || Math.abs(cz - this.pos.y) > 12) return;
+    this.resolveCircle(cx, cz, obstacle.r, obstacle, forward);
+  }
   reset(x, z, heading = this.heading) {
+    if (this.anchorConstraint) this.anchorConstraint.resetRequested = true;
+    this.anchorConstraint = null;
     this.pos.set(x, z); this.vel.set(0, 0); this.heading = heading; this.angVel = 0; this.y = 0; this.vy = 0;
     this.pitch = this.roll = this.pitchVel = this.rollVel = 0; this.prevFloor = null; this.airTime = 0; this.airPeak = 0; this.lastFloat.set(x, z);
     this.airborne = false; this.landedFrame = false; this.takeoffFrame = false; this.landQuality = ''; this.wipeT = 0; this.stuffT = 0; this.impact = 0; this.hit = 0;
+    this.windHeel = 0; this.apparentWind = 0; this.crosswind = 0;
     this.current.set(0, 0); this.waterSpeed = 0;
   }
 
@@ -381,15 +583,15 @@ export class AirboatPhysics {
     const rpmTarget = powerScale > 0.01 ? (0.18 + Math.max(0, this.throttle) * 0.82) * Math.max(0.28, powerScale) : 0;
     this.rpm += (rpmTarget - this.rpm) * (1 - Math.exp(-dt * 2.5));
 
-    const fwd = this.forward(), rgt = this.right();
+    const fwd = this.forward(this._f), rgt = this.right(this._r);
     const massF = 1 + this.loaded * 0.18 + (this.damageLoad || 0);
     this.hit = 0; this.hitTag = ''; this.hitObj = null;
 
     // ---- support surfaces under the hull ----
     const px = this.pos.x, pz = this.pos.y;
-    const hAt = (ox, oz) => T.heightAt(px + rgt.x * ox + fwd.x * (-oz), pz + rgt.y * ox + fwd.y * (-oz));
-    const hC = T.heightAt(px, pz), hBow = hAt(0, -2.6), hStern = hAt(0, 2.3);
-    const hL = (hAt(-1.1, -1.0) + hAt(-1.1, 1.6)) * 0.5, hR = (hAt(1.1, -1.0) + hAt(1.1, 1.6)) * 0.5;
+    const hC = T.heightAt(px, pz), hBow = hullHeightAt(T, px, pz, rgt, fwd, 0, -2.6), hStern = hullHeightAt(T, px, pz, rgt, fwd, 0, 2.3);
+    const hL = (hullHeightAt(T, px, pz, rgt, fwd, -1.1, -1.0) + hullHeightAt(T, px, pz, rgt, fwd, -1.1, 1.6)) * 0.5;
+    const hR = (hullHeightAt(T, px, pz, rgt, fwd, 1.1, -1.0) + hullHeightAt(T, px, pz, rgt, fwd, 1.1, 1.6)) * 0.5;
     const hMean = (hC * 2 + hBow + hStern + hL + hR) / 6;
     const floor = Math.max(hC, hMean) + DRAFT;
     const waterC = waveFn(px, pz, t);
@@ -439,6 +641,13 @@ export class AirboatPhysics {
     const rvx = this.vel.x - cx, rvz = this.vel.y - cz;
     const vf = rvx * fwd.x + rvz * fwd.y, vl = rvx * rgt.x + rvz * rgt.y;
     this.waterSpeed = Math.hypot(rvx, rvz);
+    const anchor = this.anchorConstraint, anchorForce = this._anchorForce;
+    if (anchor?.active && anchor.engaged && this.wet > 0.2 && !this.airborne) {
+      anchorConstraintForce(anchor, px + fwd.x * 2.2, pz + fwd.y * 2.2, this.vel.x, this.vel.y, anchorForce);
+    } else {
+      anchorForce.x = 0; anchorForce.z = 0; anchorForce.force = 0; anchorForce.load = 0; anchorForce.distance = 0; anchorForce.extension = 0; anchorForce.taut = false;
+      if (anchor) { anchor.load = 0; anchor.force = 0; anchor.taut = false; }
+    }
 
     // ---- yaw ----
     const wash = (0.25 + Math.max(this.throttle, 0) * 0.75) * powerScale;
@@ -448,6 +657,7 @@ export class AirboatPhysics {
     let torque = this.airborne ? steer * 6.0 * wash : steer * (0.8 * wash + Math.abs(vf) * 0.045 * wet);
     torque -= this.angVel * ((this.airborne ? 1.0 : 0.55) + (1.35 + Math.abs(vf) * 0.08) * wet + land * 1.2);
     torque -= vl * 0.045 * wet * (vf >= 0 ? 1 : -1);
+    if (anchorForce.taut) torque -= (fwd.x * 2.2 * anchorForce.z - fwd.y * 2.2 * anchorForce.x) * 0.055 / massF;
     this.angVel += torque * dt;
     this.heading += this.angVel * dt;
 
@@ -457,6 +667,7 @@ export class AirboatPhysics {
     const dl = (-vl * Math.abs(vl) * 0.22 - vl * 0.9) * wet;
     let ax = fwd.x * (thrust + df) + rgt.x * dl;
     let az = fwd.y * (thrust + df) + rgt.y * dl;
+    ax += anchorForce.x / massF; az += anchorForce.z / massF;
     // air drag
     const sp0 = this.vel.length();
     ax -= this.vel.x * sp0 * 0.012; az -= this.vel.y * sp0 * 0.012;
@@ -490,47 +701,16 @@ export class AirboatPhysics {
     }
 
     // ---- obstacles: dock, tower, tree trunks ----
-    const circles = [[0, -1.7, 1.2], [0, 0, 1.3], [0, 1.6, 1.25]];
-    const resolve = (cx, cz, r, o = null) => {
-      for (const [ox, oz, cr] of circles) {
-        const hx = this.pos.x + fwd.x * (-oz), hz = this.pos.y + fwd.y * (-oz);
-        const dx = hx - cx, dz = hz - cz; const dd = Math.hypot(dx, dz); const R = r + cr;
-        if (dd >= R) continue;
-        const nx = dx / (dd || 1), nz = dz / (dd || 1);
-        const pen = R - dd;
-        this.pos.x += nx * pen; this.pos.y += nz * pen;
-        const into = this.vel.x * nx + this.vel.y * nz;
-        if (into < 0) {
-          this.vel.x -= into * nx * 1.35; this.vel.y -= into * nz * 1.35;
-          if (-into >= this.hit) { this.hit = -into; this.hitNormal.set(nx, nz); this.hitTag = o && o.tag || ''; this.hitObj = o; }
-          if (o && o.onHit) o.onHit(-into, nx, nz, this);
-          // glance: spin the hull about the contact point
-          const lx = hx - this.pos.x, lz = hz - this.pos.y;
-          this.angVel += (lx * (-into * nz) - lz * (-into * nx)) * 0.12;
-          this.vel.multiplyScalar(0.82);
-        }
-      }
-    };
-    const obs = (o) => {
-      let cx = o.x, cz = o.z;
-      if (o.ax !== undefined) { // capsule segment
-        const abx = o.bx - o.ax, abz = o.bz - o.az; const l2 = abx * abx + abz * abz;
-        let tt = ((this.pos.x - o.ax) * abx + (this.pos.y - o.az) * abz) / (l2 || 1); tt = Math.max(0, Math.min(1, tt));
-        cx = o.ax + abx * tt; cz = o.az + abz * tt;
-      }
-      if (Math.abs(cx - this.pos.x) > 12 || Math.abs(cz - this.pos.y) > 12) return;
-      resolve(cx, cz, o.r, o);
-    };
-    for (const o of this.obstacles) obs(o);
-    for (const l of this.dyn.values()) for (const o of l) obs(o);
+    for (const obstacle of this.obstacles) this.resolveObstacle(obstacle, fwd);
+    for (const list of this.dyn.values()) for (const obstacle of list) this.resolveObstacle(obstacle, fwd);
     const near = this.trunksNear(this.pos.x, this.pos.y, this.nearTrunks);
-    for (const tr of near) resolve(tr.x, tr.z, tr.r);
+    for (const trunk of near) this.resolveCircle(trunk.x, trunk.z, trunk.r, null, fwd);
     this.speed = this.vel.length();
     this.grounded = land;
 
     // ---- attitude ----
-    const hw = (ox, oz) => waveFn(px + rgt.x * ox + fwd.x * (-oz), pz + rgt.y * ox + fwd.y * (-oz), t);
-    const wb = hw(0, -2.5), ws = hw(0, 2.3), wl = hw(-1.1, 0), wr = hw(1.1, 0);
+    const wb = waveFn(px + fwd.x * 2.5, pz + fwd.y * 2.5, t), ws = waveFn(px - fwd.x * 2.3, pz - fwd.y * 2.3, t);
+    const wl = waveFn(px - rgt.x * 1.1, pz - rgt.y * 1.1, t), wr = waveFn(px + rgt.x * 1.1, pz + rgt.y * 1.1, t);
     const wavePitch = Math.atan2(wb - ws, 4.8) * wet, waveRoll = Math.atan2(wr - wl, 2.2) * wet;
     const landPitch = Math.atan2(hBow - hStern, 4.9) * land, landRoll = Math.atan2(hR - hL, 2.2) * land;
     const accelF = thrust + df;
@@ -540,12 +720,11 @@ export class AirboatPhysics {
       // no aero surfaces: the hull keeps the rotation it left the lip with, drifting slowly toward the flight path,
       // and the driver can lean (S = nose up, W = nose down) to set up the landing
       tgtPitch = Math.atan2(this.vy, Math.max(this.speed, 3)) * 0.25;
-      tgtRoll = this.angVel * 0.08;
+      tgtRoll = this.angVel * 0.08 + this.windHeel * 0.4;
     } else {
       tgtPitch = accelF * 0.012 * wet + Math.min(vf, 14) * 0.0035 * wet + surfPitch + (this.damageTrim || 0) * wet;
-      tgtRoll = -vl * 0.02 * wet + this.angVel * vf * 0.012 + waveRoll + landRoll + (this.damageList || 0) * wet;
+      tgtRoll = -vl * 0.02 * wet + this.angVel * vf * 0.012 + waveRoll + landRoll + (this.damageList || 0) * wet + this.windHeel;
     }
-    const spring = (v, tgt, vel, k, d) => { const a = (tgt - v) * k - vel * d; return vel + a * dt; };
     if (this.takeoffFrame) {
       // the stern is still on the ramp as the bow clears it: a nose-up pop proportional to how hard the lip was rising
       this.pitchVel += Math.max(0, Math.min(0.8, this.lastSurfVel * 0.1));
@@ -555,14 +734,14 @@ export class AirboatPhysics {
     if (this.airborne) {
       const lean = wiped ? 0 : (input.pitch || 0);
       this.pitchVel += lean * 2.2 * dt;
-      this.pitchVel = spring(this.pitch, tgtPitch, this.pitchVel, 1.0, 1.8);
+      this.pitchVel = springStep(this.pitch, tgtPitch, this.pitchVel, 1.0, 1.8, dt);
       this.pitch += this.pitchVel * dt;
       this.pitch = Math.max(-0.8, Math.min(0.75, this.pitch));
-      this.rollVel = spring(this.roll, tgtRoll, this.rollVel, 6, 2.5); this.roll += this.rollVel * dt;
+      this.rollVel = springStep(this.roll, tgtRoll, this.rollVel, 6, 2.5, dt); this.roll += this.rollVel * dt;
     } else {
       const kP = this.landedFrame ? 14 : 30, dP = this.landedFrame ? 4 : 6;
-      this.pitchVel = spring(this.pitch, tgtPitch, this.pitchVel, kP, dP); this.pitch += this.pitchVel * dt;
-      this.rollVel = spring(this.roll, tgtRoll, this.rollVel, 28, 5.5); this.roll += this.rollVel * dt;
+      this.pitchVel = springStep(this.pitch, tgtPitch, this.pitchVel, kP, dP, dt); this.pitch += this.pitchVel * dt;
+      this.rollVel = springStep(this.roll, tgtRoll, this.rollVel, 28, 5.5, dt); this.roll += this.rollVel * dt;
     }
     // ---- landing quality: how the hull met the surface decides whether it skips, slams or stuffs the bow ----
     this.surfPitch = surfPitch;

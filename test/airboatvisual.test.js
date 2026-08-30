@@ -5,9 +5,11 @@ import {
   airboatSprayExposure,
   airboatWetnessStep,
   prepareAirboatWetSurfaces,
+  registerAirboatEnvironmentWetness,
   setAirboatWetness,
   updateAirboatWetness,
 } from '../src/airboat.js';
+import { setGlobalSurfaceWetness, surfaceWetMaterialStats, unregisterWetMaterial } from '../src/surfacewetness.js';
 
 test('rain, spray and splash wet the hull while fair sun and wind dry it', () => {
   let wetness = 0.05;
@@ -59,4 +61,43 @@ test('the player wet pass clones each unique material once and keeps textures sh
 
   first.geometry.dispose(); second.geometry.dispose(); excluded.geometry.dispose();
   material.dispose(); shared.dispose(); basic.dispose(); texture.dispose();
+});
+
+test('the marked player hull gets one independent wet material without splitting traffic materials', () => {
+  const shared = new THREE.MeshStandardMaterial({ color: 0xd8dcda, roughness: 1, metalness: 0.72 });
+  const group = new THREE.Group();
+  const hull = new THREE.Mesh(new THREE.BoxGeometry(), shared), chine = new THREE.Mesh(new THREE.BoxGeometry(), shared);
+  hull.userData.hullDamageSurface = true; group.add(hull, chine);
+  const surfaces = prepareAirboatWetSurfaces(group);
+  assert.equal(surfaces.length, 2);
+  assert.notEqual(hull.material, chine.material);
+  assert.equal(surfaces.filter(surface => surface.damageSurface).length, 1);
+  assert.equal(hull.material.map, chine.material.map);
+  hull.geometry.dispose(); chine.geometry.dispose(); hull.material.dispose(); chine.material.dispose(); shared.dispose();
+});
+
+test('persistent traffic airboats share one storm-wet material without clones or shader recompiles', () => {
+  setGlobalSurfaceWetness(0);
+  const material = new THREE.MeshStandardMaterial({ color: 0xd8dcda, roughness: 0.9, metalness: 0.72 });
+  const group = new THREE.Group(), first = new THREE.Mesh(new THREE.BoxGeometry(), material), second = new THREE.Mesh(new THREE.BoxGeometry(), material);
+  group.add(first, second); group.userData.airboatDynamicWetness = false;
+  const before = surfaceWetMaterialStats(), version = material.version, dryColor = material.color.r;
+
+  assert.equal(registerAirboatEnvironmentWetness(group), 1);
+  assert.equal(registerAirboatEnvironmentWetness(group), 1);
+  assert.equal(first.material, second.material);
+  assert.equal(surfaceWetMaterialStats().registered, before.registered + 1);
+  setGlobalSurfaceWetness(1);
+  assert.ok(material.roughness < 0.3);
+  assert.ok(material.color.r < dryColor);
+  assert.equal(material.version, version);
+  assert.deepEqual({ textures: surfaceWetMaterialStats().textures, programs: surfaceWetMaterialStats().programs }, { textures: 0, programs: 0 });
+
+  const playerMaterial = new THREE.MeshStandardMaterial({ color: 0xd8dcda, roughness: 0.9 });
+  const player = new THREE.Group(); player.userData.airboatDynamicWetness = true; player.add(new THREE.Mesh(new THREE.BoxGeometry(), playerMaterial));
+  assert.equal(registerAirboatEnvironmentWetness(player), 0);
+  assert.equal(surfaceWetMaterialStats().registered, before.registered + 1);
+
+  unregisterWetMaterial(material); setGlobalSurfaceWetness(0);
+  first.geometry.dispose(); second.geometry.dispose(); player.children[0].geometry.dispose(); material.dispose(); playerMaterial.dispose();
 });

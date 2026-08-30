@@ -4,13 +4,13 @@ import { Sky } from './sky.js';
 import { MAX_WAKE_STAMPS, Water } from './water.js';
 import { Vegetation } from './vegetation.js';
 import { buildTower, buildDock } from './tower.js';
-import { airboatSprayExposure, buildAirboat, AirboatPhysics, loadDriver, updateAirboatWetness } from './airboat.js';
+import { airboatSprayExposure, buildAirboat, AirboatPhysics, installDriver, updateAirboatWetness, updateSeatedDriverPose } from './airboat.js';
 import { Birds, Waders, Manatees, Gators } from './wildlife.js';
 import { SkiffAI } from './npc.js';
 import { Spray, Plume } from './particles.js';
 import { Pipeline } from './post.js';
 import { Minimap } from './hud.js';
-import { EngineAudio } from './audio.js';
+import { EngineAudio, selectOutboardSource } from './audio.js';
 import * as TEX from './textures.js';
 import { mulberry32 } from './noise.js';
 import { Game } from './game.js';
@@ -25,9 +25,11 @@ import { configureModelLoading, loadGeo, loadModel, modelBox, modelLoadingStats,
 import { Environment } from './environment.js';
 import { EncounterDirector } from './encounters.js';
 import { BoatCondition } from './condition.js';
+import { BoatAnchor } from './anchor.js';
 import { Ecology } from './ecology.js';
 import { Law } from './law.js';
 import { StormHazards } from './stormhazards.js';
+import { MarshFireDirector } from './marshfire.js';
 import { Reputation } from './reputation.js';
 import { CurrentField } from './currents.js';
 import { RegionDirector, regionAt } from './regions.js';
@@ -37,16 +39,23 @@ import { StoryDirector } from './story.js';
 import { StormRecovery } from './aftermath.js';
 import { AdaptiveQualityController, MAX_DRAW_PIXELS, initialQualityLevel, pixelRatioFor, webglRendererName } from './renderquality.js';
 import { nextQualityPreference, qualityControllerConfig, qualityPreferenceLabel, readQualityPreference, writeQualityPreference } from './displaysettings.js';
-import { startupPlan, startupTerrainReady } from './startup.js';
+import { constrainedAssetTransfer, startupPlan, startupTerrainFocus, startupTerrainReady } from './startup.js';
 import { FieldDiscoveryDirector } from './discoveries.js';
 import { NavigationAids } from './navigationaids.js';
+import { DirectedNavigationLights } from './vesselnavigationlights.js';
 import { DolphinPod } from './dolphins.js';
 import { Fishing } from './fishing.js';
 import { NocturnalWetland } from './nocturnal.js';
 import { WakeStampPool } from './wakestamps.js';
+import { shallowWaterSediment, sedimentPlumeRadius } from './sediment.js';
 import { bindPageLifecycle } from './pagelifecycle.js';
+import { CHASE_CAMERA_SAMPLES, chaseCameraBoomLimit, chaseCameraBoomStep } from './chasecamera.js';
+import { SkyEnvironmentMap } from './environmentmap.js';
+import { sampleWakeFields } from './wakefield.js';
 
 const app = document.getElementById('app');
+const loadingProgress = (message, value) => window.__loadingScreen?.progress?.(message, value);
+loadingProgress('Launching the marsh', 0.06);
 const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', stencil: false });
 const gpuRenderer = webglRendererName(renderer.getContext());
 const hardwareQualityLevel = initialQualityLevel({
@@ -77,7 +86,15 @@ const fxScene = new THREE.Scene();
 const SUN_DIR = new THREE.Vector3(-0.42, 0.72, -0.55).normalize();
 
 async function init() {
-  const startup = startupPlan(renderProfile.id);
+  const startupStartedAt = performance.now();
+  const startupTiming = {
+    terrainPrimedMs: 0, landmarksReadyMs: 0, vegetationReadyMs: 0, renderTargetsReadyMs: 0,
+    livingWorldReadyMs: 0, directorsReadyMs: 0, environmentMapMs: 0, environmentMapReadyMs: 0,
+    loopReadyMs: 0, warmupReadyMs: 0, terrainWaitMs: 0, localTerrainReadyMs: 0, titleReadyMs: 0,
+  };
+  let terrainReadinessState = { ready: false, timedOut: false, visibleAtStart: false, settled: false, queued: 0, finalizing: 0, inFlight: 0, visible: 0, building: '' };
+  const markStartup = key => { startupTiming[key] = performance.now() - startupStartedAt; };
+  const startup = startupPlan(renderProfile.id, { constrainedTransfer: constrainedAssetTransfer(navigator.connection) });
   configureModelLoading({
     deferOptional: startup.deferOptionalModels,
     concurrency: startup.modelConcurrency,
@@ -87,7 +104,7 @@ async function init() {
     disabled: startup.disabledModels,
   });
   // ---- sky & lighting ----
-  const sky = new Sky(SUN_DIR);
+  const sky = new Sky(SUN_DIR, renderProfile);
   scene.add(sky.mesh);
   const sun = new THREE.DirectionalLight(0xfff2dc, 3.0);
   sun.castShadow = true;
@@ -99,19 +116,27 @@ async function init() {
   const hemi = new THREE.HemisphereLight(0x9fc3e8, 0x3f4a2a, 0.4);
   scene.add(hemi);
 
-  // environment map from the sky (for PBR reflections on the boat / wet mud)
-  const pmrem = new THREE.PMREMGenerator(renderer);
-  const skyScene = new THREE.Scene(); const skyClone = sky.mesh.clone(); skyScene.add(skyClone);
-  scene.environment = pmrem.fromScene(skyScene, 0, 0.1, 4000).texture;
-  scene.environmentIntensity = 0.4;
-  pmrem.dispose();
-
-  await new Promise(r => setTimeout(r, 30));
-
-  // ---- terrain ----
-  const terrain = new Terrain(7);
+  // Start the local height grids before the synchronous PBR convolution. On old hardware this lets its one terrain
+  // worker make progress while the GPU prepares the much smaller profile-scaled environment map.
+  const terrain = new Terrain(7, {
+    prefetch: startup.streamBudget.terrainPrefetch,
+    finalizeBudgetMs: startup.streamBudget.terrainFinalizeBudgetMs,
+    workerLimit: startup.streamBudget.terrainWorkerLimit,
+  });
   const groundTex = { grass: TEX.grassGround(), mud: TEX.mudGround(), sand: TEX.sandGround(), noise: TEX.noiseTex() };
   scene.add(terrain.buildMesh(groundTex));
+  const startZ = 70, startX = terrain.riverCenterX(startZ);
+  const terrainPrime = terrain.prime(startX, startZ);
+  startupTiming.terrainPrimedMs = performance.now() - startupStartedAt;
+  loadingProgress('Growing the near shore', 0.24);
+
+  // The capture scene shares the real sky geometry, material and uniforms. It adds no duplicate GPU resources and
+  // can therefore follow broad day/night/weather changes without retaining a bank of environment maps.
+  const skyScene = new THREE.Scene(); const skyClone = sky.mesh.clone(); skyScene.add(skyClone);
+  scene.environmentIntensity = 0.4;
+  const environmentReflections = new SkyEnvironmentMap({ renderer, scene, skyScene, skyUniforms: sky.uniforms, profile: renderProfile });
+
+  await new Promise(r => setTimeout(r, 30));
 
   await new Promise(r => setTimeout(r, 10));
 
@@ -131,13 +156,13 @@ async function init() {
   dock.rotation.y = Math.atan2(dir.x, dir.y) + Math.PI; // dock extends along its local -Z
   dock.position.y = 0.0;
   scene.add(dock);
+  markStartup('landmarksReadyMs');
 
-  const startZ = 70, startX = terrain.riverCenterX(startZ);
   const exclusions = [{ x: tower.position.x, z: tower.position.z, r: 7 }, { x: startX, z: startZ, r: 14 }, { x: dock.position.x, z: dock.position.z, r: 4 }, { x: (island.x + dock.position.x) / 2, z: (island.y + dock.position.z) / 2, r: 4 }];
   for (const b of terrain.bars) exclusions.push({ x: b.x, z: b.z, r: b.r });
 
   // ---- vegetation ----
-  const veg = new Vegetation(terrain, exclusions);
+  const veg = new Vegetation(terrain, exclusions, { detail: startup.streamBudget.foliageDetail });
   // Cinematic keeps the full pre-title warm-up. Balanced installs the same clumps after play begins and retrofits
   // already-built near chunks one per frame; the two old-hardware tiers retain the procedural grass without ever
   // downloading or decoding these optional meshes.
@@ -150,13 +175,14 @@ async function init() {
   if (startup.solidGrass === 'blocking') await installSolidGrass(true);
   else if (startup.solidGrass === 'deferred') installSolidGrass().catch(error => console.warn('grass models failed to load', error));
   loadModel('tree_c').then(root => { const f = modelBox('tree_c'); if (root && f) root.traverse(o => { if (o.isMesh) veg.windMat(o.material, f.box.min.y, f.box.max.y, f.scale, 0.28); }); });
+  markStartup('vegetationReadyMs');
 
   await new Promise(r => setTimeout(r, 10));
 
   // ---- boat ----
-  const boat = buildAirboat({ dynamicWetness: true });
+  const boat = buildAirboat({ dynamicWetness: true, profile: renderProfile });
   scene.add(boat.group);
-  loadDriver(boat.group).catch(e => console.warn('driver model failed to load', e));
+  const playerDriver = installDriver(boat.group);
   const phys = new AirboatPhysics(terrain, startX, startZ, 0);
   // streamed chunks: vegetation is built per chunk as its ground arrives; tree trunks register as colliders
   terrain.onReady(c => veg.buildChunk(c));
@@ -174,6 +200,7 @@ async function init() {
 
   // ---- water ----
   const water = new Water(renderer, SUN_DIR, renderProfile);
+  loadingProgress('Filling the channels', 0.42);
 
   // ---- wildlife ----
   const birds = new Birds(terrain, new THREE.Vector3(startX, 0, startZ - 120));
@@ -184,6 +211,7 @@ async function init() {
   for (const m of manatees.list) scene.add(m.mesh);
   const gators = new Gators(terrain, 18);
   for (const g of gators.list) scene.add(g.mesh);
+  scene.add(gators.eyeshine);
 
   // ---- fx ----
   const spray = new Spray(startup.effectBudget.spray);
@@ -201,11 +229,12 @@ async function init() {
   plume.mat.uniforms.tDepth.value = pipeline.sceneRT.depthTexture;
   plume.mat.uniforms.resolution.value.copy(pipeline.size);
   plume.mat.uniforms.near.value = camera.near; plume.mat.uniforms.far.value = camera.far;
+  markStartup('renderTargetsReadyMs');
   const sunView = new THREE.Vector3(); const camVel = new THREE.Vector3(); const camPrev = new THREE.Vector3();
   // wind: slowly veering direction, gusty strength
   const wind = new THREE.Vector3(0.8, 1.0, 0.6);
 
-  const minimap = new Minimap(terrain);
+  const minimap = new Minimap(terrain, renderProfile);
   const audio = new EngineAudio();
   const tricks = new Tricks(phys);
   const skiff = new SkiffAI((x, z, t) => water.waveHeight(x, z, t)); skiff.mesh.visible = false; scene.add(skiff.mesh);
@@ -213,17 +242,26 @@ async function init() {
   veg.blocked = (x, z) => world.blockedAt(x, z);
   const game = new Game({ phys, T: terrain, scene, audio, tricks, manatees, gators, skiff, boat: boat.group, dockTie, startX, startZ, world });
   game.paused = true; // loading and the title screen are presentation states, not unobserved play time
+  const terrainFocus = startupTerrainFocus({
+    dockX: startX, dockZ: startZ, boatX: phys.pos.x, boatZ: phys.pos.y, positionRestored: game.positionRestored,
+  });
+  // The early dock prime overlaps terrain work with the rest of startup. A continuing save may restore the boat
+  // elsewhere, so immediately pivot the pending stream before any more systems are constructed.
+  const terrainRetarget = terrainFocus.retargeted ? terrain.prime(terrainFocus.x, terrainFocus.z) : null;
   const worldMap = new WorldMap(terrain, minimap, game, world); game.map = worldMap;
   // the small life: fish, deadheads, other boats, anglers; birds and gators get their voices and their hooks into the game
   const life = new Life({ terrain, scene, water, camera, phys, plume, spray, audio, waveFn: (x, z, t) => water.waveHeight(x, z, t), game }); game.life = life;
-  const playerWater = (x, z, t) => water.waveHeight(x, z, t) + life.traffic.wakeHeightAt(x, z, t);
-  world.fx = { plume, spray, audio, fish: life.fish, playerWakeAt: (x, z, t) => life.traffic.playerWakeAt(x, z, t) }; world.onShot = (x, z) => { waders.flushNear && waders.flushNear(x, z, 140); };
+  markStartup('livingWorldReadyMs');
+  life.traffic.setWildlife({ manatees, gators, waders });
+  const physicalWakeFields = [life.traffic];
+  const playerWater = (x, z, t) => water.waveHeight(x, z, t) + sampleWakeFields(physicalWakeFields, x, z, t);
+  world.fx = { plume, spray, audio, fish: life.fish, playerWakeAt: (x, z, t) => life.traffic.playerWakeAt(x, z, t) }; world.onShot = (x, z) => { waders.flushNear(x, z, 140, 'gunshot'); };
   birds.audio = audio; gators.audio = audio;
   gators.onCharge = (g) => game.gatorCharge(g);
-  gators.onSlide = (g, d) => { game.bounties.event('spook', 1); };
+  gators.onSlide = (g, d, source = 'player') => { if (source === 'player') game.bounties.event('spook', 1); };
   gators.onSplash = (x, z, sc) => { for (let i = 0; i < 14; i++) plume.emit(x + jitter() * 1.2, 0.1, z + jitter() * 1.2, jitter() * 2, 0.8 + Math.random() * 1.8, jitter() * 2, 0.2 + Math.random() * 0.25, 1.0, 0.6 + Math.random() * 0.4, 0.3); for (let i = 0; i < 40; i++) spray.emit(x + jitter() * 1.2, 0.05, z + jitter() * 1.2, jitter() * 3, 1 + Math.random() * 2.5, jitter() * 3, 0.015 + Math.random() * 0.03, 0.4 + Math.random() * 0.4, 0.6); audio.splash(0.5 * sc); };
-  waders.onFlush = (w, d) => { game.bounties.event('flush', 1); if (Math.random() < 0.5) audio.squawk(0.25 * Math.max(0, 1 - d / 40), w.x, w.z); };
-  const environment = new Environment({ scene, fxScene, camera, terrain, world, water, sky, sun, hemi, pipeline, wind, boat: boat.group, audio, game, phys, sunDir: SUN_DIR, effectBudget: startup.effectBudget });
+  waders.onFlush = (w, d, source = 'player') => { if (source === 'player') game.bounties.event('flush', 1); if (Math.random() < 0.5) audio.squawk(0.25 * Math.max(0, 1 - d / 40), w.x, w.z); };
+  const environment = new Environment({ scene, fxScene, camera, terrain, world, water, sky, sun, hemi, pipeline, wind, boat: boat.group, audio, game, phys, sunDir: SUN_DIR, effectBudget: startup.effectBudget, profile: renderProfile });
   life.traffic.environment = environment; environment.traffic = life.traffic;
   const currents = new CurrentField({ fxScene, terrain, water, environment, phys, game });
   environment.currentField = currents; life.currents = currents; life.fx.currents = currents; world.currents = currents; world.fx.currents = currents; skiff.currents = currents;
@@ -233,14 +271,16 @@ async function init() {
   life.traffic.reputation = reputation; life.traffic.law = law;
   const encounters = new EncounterDirector({ scene, terrain, world, water, phys, boat: boat.group, game, audio, environment, currents, regions, plume, spray, law, reputation });
   game.encounters = encounters;
+  environment.onPlayerHorn = prolonged => encounters.notePlayerHorn(prolonged);
   law.onAttention = attention => { encounters.requestPatrol(attention); };
-  const condition = new BoatCondition({ game, phys, water, environment, audio, boat: boat.group, plume, spray, startX, startZ }); condition.traffic = life.traffic; encounters.condition = condition; game.condition = condition;
+  const condition = new BoatCondition({ game, phys, water, environment, audio, boat: boat.group, hullDamage: boat.hullDamage, plume, spray, startX, startZ }); condition.traffic = life.traffic; encounters.condition = condition; game.condition = condition;
+  const anchor = new BoatAnchor({ scene, terrain, water, phys, game, audio, environment, currents }); condition.anchor = anchor; game.anchor = anchor;
+  loadingProgress('Waking the backcountry', 0.68);
   const hazards = new StormHazards({ scene, terrain, world, water, phys, game, audio, environment, currents, condition, plume, spray });
-  life.traffic.hazards = hazards;
-  environment.onLightning = strike => hazards.lightning(strike);
+  life.traffic.hazards = hazards; encounters.hazards = hazards;
   const ecology = new Ecology({ environment, birds, waders, manatees, gators, life, world, regions, water, plume, spray, game, audio, currents, phys, terrain });
   const radio = new RadioDirector({ game, audio, environment, regions, encounters, law, reputation, condition, phys });
-  environment.radio = radio;
+  environment.radio = radio; encounters.radio = radio;
   hazards.radio = radio;
   ecology.radio = radio;
   condition.radio = radio; life.traffic.radio = radio;
@@ -249,16 +289,40 @@ async function init() {
   game.incidents = incidents; game.story = story; radio.incidents = incidents; radio.story = story;
   const aftermath = new StormRecovery({ scene, terrain, world, water, phys, boat: boat.group, game, audio, environment, currents, incidents, encounters, story, radio, reputation, condition });
   game.aftermath = aftermath; radio.aftermath = aftermath;
+  const outboardSources = [
+    { id: 'resident traffic', source: life }, { id: 'boat ramp', source: world }, { id: 'encounter craft', source: encounters },
+    { id: 'world incident', source: incidents }, { id: 'story craft', source: story }, { id: 'storm recovery', source: aftermath },
+  ];
+  const outboardMix = { id: '', level: 0, pitch: 1, x: 0, z: 0 };
+  const directedVesselSources = [skiff, encounters, incidents, story, aftermath];
+  physicalWakeFields.push(...directedVesselSources);
+  ecology.setDirectedVesselSources(directedVesselSources);
+  const directedNavigationLights = new DirectedNavigationLights(scene);
   const discoveries = new FieldDiscoveryDirector({ scene, terrain, world, water, phys, game, audio, environment, regions, life, law, reputation, encounters, incidents, story, aftermath, radio });
   game.discoveries = discoveries;
   const navigationAids = new NavigationAids({ scene, terrain, world, water, phys, game, audio, environment, currents, regions, radio, law, reputation, condition });
   const dolphins = new DolphinPod({ scene, terrain, world, water, phys, game, audio, environment, regions, plume, spray, law, reputation, radio, encounters, incidents, story, aftermath });
   game.dolphins = dolphins;
-  const fishing = new Fishing({ scene, boat: boat.group, terrain, world, water, phys, game, audio, environment, currents, regions, life });
+  const fishing = new Fishing({ scene, boat: boat.group, terrain, world, water, phys, game, audio, environment, currents, regions, life, gators });
   game.fishing = fishing;
   const nocturnal = new NocturnalWetland({ scene, terrain, world, phys, environment, regions, audio, profile: renderProfile });
+  const marshFire = new MarshFireDirector({
+    scene, terrain, world, water, phys, game, audio, environment, condition, plume, spray, profile: renderProfile, ecology, waders, radio, reputation,
+    encounters, incidents, story, aftermath, discoveries, navigationAids, fishing,
+  });
+  game.marshFire = marshFire;
+  markStartup('directorsReadyMs');
+  environment.onLightning = strike => { hazards.lightning(strike); marshFire.lightning(strike); };
+  // Apply the saved clock and weather before the first capture. Previously a saved night or hurricane still received
+  // the default daytime PMREM for the whole session, even though the visible sky and direct lighting were correct.
+  environment.update(0, 0, camera.position, true);
+  const initialReflectionState = { hour: environment.hour, sunAltitude: environment.sunDir.y, storm: environment.values.storm, cover: environment.values.cloud };
+  const environmentMapStartedAt = performance.now();
+  if (!environmentReflections.capture(initialReflectionState, 'initial', environmentMapStartedAt)) console.warn('environment reflection capture failed', environmentReflections.lastError);
+  startupTiming.environmentMapMs = performance.now() - environmentMapStartedAt;
+  markStartup('environmentMapReadyMs');
   let pageHibernated = false;
-  const pageLifecycle = { hibernated: false, hiddenAt: 0, resumedAt: 0, releasedAttachmentBytes: 0, activations: 0 };
+  const pageLifecycle = { hibernated: false, hiddenAt: 0, resumedAt: 0, releasedAttachmentBytes: 0, releasedCanvasBytes: 0, activations: 0 };
   const debugSceneGraphStats = import.meta.env.DEV ? () => {
     const geometries = new Set(), materials = new Set(), textures = new Set(), roots = [scene, water.scene, fxScene]; let objects = 0;
     const addMaterial = material => {
@@ -282,35 +346,50 @@ async function init() {
   } : null;
   const debugResourceSnapshot = import.meta.env.DEV ? () => ({
     renderer: { geometries: renderer.info.memory.geometries, textures: renderer.info.memory.textures, programs: renderer.info.programs.length },
+    startup: { ...startupTiming, terrainPrime, terrainRetarget, terrainFocus: { ...terrainFocus }, environmentMap: environmentReflections.resourceStats() },
     audio: audio.spatialStats(),
     proceduralSurfaces: TEX.sharedSurfaceTextureStats(),
     sky: sky.resourceStats(),
     graph: debugSceneGraphStats(),
     terrain: terrain.memoryStats(),
+    vegetation: veg.resourceStats(),
     minimap: minimap.memoryStats(),
     wildlife: {
       waders: debugTreeResources(waders.list.map(w => w.mesh)),
       manatees: debugTreeResources(manatees.list.map(m => m.mesh)),
-      gators: debugTreeResources(gators.list.map(g => g.mesh)),
+      gators: { ...debugTreeResources(gators.list.map(g => g.mesh)), ...gators.resourceStats() },
       dolphins: dolphins.resourceStats(),
     },
     stormRecovery: { sites: aftermath.sites.length, rigs: aftermath.rigs.size, disposed: { ...aftermath.disposedResources } },
     pursuit: encounters.pursuitSnapshot(),
+    encounterWrangler: encounters.wranglerSnapshot(),
     livingWorld: {
       debris: { live: life.debris.live.size, cachedCells: life.debris.cells.size, cacheEvictions: life.debris.cacheEvictions },
       anchoredAnglers: { live: life.traffic.liveAnglers.size, cachedCells: life.traffic.anglerCells.size, cacheEvictions: life.traffic.anglerCacheEvictions },
       shoreFolk: { live: life.folk.live.size, cachedCells: life.folk.cells.size, cacheEvictions: life.folk.cacheEvictions, disposedLineGeometries: life.folk.disposedLineGeometries },
       fishFallbackReleased: life.fish.fallbackReleased,
+      worldIncidents: incidents.resourceStats(),
+      directedNavigationLights: directedNavigationLights.resourceStats(),
       fieldDiscoveries: discoveries.resourceStats(),
       navigationAids: navigationAids.resourceStats(),
       fishing: fishing.resourceStats(),
+      anchor: anchor.resourceStats(),
       nocturnalWetland: nocturnal.resourceStats(),
+      settlementPower: environment.settlementPowerSnapshot(),
+      residentRoutines: ecology.residentRoutineSnapshot(),
+      spotlightVolume: environment.spotlightVolumeSnapshot(),
+      surfaceWetness: environment.surfaceWetnessSnapshot(),
       feedingActivity: ecology.feedingSnapshot(),
+      marshFire: marshFire.resourceStats(),
     },
     chart: worldMap.memoryStats(),
     models: modelLoadingStats(),
     lifecycle: { ...pageLifecycle },
     effects: {
+      eyeAdaptation: environment.eyeAdaptationSnapshot(),
+      lightning: environment.lightningSnapshot(),
+      stormSky: environment.stormSkySnapshot(),
+      hullDamage: condition.hullDamageSnapshot(),
       spray: { active: spray.count, capacity: spray.max },
       plume: { active: plume.count, capacity: plume.max },
       rain: { active: environment.precip.rain.geo.drawRange.count / 2, capacity: environment.precip.rain.count },
@@ -324,7 +403,7 @@ async function init() {
       mapMarkers: game.mapMarkerPool.stats(game.mapMarkers.length),
     },
   }) : null;
-  window.__dbg = { renderer, camera, scene, terrain, phys, water, pipeline, sky, veg, boat, audio, spray, plume, game, tricks, gators, skiff, waders, manatees, dolphins, fishing, nocturnal, world, worldMap, life, birds, environment, currents, regions, encounters, incidents, story, contracts: story.contracts, aftermath, discoveries, navigationAids, condition, ecology, reputation, law, hazards, radio, startup, debugSceneGraphStats, debugResourceSnapshot, mode: 'full', renderQuality: () => ({
+  window.__dbg = { renderer, camera, scene, terrain, phys, water, pipeline, sky, veg, boat, audio, spray, plume, game, tricks, gators, skiff, waders, manatees, dolphins, fishing, anchor, nocturnal, marshFire, world, worldMap, life, birds, environment, environmentReflections, currents, regions, encounters, incidents, story, contracts: story.contracts, aftermath, discoveries, navigationAids, directedNavigationLights, outboardMix, condition, ecology, reputation, law, hazards, radio, startup, startupMetrics: () => ({ ...startupTiming, terrainPrime, terrainRetarget, terrainFocus: { ...terrainFocus }, terrainReadiness: { ...terrainReadinessState }, environmentMap: environmentReflections.resourceStats() }), debugSceneGraphStats, debugResourceSnapshot, mode: 'full', renderQuality: () => ({
     profile: renderProfile.id, preference: qualityPreference, gpuRenderer, pixelRatio: renderer.getPixelRatio(), maxDrawPixels: renderProfile.maxDrawPixels, cinematicMaxDrawPixels: MAX_DRAW_PIXELS,
     hibernated: pageHibernated, adaptive: qualityController.snapshot(), ...pipeline.memoryStats(), reflection: water.memoryStats(), estimatedShadowBytes: sun.shadow.map ? renderProfile.shadowMapSize ** 2 * 4 : 0,
   }) };
@@ -332,6 +411,39 @@ async function init() {
   // ---- input ----
   const keys = {};
   let started = false;
+  const reflectionState = { hour: environment.hour, sunAltitude: environment.sunDir.y, storm: environment.values.storm, cover: environment.values.cloud };
+  let reflectionCheckT = 2, reflectionIdleJob = 0, reflectionIdleKind = '';
+  const syncReflectionState = () => {
+    reflectionState.hour = environment.hour; reflectionState.sunAltitude = environment.sunDir.y;
+    reflectionState.storm = environment.values.storm; reflectionState.cover = environment.values.cloud;
+    return reflectionState;
+  };
+  const captureEnvironmentReflections = reason => {
+    const captured = environmentReflections.capture(syncReflectionState(), reason);
+    if (!captured) console.warn('environment reflection capture failed', environmentReflections.lastError);
+    return captured;
+  };
+  const scheduleEnvironmentReflections = (reason = 'atmosphere') => {
+    if (reflectionIdleJob) return false;
+    const run = deadline => {
+      reflectionIdleJob = 0; reflectionIdleKind = '';
+      if (document.hidden || pageHibernated || (!game.paused && deadline && !deadline.didTimeout && deadline.timeRemaining() < 4)) return false;
+      if (!environmentReflections.needsRefresh(syncReflectionState())) return false;
+      return captureEnvironmentReflections(reason);
+    };
+    if (typeof requestIdleCallback === 'function') {
+      reflectionIdleKind = 'idle'; reflectionIdleJob = requestIdleCallback(run, { timeout: 8000 });
+    } else {
+      reflectionIdleKind = 'timeout'; reflectionIdleJob = window.setTimeout(() => run(null), 0);
+    }
+    return true;
+  };
+  const cancelEnvironmentReflectionJob = () => {
+    if (!reflectionIdleJob) return false;
+    if (reflectionIdleKind === 'idle' && typeof cancelIdleCallback === 'function') cancelIdleCallback(reflectionIdleJob);
+    else clearTimeout(reflectionIdleJob);
+    reflectionIdleJob = 0; reflectionIdleKind = ''; return true;
+  };
   let encounterStressRunning = false;
   window.addEventListener('keydown', e => {
     keys[e.code] = true;
@@ -340,7 +452,7 @@ async function init() {
     }
     if (import.meta.env.DEV && e.code === 'F7' && !e.repeat) {
       e.preventDefault(); if (encounterStressRunning) return; encounterStressRunning = true;
-      const types = ['distress', 'airrescue', 'grounding', 'fire', 'manatee', 'spotlight', 'race', 'patrol', 'salvage', 'smuggler', 'netline'], before = debugSceneGraphStats();
+      const types = ['distress', 'airrescue', 'grounding', 'fire', 'wrangler', 'manatee', 'spotlight', 'race', 'patrol', 'salvage', 'smuggler', 'netline'], before = debugSceneGraphStats();
       let iteration = 0, started = 0;
       const rotate = () => {
         const end = Math.min(6000, iteration + 240);
@@ -356,6 +468,53 @@ async function init() {
       e.preventDefault(); const memory = renderer.info.memory, quality = window.__dbg.renderQuality(); const snapshot = debugResourceSnapshot();
       document.documentElement.dataset.emeraldResource = JSON.stringify(snapshot);
       console.info('[emerald-resource]', JSON.stringify({ geometries: memory.geometries, textures: memory.textures, programs: renderer.info.programs.length, sceneChildren: scene.children.length, graph: snapshot.graph, terrain: snapshot.terrain, minimap: snapshot.minimap, wildlife: snapshot.wildlife, chart: snapshot.chart, fireOuterInstances: encounters.rigs.fire.fire.userData.fire.outer.count, fireCoreInstances: encounters.rigs.fire.fire.userData.fire.core.count, ...quality }));
+    }
+    if (import.meta.env.DEV && e.code === 'KeyY' && e.altKey && e.shiftKey && !e.repeat && fishing.state === 'fight') {
+      e.preventDefault();
+      const session = fishing.session, dx = phys.pos.x - session.x, dz = phys.pos.y - session.z, length = Math.hypot(dx, dz) || 1;
+      const gator = gators.list.find(g => !g.towed && !g.parked && !g.big) || gators.list[0];
+      if (gator) {
+        gators.releaseHookedFish(); gator.pos.set(session.x + dx / length * 11, environment.waterLevel + gator.float, session.z + dz / length * 11);
+        gator.bask = false; gator.dive = 0; gator.charge = 0; gator.hitT = 0; gator.preyCooldown = 0; gator.mesh.visible = true;
+        fishing.attractAlligator(1);
+      }
+    }
+    if (import.meta.env.DEV && e.code === 'KeyU' && e.altKey && e.shiftKey && !e.repeat) {
+      e.preventDefault();
+      const traffic = life.traffic, resident = traffic.boats.find(b => b.kind === 'john') || traffic.boats[0], animal = manatees.list[0];
+      let staged = null;
+      for (let i = 0; i < 12 && !staged; i++) {
+        const heading = phys.heading + (i % 2 ? -1 : 1) * Math.ceil(i / 2) * Math.PI / 6;
+        const fx = -Math.sin(heading), fz = -Math.cos(heading), rx = Math.cos(heading), rz = -Math.sin(heading);
+        const bx = phys.pos.x + fx * 34 + rx * 24, bz = phys.pos.y + fz * 34 + rz * 24;
+        const mx = bx + fx * 44 + rx * 6, mz = bz + fz * 44 + rz * 6;
+        let clear = terrain.heightAt(bx, bz) < -0.72 && terrain.heightAt(mx, mz) < -0.9 && !world.blockedAt(bx, bz) && !world.blockedAt(mx, mz);
+        for (let step = 1; step < 5 && clear; step++) {
+          const amount = step / 5, x = bx + (mx - bx) * amount, z = bz + (mz - bz) * amount;
+          if (terrain.heightAt(x, z) > -0.62 || world.blockedAt(x, z)) clear = false;
+        }
+        if (clear) staged = { heading, bx, bz, mx, mz };
+      }
+      if (resident && animal && staged) {
+        for (const b of traffic.boats) traffic.retire(b, 90);
+        traffic.clearShelter(resident); resident.active = true; resident.retiring = false; resident.assisting = false; resident.collision.active = false;
+        resident.x = staged.bx; resident.z = staged.bz; resident.heading = staged.heading; resident.speed = Math.min(8, resident.max * 0.9); resident.turn = 0; resident.ground = 0; resident.mesh.visible = true;
+        traffic.beginLeg(resident, true); resident.routeBias = 0; resident.wildlifeEvalT = 0; resident.wildlifeReactionDelay = 0.45;
+        animal.pos.set(staged.mx, environment.waterLevel - 0.42, staged.mz); animal.heading = staged.heading + Math.PI / 2; animal.speed = 0.8;
+        animal.avoidT = 0; animal.diveT = 0; animal.diveBlend = 0; animal.zoneT = 12; animal.trafficAlertT = 0; animal.surfaced = true; animal.held = false; animal.mesh.visible = true;
+      }
+      const result = { staged: Boolean(staged && resident && animal), boat: resident?.profile?.id || '', distance: staged ? Math.hypot(staged.mx - staged.bx, staged.mz - staged.bz) : null };
+      const report = label => {
+        if (result.staged) result[label] = {
+          avoidance: Number(resident.wildlifeAvoidance.toFixed(3)), speed: Number(resident.speed.toFixed(3)),
+          closestApproach: Number.isFinite(resident.wildlifeClosest) ? Number(resident.wildlifeClosest.toFixed(3)) : null,
+          courseChange: Number(Math.abs(Math.atan2(Math.sin(resident.heading - staged.heading), Math.cos(resident.heading - staged.heading))).toFixed(3)),
+          animalDive: Number(animal.diveBlend.toFixed(3)), ecology: { ...ecology.trafficWildlifeStats },
+        };
+        document.documentElement.dataset.emeraldWildlifeTraffic = JSON.stringify(result);
+        console.info('[emerald-wildlife-traffic]', JSON.stringify(result));
+      };
+      report('start'); if (result.staged) { window.setTimeout(() => report('after1500'), 1500); window.setTimeout(() => report('after4500'), 4500); }
     }
     if (started && e.code === 'KeyR' && !game.menuOpen && !game.resultOpen && !(game.state && game.state.m.countdown)) phys.reset(phys.lastFloat.x, phys.lastFloat.y);
   });
@@ -384,11 +543,19 @@ async function init() {
   };
   let renderFrameNo = 0;
   const applyRenderQuality = profile => {
-    renderProfile = profile; pipeline.setQuality(profile); water.setQuality(profile); nocturnal.setQuality(profile);
+    const oldEnvironmentSize = environmentReflections.targetSize;
+    renderProfile = profile; pipeline.setQuality(profile); water.setQuality(profile); sky.setQuality(profile); condition.setQuality(profile); minimap.setQuality(profile); nocturnal.setQuality(profile); environment.setQuality(profile); environmentReflections.setProfile(profile);
     if (sun.shadow.mapSize.x !== profile.shadowMapSize) {
       sun.shadow.mapSize.set(profile.shadowMapSize, profile.shadowMapSize);
       if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; }
       water.uniforms.shadowOn.value = 0;
+    }
+    if (environmentReflections.targetSize !== profile.environmentMapSize) {
+      cancelEnvironmentReflectionJob();
+      // A downgrade releases the larger target before doing the cheaper convolution. Upgrades at the title are safe
+      // to apply immediately; an in-play promotion waits for browser idle time.
+      if (profile.environmentMapSize < oldEnvironmentSize || game.paused) captureEnvironmentReflections('quality');
+      else scheduleEnvironmentReflections('quality');
     }
     renderFrameNo = 0; resize();
   };
@@ -396,6 +563,19 @@ async function init() {
   const startEl = document.getElementById('start');
   const titlePrimary = document.getElementById('titlePrimary');
   const titleNew = document.getElementById('titleNew');
+  let deferredModelReleaseTimer = 0, deferredModelsStarted = false;
+  const scheduleDeferredModels = (delayMs = 0, reschedule = false) => {
+    if (!startup.deferOptionalModels || deferredModelsStarted) return false;
+    if (deferredModelReleaseTimer) {
+      if (!reschedule) return false;
+      window.clearTimeout(deferredModelReleaseTimer);
+    }
+    deferredModelReleaseTimer = window.setTimeout(() => {
+      deferredModelReleaseTimer = 0; deferredModelsStarted = true;
+      void releaseDeferredModels();
+    }, Math.max(0, Number(delayMs) || 0));
+    return true;
+  };
   const cashLabel = value => '$' + Math.round(value).toLocaleString('en-US');
   const renderTitle = () => {
     const progress = game.hasProgress(), region = regionAt(phys.pos.x, phys.pos.y), resetArmed = game.newGameArmed();
@@ -421,7 +601,7 @@ async function init() {
   const beginGame = (jobs = false) => {
     audio.start(); started = true; game.playing = true; game.paused = false;
     startEl.classList.add('hidden'); startEl.setAttribute('aria-hidden', 'true');
-    window.setTimeout(() => releaseDeferredModels(), startup.modelReleaseDelayMs);
+    scheduleDeferredModels(startup.modelReleaseDelayMs, true);
     if (jobs) game.openMenu('jobs');
   };
   const showTitle = (persist = true) => {
@@ -431,6 +611,7 @@ async function init() {
     for (const key in keys) keys[key] = false;
     if (persist) game.persist();
     renderTitle(); startEl.classList.remove('hidden'); startEl.setAttribute('aria-hidden', 'false');
+    if (startup.releaseModelsAtTitle) scheduleDeferredModels(startup.titleModelReleaseDelayMs);
     requestAnimationFrame(() => titlePrimary.focus({ preventScroll: true }));
   };
   game.getQualityLabel = () => qualityPreferenceLabel(qualityPreference, renderProfile.id);
@@ -451,12 +632,18 @@ async function init() {
   // ---- camera state ----
   const camPos = new THREE.Vector3(startX, 4, startZ + 10);
   const camTarget = new THREE.Vector3(startX, 1, startZ);
-  const camBack = new THREE.Vector3(), camDesired = new THREE.Vector3(), camAim = new THREE.Vector3(), audioForward = new THREE.Vector3();
+  const camBack = new THREE.Vector3(), camDesired = new THREE.Vector3(), camAim = new THREE.Vector3(), camPivot = new THREE.Vector3(), audioForward = new THREE.Vector3();
+  const cameraHeightAt = (x, z) => terrain.heightAt(x, z);
+  const cameraCollision = {
+    startX: 0, startY: 0, startZ: 0, endX: 0, endY: 0, endZ: 0,
+    waterLevel: 0, clearance: 0.9, minFraction: 0.22, safetyMargin: 0.035, samples: CHASE_CAMERA_SAMPLES,
+  };
   const fwd2 = new THREE.Vector2(), rgt2 = new THREE.Vector2(), currentFlow = new THREE.Vector2(), skiffForward = new THREE.Vector2();
   const input = { throttle: 0, steer: 0, pitch: 0 };
   const boatWetnessConditions = { dt: 0, rain: 0, spray: 0, splash: 0, wind: 0, speed: 0, daylight: 0, windScreen: 0 };
+  const sedimentConditions = { depth: 0, speed: 0, rpm: 0, throttle: 0, wet: 0, murk: 0 };
   const clock = new THREE.Timer(); clock.connect(document);
-  let time = 0, splashStamp = 0, slowT = 0, slowK = 1, fovKick = 0, airCam = 0, frameNo = 0;
+  let time = 0, splashStamp = 0, slowT = 0, slowK = 1, fovKick = 0, airCam = 0, cameraBoom = 1, frameNo = 0;
   const stamps = new WakeStampPool(MAX_WAKE_STAMPS);
   const hullPoint = { x: 0, z: 0 };
   const splashPts = [{ x: 0, z: 0 }, { x: 0, z: 0 }, { x: 0, z: 0 }];
@@ -466,7 +653,7 @@ async function init() {
     return out;
   };
   const addPlayerStamp = (p, radius, height, foam = 0, foamRadius = 0) => {
-    stamps.emit(p.x, p.z, radius, height, foam, foamRadius);
+    return stamps.emit(p.x, p.z, radius, height, foam, foamRadius);
   };
   // landing splash: the hull slaps a hull-shaped hole in the water; two sheets peel off the chines, a crown lifts at the bow,
   // and a stuffed bow throws a wall of water forward over the deck
@@ -539,7 +726,8 @@ async function init() {
       phys.update(dt, input, playerWater, time, currentFlow);
     }
     else { phys.impact = 0; phys.hit = 0; phys.landedFrame = false; }
-    environment.applyPhysics(dt);
+    environment.applyPhysics(dt, hazards.surfaceWindAtPlayer());
+    anchor.update(dt, time, started && !game.paused);
     phys.forward(fwd2); phys.right(rgt2);
     tricks.update(dt, time);
     game.update(dt, time);
@@ -579,6 +767,7 @@ async function init() {
     if (phys.rpm > 0.01) boat.prop.rotation.z += dt * (8 + phys.rpm * 95);
     boat.blur.material.opacity = Math.min(0.35, phys.rpm * 0.4);
     for (const r of boat.rudders) r.rotation.y = -phys.steer * 0.55;
+    if (playerDriver && started && !game.paused) updateSeatedDriverPose(playerDriver, phys, dt, time);
     condition.updateEffects(dt, time, started && !game.paused);
     fishing.update(dtRaw, time, started && !game.paused);
 
@@ -590,11 +779,22 @@ async function init() {
     airCam += ((phys.airborne ? Math.min(1, phys.airTime * 1.5) : 0) - airCam) * (1 - Math.exp(-dt * (phys.airborne ? 3 : 5)));
     const cd = camDist + airCam * 2.4;
     camDesired.set(phys.pos.x, 3.9 + cd * Math.sin(camPitch) * 1.2 + Math.max(0, phys.y) * 0.2 + airCam * 1.2, phys.pos.y).addScaledVector(camBack, cd * Math.cos(camPitch));
-    // keep camera above ground / water
-    const gh = terrain.heightAt(camDesired.x, camDesired.z);
-    camDesired.y = Math.max(camDesired.y, gh + 1.8, 1.2);
-    camPos.lerp(camDesired, 1 - Math.exp(-dt * 5.5));
-    camAim.set(phys.pos.x - fwd2.x * -4.5, 1.2 + Math.max(0, phys.y) * 0.9, phys.pos.y - fwd2.y * -4.5);
+    camAim.set(phys.pos.x + fwd2.x * 4.5, Math.max(1.2 + Math.max(0, phys.y) * 0.9, water.level + 1), phys.pos.y + fwd2.y * 4.5);
+    camPivot.set(phys.pos.x, Math.max(2.1 + Math.max(0, phys.y) * 0.75, water.level + 1.2), phys.pos.y);
+    // Keep the ideal endpoint above surge, then retract the entire boom when a bank lies between it and the hull.
+    camDesired.y = Math.max(camDesired.y, water.level + 1.2);
+    cameraCollision.startX = camPivot.x; cameraCollision.startY = camPivot.y; cameraCollision.startZ = camPivot.z;
+    cameraCollision.endX = camDesired.x; cameraCollision.endY = camDesired.y; cameraCollision.endZ = camDesired.z;
+    cameraCollision.waterLevel = water.level;
+    const boomLimit = chaseCameraBoomLimit(cameraCollision, cameraHeightAt), previousBoom = cameraBoom;
+    cameraBoom = chaseCameraBoomStep(cameraBoom, boomLimit, dtRaw);
+    camDesired.x = camPivot.x + (camDesired.x - camPivot.x) * cameraBoom;
+    camDesired.y = camPivot.y + (camDesired.y - camPivot.y) * cameraBoom;
+    camDesired.z = camPivot.z + (camDesired.z - camPivot.z) * cameraBoom;
+    camDesired.y = Math.max(camDesired.y, terrain.heightAt(camDesired.x, camDesired.z) + 0.9, water.level + 0.9);
+    const cameraCut = boomLimit < previousBoom - 0.01 || camPos.distanceToSquared(camDesired) > 6400;
+    if (cameraCut) camPos.copy(camDesired); else camPos.lerp(camDesired, 1 - Math.exp(-dt * 5.5));
+    camPos.y = Math.max(camPos.y, terrain.heightAt(camPos.x, camPos.z) + 0.9, water.level + 0.9);
     camTarget.lerp(camAim, 1 - Math.exp(-dt * 7));
     camera.position.copy(camPos);
     if (game.shake > 0.01) { const sh = game.shake * 0.35; camera.position.x += (Math.random() - 0.5) * sh; camera.position.y += (Math.random() - 0.5) * sh; camera.position.z += (Math.random() - 0.5) * sh; }
@@ -624,33 +824,36 @@ async function init() {
     }
     currents.update(dtRaw, time, started && !game.paused);
     hazards.update(dtRaw, time, started && !game.paused);
+    marshFire.update(dtRaw, time, started && !game.paused);
     aftermath.update(dtRaw, time, started && !game.paused && !fishing.blocking());
     nocturnal.update(dtRaw, time, started && !game.paused);
     ecology.update(dtRaw, time, started && !game.paused);
     dolphins.update(dtRaw, time, started && !game.paused);
     incidents.update(dtRaw, time, started && !game.paused && !fishing.blocking() && !story.blocking() && !aftermath.blocking() && !life.traffic.activeCollision());
+    directedNavigationLights.update(directedVesselSources, camera.position, environment, started);
     discoveries.update(dtRaw, time, started && !game.paused && !fishing.blocking());
     navigationAids.update(dtRaw, time, started && !game.paused && !fishing.blocking());
     radio.update(dtRaw, started && !game.paused);
 
     // world updates
     sky.update(time, camera.position);
+    reflectionCheckT -= dtRaw;
+    if (reflectionCheckT <= 0) {
+      reflectionCheckT = 2;
+      if (frameDelta < 1 / 28 && environmentReflections.needsRefresh(syncReflectionState())) scheduleEnvironmentReflections();
+    }
     terrain.update(time, camera.position);
     veg.update(time, environment.lightDir, wind);
     birds.update(time, camera.position, dt);
     manatees.update(dt, time, phys.pos.x, phys.pos.y);
-    gators.update(dt, time, phys.pos.x, phys.pos.y, phys.speed);
+    gators.update(dt, time, phys.pos.x, phys.pos.y, phys.speed, phys.heading, environment.spotOn, environment.night, environment.restrictedVisibility, environment.values.storm, environment.waterLevel);
     waders.update(dt, time, phys.pos.x, phys.pos.y, phys.speed);
     world.update(dt, time, phys.pos.x, phys.pos.y);
     // Do not start resident shifts or write their first-seen state while the title card is still open.
     if (started && !game.paused) life.update(dt, time);
-    {
-      const ambientBoat = Math.max(life.obLevel, world.obLevel); let outboardLevel = ambientBoat, outboardPitch = life.obPitch;
-      if (incidents.obLevel > outboardLevel) { outboardLevel = incidents.obLevel; outboardPitch = incidents.obPitch; }
-      if (story.obLevel > outboardLevel) { outboardLevel = story.obLevel; outboardPitch = story.obPitch; }
-      if (aftermath.obLevel > outboardLevel) { outboardLevel = aftermath.obLevel; outboardPitch = aftermath.obPitch; }
-      audio.outboard(outboardLevel, outboardPitch);
-    }
+    encounters.updateOutboardAudio(started && !game.paused);
+    selectOutboardSource(outboardSources, outboardMix);
+    audio.outboard(outboardMix.level, outboardMix.pitch, outboardMix.x, outboardMix.z, outboardMix.id);
     audio.truck(world.truckLevel);
     water.updateMurk(terrain, camera.position);
     frameNo++; // cadence divider for the canvas HUDs (radar every 2nd frame, open chart every 4th)
@@ -672,8 +875,16 @@ async function init() {
       pt = hullPt(-1.0, 0.8); addPlayerStamp(pt, 0.9, 0.35 * spF, 0.35 * spF, 0.8);
       pt = hullPt(0, 2.6); addPlayerStamp(pt, 1.5, 0.9 * spF + 0.3 * thr, 0.9 * spF + 2.2 * thr * (0.3 + spF), 1.25);
       pt = hullPt(0, 4.3); addPlayerStamp(pt, 2, 0, 1.3 * thr * (0.3 + spF), 1.7);
-      pt = hullPt(0, 6.5); addPlayerStamp(pt, 2.4, 0, 0.5 * thr * spF, 2.2);
-      skiff.stamps(stamps); life.stamps(stamps); world.stamps(stamps); dolphins.stamps(stamps); encounters.stamps(stamps); incidents.stamps(stamps); story.stamps(stamps); aftermath.stamps(stamps); hazards.stamps(stamps);
+      // The air propeller never touches the water; in skinny water it is the pressure wave beneath the hull and stern
+      // wash that lifts peat and limestone silt. Reuse the trailing wake slot so the plume adds no objects or stamps.
+      pt = hullPt(0, 6.5);
+      sedimentConditions.depth = water.level - terrain.heightAt(pt.x, pt.z);
+      sedimentConditions.speed = phys.speed; sedimentConditions.rpm = rpm; sedimentConditions.throttle = Math.max(0, phys.throttle);
+      sedimentConditions.wet = wet; sedimentConditions.murk = water.murkAt(pt.x, pt.z);
+      const sediment = shallowWaterSediment(sedimentConditions);
+      const sedimentStamp = addPlayerStamp(pt, 2.4, 0, 0, 2.2);
+      if (sedimentStamp) { sedimentStamp.sediment = sediment * 2.2; sedimentStamp.sedimentRadius = sedimentPlumeRadius(sedimentConditions.depth, phys.speed); }
+      skiff.stamps(stamps); life.stamps(stamps); world.stamps(stamps); dolphins.stamps(stamps); encounters.stamps(stamps); gators.stamps(stamps); incidents.stamps(stamps); story.stamps(stamps); aftermath.stamps(stamps); discoveries.stamps(stamps); hazards.stamps(stamps);
       wakeCenter.set(phys.pos.x + fwd2.x * -25, phys.pos.y + fwd2.y * -25);
       water.simulate(wakeCenter, stamps, dt, currentFlow);
     }
@@ -756,19 +967,23 @@ async function init() {
     renderFrameNo++;
   }
   renderer.setAnimationLoop(frame);
-  const attachmentBytes = () => pipeline.memoryStats().estimatedAttachmentBytes + water.memoryStats().estimatedAttachmentBytes + (sun.shadow.map ? renderProfile.shadowMapSize ** 2 * 4 : 0);
+  markStartup('loopReadyMs');
+  const attachmentBytes = () => pipeline.memoryStats().estimatedAttachmentBytes + water.memoryStats().estimatedAttachmentBytes + environmentReflections.resourceStats().retainedBytes + (sun.shadow.map ? renderProfile.shadowMapSize ** 2 * 4 : 0);
   const hibernatePage = () => {
     if (pageHibernated) return false;
-    const before = attachmentBytes(); pageHibernated = true; renderer.setAnimationLoop(null);
+    const before = attachmentBytes(), canvasBefore = minimap.memoryStats().estimatedBackingBytes + worldMap.memoryStats().estimatedBackingBytes; pageHibernated = true; renderer.setAnimationLoop(null);
+    cancelEnvironmentReflectionJob(); environmentReflections.dispose();
     pipeline.hibernate(); water.hibernate();
+    minimap.releaseTiles(); worldMap.hibernate();
     if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; water.uniforms.shadowOn.value = 0; }
     renderer.setPixelRatio(1); renderer.setSize(1, 1, false); qualityController.reset(); void audio.suspend();
-    pageLifecycle.hibernated = true; pageLifecycle.hiddenAt = Date.now(); pageLifecycle.releasedAttachmentBytes = Math.max(0, before - attachmentBytes()); pageLifecycle.activations++;
+    pageLifecycle.hibernated = true; pageLifecycle.hiddenAt = Date.now(); pageLifecycle.releasedAttachmentBytes = Math.max(0, before - attachmentBytes());
+    pageLifecycle.releasedCanvasBytes = Math.max(0, canvasBefore - minimap.memoryStats().estimatedBackingBytes - worldMap.memoryStats().estimatedBackingBytes); pageLifecycle.activations++;
     return true;
   };
   const resumePage = () => {
     if (!pageHibernated || document.hidden) return false;
-    pageHibernated = false; pipeline.resume(); water.resume(); resize(); clock.reset(); renderFrameNo = 0; void audio.resume(); renderer.setAnimationLoop(frame);
+    pageHibernated = false; pipeline.resume(); water.resume(); resize(); worldMap.resume(); clock.reset(); renderFrameNo = 0; void audio.resume(); renderer.setAnimationLoop(frame); scheduleEnvironmentReflections('resume');
     pageLifecycle.hibernated = false; pageLifecycle.resumedAt = Date.now();
     return true;
   };
@@ -779,6 +994,7 @@ async function init() {
   // Cinematic machines absorb the full shader/model warm-up behind the loading card. Lower profiles render the real
   // dock scene only and open as soon as local terrain is visible; distant terrain and optional models keep streaming.
   let warm = null;
+  loadingProgress(startup.warmShaders ? 'Warming the storm light' : 'Checking the channel', 0.82);
   if (startup.warmShaders) {
     warm = new THREE.Group();
     { const nc = world.campAt(1, 1) || world.campsNear(0, 0, 5000)[0]; if (nc) { const g = world.buildCamp(nc); g.position.set(startX - nc.x, 0, startZ - 20 - nc.z); warm.add(g); } }
@@ -801,27 +1017,41 @@ async function init() {
       }
       for (let k = 0; k < 6; k++) life.fish.launch(startX + k, startZ - 6, 3, 0, 0, 1, 0, true);
       { const pr = mulberry32(11); let k = 0; for (const pose of ['stand', 'sit', 'sitEdge', 'crouch']) { const pp = person(pr, { pose, rod: k % 2 === 0, gun: k === 3 }); pp.position.set(startX - 8 + k * 2, 0.4, startZ - 6); warm.add(pp); k++; } const cn = canoe(pr); cn.position.set(startX + 6, 0, startZ - 8); warm.add(cn); }
-      for (const [k, name] of ['beau_boat', 'boat_dreams', 'sandbox_boat', 'realistic_alligator', 'turtle_boat'].entries()) { const m = spawn(name); m.position.set(startX - 10 + k * 5, 0.3, startZ - 16); warm.add(m); }
+      // Deferred model callbacks belong only to live stand-ins. Attaching one to this soon-disposed warm-up tree
+      // would retain the detached group until the late model request completed.
+      if (!startup.deferOptionalModels) for (const [k, name] of ['beau_boat', 'boat_dreams', 'sandbox_boat', 'realistic_alligator', 'turtle_boat'].entries()) { const m = spawn(name); m.position.set(startX - 10 + k * 5, 0.3, startZ - 16); warm.add(m); }
     }
     warm.scale.setScalar(0.004); warm.position.set(startX, 0.3, startZ - 6);
     scene.add(warm); skiff.mesh.visible = true; skiff.mesh.position.set(startX, 0, startZ - 12);
   }
+  markStartup('warmupReadyMs');
   const t0 = performance.now();
   const terrainReady = new Promise(r => { const poll = () => {
     const elapsed = performance.now() - t0;
-    const ready = startupTerrainReady(startup.terrainReadiness, { settled: terrain.settled(), localVisible: terrain.visibleAt(startX, startZ) });
-    if ((ready && elapsed >= startup.minWaitMs) || elapsed >= startup.maxWaitMs) r(); else setTimeout(poll, 100);
+    const visibleAtFocus = terrain.visibleAt(terrainFocus.x, terrainFocus.z);
+    const ready = startupTerrainReady(startup.terrainReadiness, { settled: terrain.settled(), localVisible: visibleAtFocus });
+    if ((ready && elapsed >= startup.minWaitMs) || elapsed >= startup.maxWaitMs) {
+      terrainReadinessState = {
+        ready, timedOut: !ready && elapsed >= startup.maxWaitMs, visibleAtStart: visibleAtFocus, visibleAtFocus,
+        visibleAtDock: terrain.visibleAt(startX, startZ), focusX: terrainFocus.x, focusZ: terrainFocus.z, restored: terrainFocus.restored,
+        settled: terrain.settled(),
+        queued: terrain.queue.length, finalizing: terrain.finalize.length, inFlight: terrain.pool.inFlight, visible: terrain.visible.size, building: terrain.building?.key || '',
+      };
+      startupTiming.terrainWaitMs = elapsed; startupTiming.localTerrainReadyMs = performance.now() - startupStartedAt; r();
+    } else setTimeout(poll, 100);
   }; poll(); });
   await Promise.all([startup.blockingModels.length ? preload(startup.blockingModels) : Promise.resolve(), terrainReady]);
+  loadingProgress('Pulling the boat off the trailer', 0.96);
   if (startup.compileDelayMs) await new Promise(r => setTimeout(r, startup.compileDelayMs));
   if (warm) {
     scene.remove(warm); encounters.spills[0].uniforms.uAlpha.value = 0; window.__dbg.warmDisposedGeometries = disposeDetachedGeometries(warm, scene, water.scene, fxScene); skiff.mesh.visible = false;
     for (const b of life.traffic.boats) { b.mesh.visible = false; if (b.searchRig) { b.searchRig.visible = false; b.searchLight.intensity = 0; b.searchBeam.visible = false; b.searchBeam.scale.set(b.searchWidth, b.searchLength, 1); } }
   }
   if (import.meta.env.DEV) document.documentElement.dataset.emeraldResource = JSON.stringify(debugResourceSnapshot());
-  document.getElementById('loading').remove();
+  startupTiming.titleReadyMs = performance.now() - startupStartedAt;
   showTitle(false);
   activatePageLifecycle();
+  window.__loadingScreen?.complete?.();
 }
 
-init().catch(e => { console.error(e); document.getElementById('loading').textContent = 'Error: ' + e.message; });
+init().catch(e => { console.error(e); window.__loadingScreen?.fail?.('The launch motor quit. Reload and try again.'); });
