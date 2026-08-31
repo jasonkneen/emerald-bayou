@@ -7,6 +7,7 @@ import { HullDamageMaterial } from './hulldamage.js';
 import { person } from './folk.js';
 import { mulberry32 } from './noise.js';
 import { registerWetMaterial } from './surfacewetness.js';
+import { bottomStrikeSeverity } from './boatdamage.js';
 
 // Boat local frame: +X starboard, +Y up, -Z forward (bow at -Z).
 // The player boat and scheduled traffic use the same detailed hull. Keep one immutable render template so its
@@ -89,6 +90,28 @@ export function setAirboatWetness(boat, value = 0) {
 
 export function updateAirboatWetness(boat, conditions) {
   return setAirboatWetness(boat, airboatWetnessStep(boat?.surfaceWetness, conditions));
+}
+
+// One player-only line buffer suggests vines and splintered brush wound through the prop disc. It is created once,
+// hidden when the cage is clear and never rebuilt as fouling changes.
+export function makePropWrapVisual() {
+  const turns = 24, positions = new Float32Array(turns * 2 * 3 + 8 * 2 * 3);
+  let cursor = 0;
+  const point = (x, y, z) => { positions[cursor++] = x; positions[cursor++] = y; positions[cursor++] = z; };
+  for (let i = 0; i < turns; i++) {
+    const a0 = i / turns * Math.PI * 3.6 - 0.6, a1 = (i + 1) / turns * Math.PI * 3.6 - 0.6;
+    const r0 = 0.2 + i / turns * 0.92, r1 = 0.2 + (i + 1) / turns * 0.92;
+    point(Math.cos(a0) * r0, Math.sin(a0) * r0, -0.035); point(Math.cos(a1) * r1, Math.sin(a1) * r1, -0.035);
+  }
+  for (let i = 0; i < 8; i++) {
+    const a = i / 8 * Math.PI * 2 + 0.23, bend = 0.15 * Math.sin(i * 2.7);
+    point(Math.cos(a) * 1.08, Math.sin(a) * 1.08, -0.045);
+    point(Math.cos(a + 1.72) * (0.31 + bend), Math.sin(a + 1.72) * (0.31 + bend), -0.055);
+  }
+  const geometry = new THREE.BufferGeometry(); geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3)); geometry.computeBoundingSphere();
+  const material = new THREE.LineBasicMaterial({ color: 0x83734a, transparent: true, opacity: 0.9, depthWrite: false, toneMapped: true });
+  const wrap = new THREE.LineSegments(geometry, material); wrap.name = 'airboat prop wrap'; wrap.visible = false; wrap.renderOrder = 4;
+  return wrap;
 }
 
 // Persistent world airboats share the immutable template's PBR materials, so one global storm-film registration
@@ -298,11 +321,12 @@ export function buildAirboat({ dynamicWetness = false, initialWetness = 0.06, pr
   // player requests the small unique set whose roughness and colour respond to rain and spray.
   blur.material = blur.material.clone();
   group.userData.airboatDynamicWetness = dynamicWetness;
-  const boat = { group, prop, blur, rudders, cage, wetSurfaceMaterials: EMPTY_WET_SURFACES, surfaceWetness: 0, hullDamage: null };
+  const boat = { group, prop, blur, rudders, cage, propWrap: null, wetSurfaceMaterials: EMPTY_WET_SURFACES, surfaceWetness: 0, hullDamage: null };
   if (dynamicWetness) {
     boat.wetSurfaceMaterials = prepareAirboatWetSurfaces(group);
     const damageSurface = boat.wetSurfaceMaterials.find(surface => surface.damageSurface);
     if (damageSurface) boat.hullDamage = new HullDamageMaterial(damageSurface.material, profile);
+    boat.propWrap = makePropWrapVisual(); prop.add(boat.propWrap);
     setAirboatWetness(boat, initialWetness);
   }
   return boat;
@@ -486,6 +510,7 @@ export class AirboatPhysics {
     this.speed = 0;
     this.wet = 1; this.landFac = 0; this.contact = true; this.airborne = false; this.airTime = 0; this.airPeak = 0;
     this.impact = 0; // vertical landing impact (m/s) on the frame it happens
+    this.bottomStrike = 0; // fast first contact with a submerged bed
     this.hit = 0; this.hitNormal = new THREE.Vector2(); // collision speed into an obstacle this frame
     this.surfH = 0; this.prevFloor = null; this.groundH = 0; this.waterH = 0;
     this.grounded = 0; this.bob = 0;
@@ -496,7 +521,7 @@ export class AirboatPhysics {
     this.lastFloat = new THREE.Vector2(x, z);
     this.loaded = 0; // passenger / cargo mass factor
     this.towDrag = 0; // extra quadratic drag from something on a rope behind the boat
-    this.powerScale = 1; this.steerScale = 1; this.damageLoad = 0; this.damageList = 0; this.damageTrim = 0;
+    this.powerScale = 1; this.steerScale = 1; this.damageLoad = 0; this.damageList = 0; this.damageTrim = 0; this.damageSink = 0;
     this.landedFrame = false; this.takeoffFrame = false;
     this.landQuality = ''; // '', 'clean', 'hard', 'stuffed', 'wipeout' on the landing frame
     this.noseIn = 0; this.tailIn = 0; this.wipeT = 0; this.stuffT = 0;
@@ -568,7 +593,7 @@ export class AirboatPhysics {
     this.anchorConstraint = null;
     this.pos.set(x, z); this.vel.set(0, 0); this.heading = heading; this.angVel = 0; this.y = 0; this.vy = 0;
     this.pitch = this.roll = this.pitchVel = this.rollVel = 0; this.prevFloor = null; this.airTime = 0; this.airPeak = 0; this.lastFloat.set(x, z);
-    this.airborne = false; this.landedFrame = false; this.takeoffFrame = false; this.landQuality = ''; this.wipeT = 0; this.stuffT = 0; this.impact = 0; this.hit = 0;
+    this.airborne = false; this.landedFrame = false; this.takeoffFrame = false; this.landQuality = ''; this.wipeT = 0; this.stuffT = 0; this.impact = 0; this.bottomStrike = 0; this.hit = 0;
     this.windHeel = 0; this.apparentWind = 0; this.crosswind = 0;
     this.current.set(0, 0); this.waterSpeed = 0;
   }
@@ -584,8 +609,8 @@ export class AirboatPhysics {
     this.rpm += (rpmTarget - this.rpm) * (1 - Math.exp(-dt * 2.5));
 
     const fwd = this.forward(this._f), rgt = this.right(this._r);
-    const massF = 1 + this.loaded * 0.18 + (this.damageLoad || 0);
-    this.hit = 0; this.hitTag = ''; this.hitObj = null;
+    const massF = 1 + this.loaded * 0.18 + (this.damageLoad || 0), previousGrounded = this.grounded;
+    this.hit = 0; this.hitTag = ''; this.hitObj = null; this.bottomStrike = 0;
 
     // ---- support surfaces under the hull ----
     const px = this.pos.x, pz = this.pos.y;
@@ -641,6 +666,7 @@ export class AirboatPhysics {
     const rvx = this.vel.x - cx, rvz = this.vel.y - cz;
     const vf = rvx * fwd.x + rvz * fwd.y, vl = rvx * rgt.x + rvz * rgt.y;
     this.waterSpeed = Math.hypot(rvx, rvz);
+    this.bottomStrike = bottomStrikeSeverity(this.waterSpeed, previousGrounded, this.landFac, waterC - Math.max(hC, hMean), hBow - Math.max(hC, hStern));
     const anchor = this.anchorConstraint, anchorForce = this._anchorForce;
     if (anchor?.active && anchor.engaged && this.wet > 0.2 && !this.airborne) {
       anchorConstraintForce(anchor, px + fwd.x * 2.2, pz + fwd.y * 2.2, this.vel.x, this.vel.y, anchorForce);
