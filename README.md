@@ -53,14 +53,25 @@ The GitHub Pages workflow downloads and verifies this archive before it builds t
 | `A` / `D` | rudder, and spin while airborne |
 | `S` / `Shift` in the air | lean back, lean forward |
 | drag | look around |
+| `V` | switch between chase and helm cameras |
 | `E` | interact (job posts, docks, traps, field notes, aid reports) |
 | `C` | cast, set the hook, and reel while held |
 | `X` | reel in or cut the line |
+| `G` | set or weigh the anchor while nearly stopped |
 | `M` | jobs board |
 | `Tab` | chart |
 | `L` | spotlight |
 | `H` | horn; one prolonged blast in dense fog |
+| `X` | cut a fishing line, or cut cage debris after the prop settles |
 | `R` | reset the boat |
+| controller `RT` / `LT` | analogue throttle and reverse |
+| controller left stick | rudder; pitch and spin while airborne; click to switch camera |
+| controller right stick | look; click to centre the camera |
+| controller `A / Cross` | interact |
+| controller `X / Square`, `B / Circle`, `Y / Triangle` | fish, alternate action or cut line/cage debris, anchor |
+| controller `LB`, `RB`, View, Menu | spotlight, horn, chart, pause |
+
+The D-pad works throughout the title and pause menus. D-pad up opens the jobs board while you are on the water. Supported controllers also rumble with hull strikes and hard landings.
 
 ## What's in it
 
@@ -70,7 +81,19 @@ Sixteen jobs unlock in sequence, from a shakedown run through a manatee count, a
 
 Between jobs, you can come across dead motors, FWC stops, watched packages, storm wreckage, drifting fuel drums and illegal monofilament sets. A hard strike can split a drum and leave a sheen moving with the current. It can also stop one of the resident working boats: kill the prop and hold alongside while the crew checks everyone aboard, or leave and hear your hull reported over the radio.
 
+On calm afternoons, Big Cal may be working a nuisance gator beside his skiff while two boats form an unhelpful gallery. Idle 55–100 ft off and hold the escape cut to help him get the tape on, or put $50 on the number of fingers he finishes with. A fast closing pass, jump landing or hull contact can break his grip. The loose animal turns at the boat before it runs for deep water, while a sudden squall can scatter the scene without blaming the player.
+
+That whole gathering borrows three skiffs, four people and the alligator already kept by the encounter director. It creates no mesh, geometry, material, texture or light. The boats use three fixed collision records, the gator uses one, and the moving animal writes into the existing wake-stamp pool.
+
 The seven resident crews keep their own schedules, jobs and operator records. They run for shelter when the weather exceeds what their boat can carry, complain about wake over working gear and remember collisions. FWC 27 can break from patrol to answer an emergency tow call when there is a safe approach.
+
+Those crews also watch for manatee backs and footprints. Five times a second, each skipper projects the closest approach over the next seven seconds, waits a human beat, then comes off plane and turns into the safer water. Darkness, fog and hard weather shorten the distance at which a crew notices the animal. The behaviour follows [FWC boating guidance](https://myfwc.com/education/wildlife/manatee/for-boaters/): stay at least 50 ft away, slow down and watch for footprints, backs, snouts and tails.
+
+Resident wakes affect the rest of the swamp too. Prop wash can blow a bait school down before the player reaches it, passing hulls flush waders, nearby manatees dive, and gators leave a bank or slip under. These ambient reactions do not pay player bounties. The pass reuses the seven boats, four manatees, sixteen waders and eighteen gators already in memory, with one retained avoidance record per boat and no new render resource. [Everglades boating rules](https://www.nps.gov/ever/planyourvisit/boatingrulesregs.htm) prohibit harassing wildlife.
+
+Surface patrols cannot see through islands. During a chase they check the waterline five times a second; an emergent bank or mangrove point breaks their view, sends them to the last reported position and changes the wanted display to FWC searching. Another patrol boat with a clear angle, or Air 2 overhead, can keep the hull identified. The check keeps one small state record and uses bounded terrain samples, with no new scene or GPU resources.
+
+At four wanted stars, Shallow Water 4 reads the player's current course, checks a predicted intercept for depth and obstructions, then runs ahead and turns broadside. The point stays fixed, so an early turn beats the roadblock. Hold course and its hull becomes a real collision obstacle while FWC 27 and Marine 12 keep pressing and ramming. The tactic uses the third pooled patrol boat and adds no scene resources.
 
 At five wanted stars, a sustained pursuit can bring FWC Air 2 if the wind and storm conditions are flyable. It works from positions called by surface units and its own finite view. Lose both under canopy or in fog and the helicopter circles the last fix while its searchlight sweeps; the chase can still be escaped. The response reuses the Coast Guard helicopter rig, searchlight and rotor audio, so it adds no second aircraft pool. This is based on FWC's description of its [Aviation Unit](https://myfwc.com/law-enforcement/special-programs/) patrolling large areas of land and water as an "Eye in the Sky," and its account of coordinating [air, land and sea assets](https://myfwc.com/about/inside-fwc/le/what-we-do/).
 
@@ -80,9 +103,19 @@ The horn is live on `H`. It gives a short warning in clear water and a 4.5-secon
 
 The marked channels now match the radio traffic. Red aids carry even numbers, green aids carry odd numbers, and each light keeps its own flash characteristic while the float moves with chop and current. Hail, tropical weather, hurricanes and vessel strikes can leave a marker dim, dark, off station or down. Idle alongside a bad aid to report the exact fix; it stays on the working chart until FWC maintenance clears it.
 
-The water is the part that took longest. Real reflection and refraction passes, a tannin absorption map rendered by the terrain workers so still shaded water goes black and grows duckweed, a tide that moves the shoreline about 0.4 m either way, and a wake that stamps into the surface and shoves floating debris around.
+The water is the part that took longest. Real reflection and refraction passes, a tannin absorption map rendered by the terrain workers so still shaded water goes black and grows duckweed, a tide that moves the shoreline about 0.4 m either way, and a wake that stamps into the surface and shoves floating debris around. Run skinny water and the hull pressure wave lifts a brown sediment plume from the bed; it spreads with speed, thickens in soft tannin backwaters and drifts with the same current as the wake. The plume uses the wake target's previously unused alpha channel and one existing trailing stamp, so it adds no texture, render target, material, geometry, scene object or draw call.
 
-Severe tropical bands can now lift loose planks and sheet metal over the channel. They move with the gusts, tumble, become solid only as they drop to cage height, then splash down and remain as floating prop hazards. Logs stay in the water. The behavior follows National Weather Service and National Hurricane Center guidance that tropical-storm and hurricane winds can turn loose outdoor material into [windborne debris](https://www.weather.gov/mhx/hurricaneprep) and [flying missiles](https://www.nhc.noaa.gov/prepare/hazards.php); the debris left obstructing shallow channels follows [NOAA's account of storm-driven marine debris](https://oceanservice.noaa.gov/facts/disaster-debris.html).
+At idle, `G` drops the bow anchor. Water depth sets the amount of rode, and the hull drifts within that scope before the line comes tight. Firm mud holds best; soft muck, shell and sawgrass give sooner. Current, storm load or too much throttle can make the anchor drag while the bow swings into the load. The rode is one fixed 12-point line, reused for every drop.
+
+Rain stays on the world after the curtain passes. Banks and tidal mud keep a dark wet film, while roofs, dock timber, trees and sawgrass lose roughness and catch sharper light until the sun and wind dry them. Hail melt and dense night fog can leave moisture too. The pass changes two terrain uniforms and the existing cached materials; it creates no textures, meshes, draw calls, render targets or shader programs.
+
+Severe tropical bands can now lift loose planks and sheet metal over the channel. They move with the gusts, tumble, become solid only as they drop to cage height, then splash down and remain as floating hull hazards. Logs stay in the water. The behavior follows National Weather Service and National Hurricane Center guidance that tropical-storm and hurricane winds can turn loose outdoor material into [windborne debris](https://www.weather.gov/mhx/hurricaneprep) and [flying missiles](https://www.nhc.noaa.gov/prepare/hazards.php); the debris left obstructing shallow channels follows [NOAA's account of storm-driven marine debris](https://oceanservice.noaa.gov/facts/disaster-debris.html).
+
+The air prop fails like an air prop. Floating deadheads hammer the hull, but standing cypress limbs and windborne debris can enter the cage, visibly wrap the prop, choke thrust and load the engine. Bring the throttle to idle and hold `X` (`B / Circle` on a controller) to cut the debris free from aboard. Pinning the throttle tightens it. The wrap is one fixed player-only line with a 768-byte position buffer that stays hidden when the cage is clear. Its stock line program is prepared behind the loading card, so the first cage strike does not compile a shader in play.
+
+Lightning no longer fades as one unbranched line. Each strike fills a fixed 72-segment buffer with a 24-step main channel, two major forks and a bounded set of smaller branches. Three return strokes run through the same channel with dark gaps between them, relighting the sky and water each time. Thunder still arrives by distance, and a nearby strike can still damage the boat or knock out settlement power. The line geometry and its scratch buffer total 3,756 bytes. There is one draw call and no texture.
+
+The camera now takes time to recover after looking into the sun or catching a close flash. Direct fair-weather sun, lightning and the night spotlight contract the existing grade exposure quickly; darkness returns more slowly. Cloud, rain and fog stop a hidden sun from dimming the picture. This changes the exposure uniform already in the post pass and adds no GPU resource.
 
 The storm system still owns twelve debris bodies and 44 meshes. Sharing their immutable parts cut the pool from 44 geometries and 16 materials to six geometries and seven materials. Its seventeen wake records are reused every frame, and thunder loops the existing engine-noise sample instead of generating a new 2.8 second buffer for every strike.
 
@@ -90,13 +123,23 @@ World sounds follow their sources across the water. Gator bellows, bird calls, f
 
 A clearing squall can leave a rainbow opposite the low sun. The primary bow carries red on the outside; a faint secondary reverses the colours, with Alexander's dark band between them. It needs recent rain and a break in the cloud, then fades as the rain curtain moves off. Both arcs are drawn inside the existing sky shader and its water reflection, with no extra scene objects, textures or render targets.
 
-The Moon advances through a 29.531-day cycle. Its rise time, crescent or quarter terminator, moonlight and shadows all come from the same phase. New and full moons retain the strongest spring range; quarter moons soften the water and currents into a neap range. Clouds now hide the stars and Moon instead of letting either draw over the weather.
+Clouds now move across the ground as well as the sky. In fair and overcast daylight, broad shadows cross the water, banks and trees with the wind. They thin through a squall and disappear under the solid dark deck of a hurricane. The mask takes one sample from the 256 px noise texture already used by mist, inside the existing colour-grade pass. Performance and Fallback skip the work. It adds no scene object or render target and reuses the existing shader program and texture.
+
+Clear, calm afternoons now put a thin refractive shimmer over distant water and low banks. It builds after solar noon and dies under overcast, rain, fog or strong wind. Depth reconstruction keeps the nearby boat and sky steady, and the effect fades through the high canopy instead of warping the whole screen. Balanced and Cinematic reuse the grade pass's depth and noise inputs. Performance and Fallback skip the lookup. No new texture, render target or scene object is allocated.
+
+The Moon advances through a 29.531-day cycle. Its rise time, crescent or quarter terminator, moonlight and shadows all come from the same phase. New and full moons retain the strongest spring range; quarter moons soften the water and currents into a neap range. Clouds now hide the stars and Moon instead of letting either draw over the weather. One retained brightness value follows the Moon above the horizon and through the cloud deck, then drives the scene light, firefly display and visible contrast of blue-fire wakes without another frame allocation.
 
 The renderer budgets its internal drawing buffer instead of blindly doubling every Retina dimension. Performance profiles release the full-size optional post targets, reduce reflection and shadow work, and defer optional GLB decoding until the dock scene is playable. The map, streaming distance and simulation stay unchanged while the largest HDR and depth attachments remain bounded.
+
+The sky reflection convolution follows the same budget. Fallback, Performance, Balanced and Cinematic use 32, 64, 128 and 128 px environment maps. The map is convolved behind loading or at the title and then held through active play, because rebuilding it on an idle callback can still stop the main thread. Cinematic now retains about 2.25 MiB of half-float colour and capture depth instead of the old 9 MiB target.
 
 Navigation aids are streamed from seeded 360 m cells and capped at 36 around the boat. Six instanced meshes draw the whole local network, including the flashing lanterns, with no per-marker light objects or model downloads. Collision objects only enter physics inside a roughly 100 m working set, and the persistent fault ledger is capped at twelve records.
 
 Wildlife lives its own life. Alligators bask on banks and slide in when you get close, and the bull will charge an idle hull inside 16 m. Mullet jump near the boat, bait boils off the bow in the shallows, ibis and pelicans run lines low over the water, and vultures circle high. When you get more than 700 m away it all quietly relocates ahead of you.
+
+At night, the boat spotlight can catch an alligator before the rest of it appears out of the black water. A surfaced animal facing the beam throws back a tight amber-red pair. Turn its head, let it dive, or bring in dense fog and the return goes. The eighteen gators share one fixed 36-eye instanced pool with one geometry and one material. The effect uses no point lights or textures, and their swimming height and preferred depth now move with the tide.
+
+The same spotlight now shows the wet air it is cutting through. Clear air holds only a faint shaft. Rain and fog thicken it and shorten the usable throw, with three nested shells breaking up the cone instead of drawing a solid tube. It is one textureless 432-vertex mesh. Fallback turns it off; the other graphics profiles reuse the same 8.6 KB geometry and material.
 
 On a moving tide, pelicans and the osprey can find a mullet school in open water. Hold 25–65 m off at idle and the bait stays up; drive through it or let your wake reach it and the birds lift while the school goes deep. The event redirects two existing bird flocks and borrows from the fixed fish and spray pools instead of creating another set of wildlife.
 
@@ -106,13 +149,23 @@ The habitat split follows Florida Fish and Wildlife Conservation Commission prof
 
 Fishing owns one rod, one dynamic line buffer, one lure and one landing fish. Those resources are reused on every cast, and the recent-catch ledger stops at twelve entries.
 
-Rare field signs depend on the place and the water rather than a mission marker. Roseate spoonbills settle in Rookery Lakes around first and last light, and a real player wake reaching the bank will flush them. A tagged smalltooth sawfish moves through Mangrove Reach on a rising tide; its receiver ping closes up as the boat approaches, but the fix only resolves while the hull stays at idle distance. Falling water in Cypress Reach can uncover a logging skiff long enough to copy its builder plate. Successful observations stay in the boat log and on the chart.
+A hooked fish can now pull a nearby swimming alligator into the fight. A hard run carries farther than a small splash; one eligible animal may turn, throw a visible wake and close on the fish. Pull it clear or press `X` to cut the line. Banks block the approach, while basking, submerged, handled and recently fed animals stay out of it. If the alligator gets there first, the fish is gone and the boat log keeps the loss.
 
-On some calm nights, a plankton bloom reaches Mangrove Reach. The water stays black until something moves through it: hull wakes, fish, paddles and splashes leave blue fire behind them. The bloom runs through the existing wake and particle buffers, so it adds no extra scene assets.
+The chase reuses the existing eighteen alligators, fish splash pool and two-slot wildlife wake budget. It adds no geometry, material, texture or draw call. The behaviour follows the National Park Service descriptions of alligators as [stealth hunters that feed in the water](https://www.nps.gov/bicy/learn/nature/american-alligators.htm) and of [fish as normal adult prey](https://www.nps.gov/guis/learn/nature/alligators.htm).
 
-Calm banks now carry fireflies after sunset, with the thickest displays in cypress and mangrove water. Heavy rain and hard wind shut them down. A fast engine thins the flashes close to the hull, while the bow spotlight washes out the insects caught in its cone. Each bank is seeded from its world cell, so the same lights remain in place as the boat idles past. The display is one textureless point draw capped at 243 insects; Performance and Balanced draw smaller prefixes, and Fallback skips it.
+Rare field signs depend on the place and the water rather than a mission marker. Roseate spoonbills settle in Rookery Lakes around first and last light, and a real player wake reaching the bank will flush them. A tagged smalltooth sawfish moves through Mangrove Reach on a rising tide; its receiver ping closes up as the boat approaches, but the fix only resolves while the hull stays at idle distance. Falling water in Cypress Reach can uncover a logging skiff long enough to copy its builder plate.
+
+Around dusk or dawn, a Burmese python may cross a still Cypress Reach cut. The boat has to hold 13–38 m off with an open waterline while the field camera records its body, heading and position; a cypress island or trunk between the boat and animal blocks the sequence. Prop wash can make it dive before the fix is complete. The report goes to FWC with no capture attempt, matching the agency's advice to photograph, note the location and report a sighting. Burmese pythons are established in South Florida and are often found near or in water; see the [FWC species profile](https://myfwc.com/wildlifehabitats/profiles/reptiles/snakes/burmese-python/) and [USGS waterway research](https://www.usgs.gov/centers/wetland-and-aquatic-research-center/science/burmese-python-environmental-dna-edna-surveys). Successful observations stay in the boat log and on the chart.
+
+The python is one 18-segment instanced mesh with one procedural geometry and one material. Its surface wake uses one record from the existing wake pool. Repeated sightings reuse the same rig.
+
+On some calm nights, a plankton bloom reaches Mangrove Reach. The water stays black until something moves through it: hull wakes, fish, paddles and splashes leave blue fire behind them. A bright Moon takes some contrast out of the glow without switching off the bloom; moonset and thick cloud bring the darker water back. The bloom runs through the existing wake and particle buffers, so it adds no extra scene assets.
+
+Calm banks now carry fireflies after sunset, with the thickest displays in cypress and mangrove water. Heavy rain and hard wind shut them down, while a high bright Moon makes the flashes harder to pick out. A fast engine thins the display close to the hull, and the bow spotlight washes out the insects caught in its cone. Each bank is seeded from its world cell, so the same lights remain in place as the boat idles past. The display is one textureless point draw capped at 243 insects; Performance and Balanced draw smaller prefixes, and Fallback skips it.
 
 The timing and wet-bank placement draw on [University of Florida field notes](https://entnemdept.ufl.edu/lloyd/firefly/ffcomp1-1.pdf). The mangrove bias follows the documented habitat of the [Florida intertidal firefly](https://xerces.org/press/first-conservation-status-assessments-published-for-north-american-fireflies), and the weather and light response follows [National Park Service viewing guidance](https://home.nps.gov/cong/fireflies.htm).
+
+Power at the camps is no longer perfect. Squalls make weak circuits sag. Thunderstorms and tropical weather can black out individual houses, and a close lightning strike can leave one address dark after the rain moves on. Each place keeps the same vulnerability for the day, and restored power comes back slowly instead of snapping on. The effect still uses five pooled point lights. Those lights now share one bulb geometry and material, and nearest-site selection reuses five fixed records instead of rebuilding and sorting a candidate list every 0.6 seconds.
 
 People are jointed figures driven by a pose target system rather than baked animation, so a man on a dock will track you as you go past, drink his beer, check his rod, cast, and reel in a fish. Boat ramps run a 150 second cycle where a truck backs down the slab, floats a boat off the trailer, motors out and comes back to winch it on.
 
@@ -136,14 +189,20 @@ Minimap tiles are 200 m and rendered by the same workers, then cached. The chart
 src/
   heightfield.js   terrain function, no three.js, shared with the workers
   terrain.js       quadtree streaming and LOD
+  surfacewetness.js retained rain film and shared outdoor material response
   vegetation.js    per-chunk instancing, wind shader
-  water.js         reflection, refraction, murk, tide
+  water.js         reflection, refraction, murk, tide, wake sediment
+  sediment.js      shallow-bed churn model
   airboat.js       hull physics, air control, landing quality
   game.js          jobs, bounties, records, save
   discoveries.js   tide, time and region-driven field observations
   navigationaids.js seeded channel markers, light failures and reports
   fishing.js       boat-bound fishing, habitat, line tension and catch log
+  ecology.js       weather, time and traffic-driven world behaviour
   nocturnal.js     seeded bank fireflies and night disturbance response
+  wildlife.js      birds, fish, gators and spotlight eyeshine
+  wildlifetraffic.js retained manatee closest-approach and safe-speed rules
+  wrangler.js      nuisance-gator station keeping and wake-risk rules
   encounters.js    rescues, patrols, races, contraband and wildlife calls
   law.js           wanted attention and pursuit state
   story.js         the channel 68 arc
@@ -164,20 +223,32 @@ __dbg.mode = 'depth'                      // full | raw | nowater | depth | refl
 __dbg.phys.reset(x, z, heading)           // teleport
 __dbg.environment.minutesPerSecond = 0    // freeze the clock
 __dbg.environment.setHour(17.4)           // pick the light
-__dbg.environment.lunarSnapshot()         // phase, illumination, tide range, altitude
+__dbg.environment.lunarSnapshot()         // phase, illumination, tide range, altitude, live light
 __dbg.ecology.setBioluminescence(1, true) // force the disturbed-water glow
 __dbg.discoveries.start('roseate-roost', true, true) // force a nearby field sign
+__dbg.discoveries.start('python-crossing', true, true) // force the swimming-python report
 __dbg.navigationAids.resourceStats()     // active aids, draw calls, faults and reports
 __dbg.fishing.resourceStats()            // fixed rod, line, lure and landing-fish budget
 __dbg.nocturnal.setActivityOverride(1, true) // force bank fireflies for inspection
 __dbg.nocturnal.resourceStats()           // point count, draw count and geometry bytes
+__dbg.gators.resourceStats()               // 18 animals and the fixed 36-eye instanced pool
+Alt+Shift+U                                // stage one resident-boat/manatee crossing in development
 __dbg.environment.setRainbow(1)            // force both bows; pass null to restore live weather
-__dbg.encounters.pursuitSnapshot()        // surface units, shared visual and pooled aviation state
+__dbg.environment.settlementPowerSnapshot() // five-light pool, live grid stress and saved strike outages
+__dbg.environment.spotlightVolumeSnapshot() // one weather-scaled beam mesh and its fixed geometry budget
+__dbg.environment.lightningSnapshot()       // fixed branched channel, return strokes and live draw budget
+__dbg.environment.eyeAdaptationSnapshot()   // current exposure target and zero-extra-GPU-resource budget
+__dbg.environment.cloudShadowSnapshot()   // live mask, drift and zero-extra-resource budget
+__dbg.environment.surfaceWetnessSnapshot()  // live film target, shared material writes and terrain uniforms
+__dbg.encounters.pursuitSnapshot()        // surface units, channel closure, shared visual and pooled aviation state
+__dbg.encounters.wranglerSnapshot()       // pooled crowd, assist, wake risk and zero extra render resources
 __dbg.hazards.resourceStats()             // debris pool, shared resources and wake-stamp budget
 __dbg.audio.spatialStats()                 // listener direction and spatial-node allocation totals
 __dbg.freeCam = { x, y, z, tx, ty, tz }   // park the camera
 __dbg.terrain.hf.computeBase(x, z)        // { h, s, lake, prairie, hammock }
 ```
+
+In development, `Shift+F12` toggles a frozen, safe-distance python inspection and restores the previous boat position and clock when pressed again. It is stripped from the production build.
 
 `import('/src/inspect.js')` from the console gives you a helper for measuring and previewing a GLB, which is how the entries in `SPEC` in `src/models.js` were worked out.
 

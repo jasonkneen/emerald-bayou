@@ -3,6 +3,7 @@ import { loadDriver } from './airboat.js';
 import { person } from './folk.js';
 import { mulberry32 } from './noise.js';
 import { emitWakeStamp } from './wakestamps.js';
+import { wakeSampleAt } from './wakefield.js';
 
 function skiffHullGeometry() {
   const stations = [
@@ -89,12 +90,30 @@ export function buildSkiff({ crew = true, driverModel = true } = {}) {
   if (crew) {
     const driver = skiffCrew(0.16, 1.18, SKIFF_MAT.capRed, true); g.add(driver); crewList.push(driver);
     const rr = mulberry32(0x51cf2d + skiffSerial++ * 977); const deckhand = person(rr, { pose: 'sit', hat: true, vest: rr() < 0.55 }); deckhand.scale.setScalar(0.74); deckhand.position.set(-0.1, 0.142, -0.68); deckhand.rotation.y = Math.PI; g.add(deckhand); people.push(deckhand);
-    if (driverModel) loadDriver(g, { scale: 0.48, position: [0.16, 0.49, 1.16] }).then(model => { driver.visible = false; g.userData.driverModel = model; }).catch(() => {});
+    if (driverModel) loadDriver(g, { scale: 0.48, position: [0.16, 0.49, 1.16] }).then(model => { if (!model) return; driver.visible = false; g.userData.driverModel = model; }).catch(() => {});
   }
   const net = skiffPart(SKIFF_GEO.net, SKIFF_MAT.net); net.scale.set(1.32, 0.42, 0.8); net.position.set(0, 0.42, -1.52); g.add(net);
   for (const x of [-0.24, 0.22]) { const coil = skiffPart(SKIFF_GEO.netCoil, SKIFF_MAT.rope); coil.rotation.x = Math.PI / 2; coil.position.set(x, 0.5, -1.48); g.add(coil); }
   const fuel = skiffPart(SKIFF_GEO.fuel, SKIFF_MAT.fuel); fuel.position.set(0.5, 0.32, 1.16); g.add(fuel);
   g.userData.motor = motor; g.userData.crew = crewList; g.userData.people = people; g.userData.fuel = fuel;
+  return g;
+}
+
+const MODEL_BOAT_FALLBACKS = Object.freeze({
+  beau_boat: Object.freeze({ beam: 0.94, depth: 0.96, length: 0.98, console: 1.05 }),
+  sandbox_boat: Object.freeze({ beam: 0.9, depth: 0.92, length: 0.9, console: 0.92 }),
+  boat_dreams: Object.freeze({ beam: 1.24, depth: 1.08, length: 1.22, console: 1.7 }),
+});
+
+// Low-tier model replacements stay recognizable while sharing four resources already owned by the procedural
+// johnboat. The wrapper is removed when a GLB arrives; on old hardware it remains as a compact four-draw hull.
+export function buildModelBoatFallback(name = 'beau_boat') {
+  const shape = MODEL_BOAT_FALLBACKS[name] || MODEL_BOAT_FALLBACKS.beau_boat;
+  const g = new THREE.Group(); g.name = `${name} procedural hull`; g.userData.fallbackModel = name;
+  const hull = skiffPart(SKIFF_GEO.hull, SKIFF_MAT.hull); hull.scale.set(shape.beam, shape.depth, shape.length); g.add(hull);
+  const floor = skiffPart(SKIFF_GEO.floor, SKIFF_MAT.floor); floor.scale.set(shape.beam * 1.08, 1, shape.length); floor.position.set(0, 0.07, 0.16 * shape.length); g.add(floor);
+  const cowl = skiffPart(SKIFF_GEO.cowl, SKIFF_MAT.motor); cowl.scale.set(shape.console, 0.86 + shape.console * 0.18, 1.08 + shape.console * 0.32); cowl.position.set(0, 0.67, 0.72 * shape.length); g.add(cowl);
+  const leg = skiffPart(SKIFF_GEO.leg, SKIFF_MAT.motor); leg.scale.y = 0.82; leg.position.set(0, 0.08, 1.92 * shape.length); g.add(leg);
   return g;
 }
 
@@ -104,16 +123,40 @@ export class SkiffAI {
     this.mesh = buildSkiff();
     this.pos = new THREE.Vector2(); this.vel = new THREE.Vector2(); this.heading = 0; this.speed = 0;
     this.maxSpeed = 11.6; this.path = []; this.i = 0; this.active = false; this.done = false; this.waveFn = waveFn;
+    this.navigationLights = true;
     this.roll = 0; this.pitch = 0; this.dist = 0;
+    this.shoveX = 0; this.shoveZ = 0; this.yawKick = 0; this.heelKick = 0;
     this.lookAhead = 14; this._flow = new THREE.Vector2(); this._forward = new THREE.Vector2();
   }
-  start(path, speed) {
-    this.path = path; this.i = 0; this.maxSpeed = speed || 11.6;
+  start(path, speed, lookAhead = 14) {
+    this.path = path; this.i = 0; this.maxSpeed = speed || 11.6; this.lookAhead = Math.max(4, Number(lookAhead) || 14);
     this.pos.set(path[0].x, path[0].z); this.heading = Math.atan2(-(path[1].x - path[0].x), -(path[1].z - path[0].z));
-    this.vel.set(0, 0); this.speed = 0; this.active = true; this.done = false; this.mesh.visible = true; this.dist = 0;
+    this.vel.set(0, 0); this.speed = 0; this.active = true; this.done = false; this.dist = 0; this.roll = 0; this.pitch = 0;
+    this.shoveX = 0; this.shoveZ = 0; this.yawKick = 0; this.heelKick = 0;
+    this.mesh.position.set(this.pos.x, this.waveFn(this.pos.x, this.pos.y, 0) - 0.05, this.pos.y);
+    this.mesh.rotation.set(0, this.heading, 0); this.mesh.userData.motor.rotation.y = 0; this.mesh.visible = true;
   }
-  stop() { this.active = false; this.mesh.visible = false; }
+  stop() { this.active = false; this.mesh.visible = false; this.shoveX = 0; this.shoveZ = 0; this.yawKick = 0; this.heelKick = 0; }
   forward(out = new THREE.Vector2()) { return out.set(-Math.sin(this.heading), -Math.cos(this.heading)); }
+  // Retain a short hydrodynamic slide and attitude kick after another hull strikes this one. The normal points from
+  // the skiff toward the other boat, so the reciprocal impulse travels in the opposite direction. Contact distance
+  // along the centreline provides the torque arm: the same side hit yaws opposite ways at the bow and stern.
+  applyImpact(into, nx, nz, contactAlong = 0) {
+    const hit = Math.max(0, Math.min(12, Number(into) || 0)), normalLength = Math.hypot(nx, nz);
+    if (hit <= 0 || !Number.isFinite(normalLength) || normalLength < 1e-5) return false;
+    nx /= normalLength; nz /= normalLength;
+    const impulse = Math.min(4.8, hit * 0.48);
+    this.shoveX -= nx * impulse; this.shoveZ -= nz * impulse;
+    const shoveSpeed = Math.hypot(this.shoveX, this.shoveZ), maxShove = 5.4;
+    if (shoveSpeed > maxShove) { const scale = maxShove / shoveSpeed; this.shoveX *= scale; this.shoveZ *= scale; }
+    const along = Math.max(-2, Math.min(2, Number(contactAlong) || 0));
+    const fx = -Math.sin(this.heading), fz = -Math.cos(this.heading), forceX = -nx * impulse, forceZ = -nz * impulse;
+    const torque = (fz * along) * forceX - (fx * along) * forceZ;
+    this.yawKick = Math.max(-1.1, Math.min(1.1, this.yawKick + Math.max(-0.85, Math.min(0.85, torque * 0.1))));
+    const rightX = -Math.cos(this.heading), rightZ = Math.sin(this.heading), contactSide = nx * rightX + nz * rightZ;
+    this.heelKick = Math.max(-0.22, Math.min(0.22, this.heelKick + contactSide * hit * 0.022));
+    return true;
+  }
   update(dt, t, hold = 0) {
     if (!this.active) return;
     // advance the target index past waypoints we are within reach of, then steer at a point a little ahead
@@ -123,22 +166,32 @@ export class SkiffAI {
     let dh = want - this.heading; dh = Math.atan2(Math.sin(dh), Math.cos(dh));
     const turnRate = 1.6;
     const turn = Math.max(-turnRate, Math.min(turnRate, dh * 3.0));
-    this.heading += turn * dt;
+    this.heading += (turn + this.yawKick) * dt;
     // slow for the bends, and if told to (a boat alongside)
     const bend = Math.min(1, Math.abs(dh) / 0.8);
     const tgtSpeed = this.maxSpeed * (1 - bend * 0.3) * (1 - hold * 0.8);
     this.speed += (tgtSpeed - this.speed) * (1 - Math.exp(-dt * (tgtSpeed > this.speed ? 0.6 : 2.0)));
     const f = this.forward(this._forward);
-    this.vel.set(f.x * this.speed, f.y * this.speed);
+    this.vel.set(f.x * this.speed + this.shoveX, f.y * this.speed + this.shoveZ);
     if (this.currents) this.vel.add(this.currents.flowAt(this.pos.x, this.pos.y, this._flow));
     this.pos.addScaledVector(this.vel, dt); this.dist += this.speed * dt;
-    this.roll += ((-turn * this.speed * 0.02) - this.roll) * (1 - Math.exp(-dt * 4));
+    this.roll += ((-turn * this.speed * 0.02 + this.heelKick) - this.roll) * (1 - Math.exp(-dt * 6));
     this.pitch += ((this.speed * 0.006) - this.pitch) * (1 - Math.exp(-dt * 3));
+    const shoveDecay = Math.exp(-dt * 1.9); this.shoveX *= shoveDecay; this.shoveZ *= shoveDecay;
+    this.yawKick *= Math.exp(-dt * 3.2); this.heelKick *= Math.exp(-dt * 2.8);
     const y = this.waveFn(this.pos.x, this.pos.y, t);
     this.mesh.position.set(this.pos.x, y - 0.05, this.pos.y);
     this.mesh.rotation.set(this.pitch, this.heading, this.roll, 'YXZ');
     this.mesh.userData.motor.rotation.y = -turn * 0.4; this.mesh.userData.motor.userData.prop.rotation.z += dt * (6 + this.speed * 5);
     if (this.i >= this.path.length - 1 && Math.hypot(tgt.x - this.pos.x, tgt.z - this.pos.y) < 6) this.done = true;
+  }
+  wakeHeightAt(x, z, t) {
+    if (!this.active || this.speed <= 2.2) return 0;
+    const dx = x - this.pos.x, dz = z - this.pos.y; if (dx * dx + dz * dz > 10609) return 0;
+    return wakeSampleAt(this.pos.x, this.pos.y, this.heading, this.speed, this.maxSpeed, 0.11, x, z, t);
+  }
+  visitActiveVessels(visitor) {
+    if (this.active) visitor(this.pos.x, this.pos.y, this.speed, 'skiff', this);
   }
   // wake stamps for the water sim (only worth pushing when inside the sim window)
   stamps(out) {

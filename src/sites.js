@@ -1,11 +1,13 @@
 import * as THREE from 'three';
 import { mulberry32 } from './noise.js';
 import { buildDock } from './tower.js';
-import { buildSkiff } from './npc.js';
+import { buildModelBoatFallback, buildSkiff } from './npc.js';
 import * as TEX from './textures.js';
 import { person, animatePerson, wave, aim, fishingUpdate, cooler, chair, bucket, fishingLine } from './folk.js';
+import { heroTreeFallback } from './markers.js';
 import { spawn, SPEC } from './models.js';
 import { cachedResource, sharedResource } from './cache.js';
+import { registerWetMaterial } from './surfacewetness.js';
 
 // The people who live out here: stilt houses with a dock and a washing line, public boat ramps with a truck and an
 // empty trailer, tin-roof boathouses over the water, duck blinds in the shallows. One per ~800 m cell, seeded, placed
@@ -18,7 +20,7 @@ const boxGeometry = (w, h, d) => geometry('box', [w, h, d], () => new THREE.BoxG
 const cylinderGeometry = (r0, r1, h, seg = 8) => geometry('cylinder', [r0, r1, h, seg], () => new THREE.CylinderGeometry(r0, r1, h, seg));
 const sphereGeometry = (r, w, h) => geometry('sphere', [r, w, h], () => new THREE.SphereGeometry(r, w, h));
 const torusGeometry = (r, tube, radial, tubular) => geometry('torus', [r, tube, radial, tubular], () => new THREE.TorusGeometry(r, tube, radial, tubular));
-const material = (key, params) => cachedResource(materialCache, key, () => new THREE.MeshStandardMaterial(params));
+const material = (key, params) => cachedResource(materialCache, key, () => registerWetMaterial(new THREE.MeshStandardMaterial(params)));
 
 const wood = material('wood', { color: 0x6b5641, roughness: 0.95 });
 const greyWood = material('grey-wood', { color: 0x8e877a, roughness: 0.95 });
@@ -84,7 +86,7 @@ function trailBoat(rr) {
   const r = rr();
   if (r < 0.45) { const g = buildSkiff({ crew: true }); recolor(g, 0x6f7570, [0x6f7570, 0x4c6b4a, 0xb8b4a8][Math.floor(rr() * 3)]); g.userData.len = 4.6; return g; }
   const name = r < 0.7 ? 'beau_boat' : r < 0.85 ? 'sandbox_boat' : 'boat_dreams';
-  const g = spawn(name); g.userData.len = SPEC[name].len;
+  const g = spawn(name, buildModelBoatFallback(name)); g.userData.len = SPEC[name].len;
   const d = person(rr, { pose: 'sit', hat: true, drive: true }); d.position.set(name === 'boat_dreams' ? 0.45 : 0, SPEC[name].y + (name === 'boat_dreams' ? 0.35 : 0.05), name === 'boat_dreams' ? 0.4 : 0.5); d.rotation.y = Math.PI; g.add(d); g.userData.people = [d];
   return g;
 }
@@ -92,7 +94,7 @@ function recolor(group, from, to) {
   group.traverse(o => {
     if (!o.isMesh || !o.material?.color || o.material.color.getHex() !== from) return;
     const source = o.material, key = `${source.uuid}:${to}`;
-    o.material = cachedResource(tintCache, key, () => { const tinted = source.clone(); tinted.color.setHex(to); return tinted; });
+    o.material = cachedResource(tintCache, key, () => { const tinted = source.clone(); tinted.color.setHex(to); return registerWetMaterial(tinted); });
   });
 }
 // ---- kinds ----
@@ -193,7 +195,8 @@ function animateRamp(g, t, waveFn, ctx) {
     const wp = boat.getWorldPosition(_v3);
     const d = Math.hypot(wp.x - ctx.bx, wp.z - ctx.bz);
     if (vis && speed > 0.05 && d < 90) {
-      ctx.ob = Math.max(ctx.ob, speed * Math.max(0, 1 - d / 90));
+      const level = speed * Math.max(0, 1 - d / 90);
+      if (level > ctx.ob) { ctx.ob = level; ctx.obPitch = 1; ctx.obX = wp.x; ctx.obZ = wp.z; }
       const fx = -Math.sin(heading + g.rotation.y), fz = -Math.cos(heading + g.rotation.y);
       if (d < 75) { if (ctx.emitStamp) ctx.emitStamp(wp.x - fx * 1.8, wp.z - fz * 1.8, 1.1, 0.5 * speed, 1.4 * speed, 1); else ctx.stamps?.push({ x: wp.x - fx * 1.8, z: wp.z - fz * 1.8, radius: 1.1, height: 0.5 * speed, foam: 1.4 * speed, foamRadius: 1 }); const n = Math.floor(50 * ctx.dt * speed + Math.random()); for (let i = 0; i < n; i++) ctx.plume.emit(wp.x - fx * 2.4 + (Math.random() - 0.5) * 0.8, 0.1, wp.z - fz * 2.4 + (Math.random() - 0.5) * 0.8, -fx * 1.5 + (Math.random() - 0.5), 0.5 + Math.random() * 1.2 * speed, -fz * 1.5 + (Math.random() - 0.5), 0.25 + Math.random() * 0.3, 0.9, 0.6 + Math.random() * 0.5, 0.25); }
     }
@@ -300,7 +303,7 @@ export function buildSite(s, T) {
     dock.position.set(s.bank.x, 0, s.bank.z); dock.rotation.y = Math.atan2(dx / l, dz / l) + Math.PI; g.add(dock);
     if (rr() < 0.7) { const sk = buildSkiff({ crew: false }); const side = rr() < 0.5 ? -1 : 1; sk.position.set(s.bank.x + dx / l * 9 + (-dz / l) * side * 2.4, -0.05, s.bank.z + dz / l * 9 + (dx / l) * side * 2.4); sk.rotation.y = Math.atan2(dx / l, dz / l) + (rr() - 0.5) * 0.3; sk.rotation.order = 'YXZ'; g.add(sk); g.userData.skiff = sk; g.userData.skiffWater = { x: sk.position.x, z: sk.position.z, heading: sk.rotation.y }; }
     // a big live oak or two behind the house
-    if (rr() < 0.75) { const ry = h.rotation.y; const n = 1 + (rr() < 0.4 ? 1 : 0); for (let i = 0; i < n; i++) { const lx = (i ? 1 : -1) * (4 + rr() * 3), lz = -(6 + rr() * 4); const wx = s.x + lx * Math.cos(ry) + lz * Math.sin(ry), wz = s.z - lx * Math.sin(ry) + lz * Math.cos(ry); const tr = spawn('tree_c'); tr.position.set(wx, T.heightAt(wx, wz) - 0.1, wz); tr.rotation.y = rr() * 6.28; tr.scale.setScalar(0.85 + rr() * 0.35); g.add(tr); } }
+    if (rr() < 0.75) { const ry = h.rotation.y; const n = 1 + (rr() < 0.4 ? 1 : 0); for (let i = 0; i < n; i++) { const lx = (i ? 1 : -1) * (4 + rr() * 3), lz = -(6 + rr() * 4); const wx = s.x + lx * Math.cos(ry) + lz * Math.sin(ry), wz = s.z - lx * Math.sin(ry) + lz * Math.cos(ry); const tr = spawn('tree_c', heroTreeFallback()); tr.position.set(wx, T.heightAt(wx, wz) - 0.1, wz); tr.rotation.y = rr() * 6.28; tr.scale.setScalar(0.85 + rr() * 0.35); g.add(tr); } }
     // a kid or an old man off the end of the dock with a rod
     if (rr() < 0.55) { const p = person(rr, { pose: 'sitEdge', rod: true, hat: rr() < 0.7 }); p.position.set(0.72, 0.81, -12.6); p.rotation.y = Math.PI / 2; dock.add(p); g.userData.people.push(p); const bk = bucket(); bk.position.set(-0.4, 0.81, -12.0); dock.add(bk); }
     s.colliders = [{ ax: s.bank.x, az: s.bank.z, bx: s.bank.x + dx / l * 14, bz: s.bank.z + dz / l * 14, r: 1.1, tag: 'dock' }, { x: s.x, z: s.z, r: 3.6, tag: 'house' }];
@@ -329,6 +332,7 @@ export function buildSite(s, T) {
 // per-frame life for a built site: boats bob, decoys bob, towels flap, the ramp runs its launch, people watch and wave
 // ctx = { bx, bz, speed, dt, stamps, plume, spray, audio, fish, ob, truck } (ob / truck are written back: the loudest engine near the boat)
 const _tip = new THREE.Vector3(), _dir = new THREE.Vector3();
+const _boat = { x: 0, z: 0, speed: 0 };
 const siteWaterAt = (waveFn, wakeAt, x, z, t) => waveFn(x, z, t) + (wakeAt ? wakeAt(x, z, t) : 0);
 export function animateSite(g, t, waveFn, wind, ctx) {
   const sk = g.userData.skiff;
@@ -349,14 +353,14 @@ export function animateSite(g, t, waveFn, wind, ctx) {
   const house = g.userData.house; if (house) { const w = wind ? wind.y : 0.5; let i = 0; for (const tw of house.userData.towels) { tw.rotation.x = 0.15 * w + Math.sin(t * 2.2 + i * 1.7) * 0.18 * w; i++; } }
   if (g.userData.rampG) animateRamp(g.userData.rampG, t, waveFn, ctx);
   if (!ctx) return;
-  const dt = ctx.dt, boat = { x: ctx.bx, z: ctx.bz, speed: ctx.speed };
+  const dt = ctx.dt, boat = _boat; boat.x = ctx.bx; boat.z = ctx.bz; boat.speed = ctx.speed;
   const site = g.userData.site; const dSite = site ? Math.hypot(site.x - ctx.bx, site.z - ctx.bz) : 1e9;
-  if ((ctx.humanActivity ?? 1) <= 0.2) return;
   // a shotgun from the blind now and then, when you are not right on top of it
-  if (g.userData.blind && g.userData.blind.userData.people.length) { const b = g.userData.blind; b.userData.shotT -= dt; if (b.userData.shotT < 2.2 && dSite < 520 && !b.userData.aiming) { b.userData.aiming = true; aim(b.userData.people[Math.floor(Math.random() * b.userData.people.length)], 3.2); } if (b.userData.shotT <= 0) { b.userData.aiming = false; b.userData.shotT = 30 + Math.random() * 70; if (dSite > 40 && dSite < 520 && ctx.audio) { ctx.audio.shot(0.4 * (1 - dSite / 520), site.x, site.z); if (ctx.onShot) ctx.onShot(site.x, site.z); } } }
+  if ((ctx.humanActivity ?? 1) > 0.2 && g.userData.blind && g.userData.blind.userData.people.length) { const b = g.userData.blind; b.userData.shotT -= dt; if (b.userData.shotT < 2.2 && dSite < 520 && !b.userData.aiming) { b.userData.aiming = true; aim(b.userData.people[Math.floor(Math.random() * b.userData.people.length)], 3.2); } if (b.userData.shotT <= 0) { b.userData.aiming = false; b.userData.shotT = 30 + Math.random() * 70; if (dSite > 40 && dSite < 520 && ctx.audio) { ctx.audio.shot(0.4 * (1 - dSite / 520), site.x, site.z); if (ctx.onShot) ctx.onShot(site.x, site.z); } } }
   if (dSite > 220) return; // people only move when you can see them
   for (const p of g.userData.people) {
     const u = p.userData;
+    if (!p.visible) { if (u.line) u.line.visible = false; continue; }
     animatePerson(p, t, dt, boat, ctx);
     fishingUpdate(p, t, dt, waveFn, ctx);
     // a wave for a boat idling past

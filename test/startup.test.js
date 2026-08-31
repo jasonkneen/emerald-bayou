@@ -1,20 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import * as THREE from 'three';
-import { startupPlan, startupTerrainReady } from '../src/startup.js';
-import { compareTerrainBuildPriority, shouldPreemptTerrainBuild, Terrain } from '../src/terrain.js';
+import { constrainedAssetTransfer, OPTIONAL_MODEL_NAMES, startupPlan, startupTerrainFocus, startupTerrainReady } from '../src/startup.js';
+import { compareTerrainBuildPriority, normalizeTerrainStreamOptions, shouldPreemptTerrainBuild, Terrain } from '../src/terrain.js';
 
-test('cinematic hardware keeps the complete shader and model warm-up', () => {
+test('cinematic hardware warms shaders without blocking the title on authored models', () => {
   const plan = startupPlan('cinematic');
   assert.equal(plan.warmShaders, true);
-  assert.deepEqual(plan.blockingModels, ['beau_boat', 'boat_dreams', 'sandbox_boat', 'realistic_alligator', 'turtle_boat', 'fish_a', 'driver']);
-  assert.equal(plan.terrainReadiness, 'settled');
-  assert.equal(plan.maxWaitMs, 20000);
-  assert.equal(plan.compileDelayMs, 250);
-  assert.equal(plan.deferOptionalModels, false);
-  assert.equal(plan.modelConcurrency, 4);
-  assert.equal(plan.modelPressureMaxWaitMs, 0);
-  assert.equal(plan.solidGrass, 'blocking');
+  assert.deepEqual(plan.blockingModels, []);
+  assert.equal(plan.terrainReadiness, 'local');
+  assert.equal(plan.maxWaitMs, 6000);
+  assert.equal(plan.compileDelayMs, 0);
+  assert.equal(plan.deferOptionalModels, true);
+  assert.equal(plan.releaseModelsAtTitle, true);
+  assert.equal(plan.titleModelReleaseDelayMs, 1200);
+  assert.equal(plan.modelConcurrency, 1);
+  assert.equal(plan.modelBatchDelayMs, 420);
+  assert.equal(plan.modelPressureMaxWaitMs, 6000);
+  assert.equal(plan.solidGrass, 'deferred');
   assert.deepEqual(plan.disabledModels, []);
 });
 
@@ -27,6 +31,7 @@ test('older-hardware profiles do not block on optional models or the full shader
     assert.ok(plan.maxWaitMs >= 3000 && plan.maxWaitMs <= 6000);
     assert.equal(plan.compileDelayMs, 0);
     assert.equal(plan.deferOptionalModels, true);
+    assert.equal(plan.releaseModelsAtTitle, false);
     assert.ok(plan.modelConcurrency >= 1 && plan.modelConcurrency <= 2);
     assert.ok(plan.modelReleaseDelayMs >= 700);
     assert.ok(plan.modelBatchDelayMs >= 0);
@@ -38,11 +43,31 @@ test('older-hardware profiles do not block on optional models or the full shader
   assert.ok(performance.modelReleaseDelayMs > balanced.modelReleaseDelayMs);
   assert.ok(fallback.modelBatchDelayMs > performance.modelBatchDelayMs);
   assert.ok(performance.modelBatchDelayMs > balanced.modelBatchDelayMs);
-  assert.deepEqual(fallback.disabledModels, ['grass_a', 'grass_d', 'tree_c']);
+  assert.deepEqual(fallback.disabledModels, OPTIONAL_MODEL_NAMES);
   assert.deepEqual(performance.disabledModels, fallback.disabledModels);
-  assert.deepEqual(balanced.disabledModels, []);
+  assert.deepEqual(balanced.disabledModels, ['tree_c']);
+  assert.equal(balanced.modelConcurrency, 1);
+  assert.equal(fallback.disabledModels.length, 10);
   assert.deepEqual([fallback.solidGrass, performance.solidGrass, balanced.solidGrass], ['off', 'off', 'deferred']);
-  assert.deepEqual([fallback.modelPressureMaxWaitMs, performance.modelPressureMaxWaitMs, balanced.modelPressureMaxWaitMs], [12000, 8000, 4000]);
+  assert.deepEqual([fallback.modelPressureMaxWaitMs, performance.modelPressureMaxWaitMs, balanced.modelPressureMaxWaitMs], [12000, 8000, 6000]);
+  assert.deepEqual(['fallback', 'performance', 'balanced', 'cinematic'].map(id => startupPlan(id).blockingModels), [[], [], [], []]);
+});
+
+test('constrained transfers keep the full world budget while skipping optional model traffic', () => {
+  assert.equal(constrainedAssetTransfer(), false);
+  assert.equal(constrainedAssetTransfer({ saveData: true, effectiveType: '4g', downlink: 50 }), true);
+  assert.equal(constrainedAssetTransfer({ effectiveType: '3g', downlink: 10 }), true);
+  assert.equal(constrainedAssetTransfer({ effectiveType: '4g', downlink: 2.5 }), true);
+  assert.equal(constrainedAssetTransfer({ effectiveType: '4g', downlink: 2.6 }), false);
+
+  for (const id of ['balanced', 'cinematic']) {
+    const regular = startupPlan(id), constrained = startupPlan(id, { constrainedTransfer: true });
+    assert.equal(constrained.constrainedTransfer, true); assert.equal(Object.isFrozen(constrained), true);
+    assert.deepEqual(constrained.disabledModels, OPTIONAL_MODEL_NAMES); assert.equal(constrained.solidGrass, 'off');
+    assert.equal(constrained.releaseModelsAtTitle, false); assert.equal(constrained.modelConcurrency, 1);
+    assert.equal(constrained.effectBudget, regular.effectBudget); assert.equal(constrained.streamBudget, regular.streamBudget);
+    assert.equal(constrained.warmShaders, regular.warmShaders); assert.equal(constrained.terrainReadiness, regular.terrainReadiness);
+  }
 });
 
 test('older-hardware profiles allocate smaller bounded weather and spray pools', () => {
@@ -59,6 +84,27 @@ test('older-hardware profiles allocate smaller bounded weather and spray pools',
   assert.ok(Object.isFrozen(fallback));
 });
 
+test('streaming budgets preserve the map while shedding low-end foliage work', () => {
+  const fallback = startupPlan('fallback').streamBudget;
+  const performance = startupPlan('performance').streamBudget;
+  const balanced = startupPlan('balanced').streamBudget;
+  const cinematic = startupPlan('cinematic').streamBudget;
+
+  assert.deepEqual([fallback.foliageDetail, performance.foliageDetail, balanced.foliageDetail, cinematic.foliageDetail], [0.36, 0.56, 0.82, 1]);
+  assert.ok(fallback.terrainPrefetch < performance.terrainPrefetch);
+  assert.ok(performance.terrainPrefetch < balanced.terrainPrefetch);
+  assert.ok(balanced.terrainPrefetch < cinematic.terrainPrefetch);
+  assert.deepEqual([fallback.terrainWorkerLimit, performance.terrainWorkerLimit, balanced.terrainWorkerLimit, cinematic.terrainWorkerLimit], [1, 1, 2, 4]);
+  assert.deepEqual([fallback.terrainFinalizeBudgetMs, performance.terrainFinalizeBudgetMs, balanced.terrainFinalizeBudgetMs, cinematic.terrainFinalizeBudgetMs], [1.25, 2, 3, 4]);
+  for (const plan of [fallback, performance, balanced, cinematic]) assert.ok(Object.isFrozen(plan));
+});
+
+test('terrain stream options are bounded without changing world extent', () => {
+  assert.deepEqual(normalizeTerrainStreamOptions(), { prefetch: 1.35, finalizeBudgetMs: 4, workerLimit: 4 });
+  assert.deepEqual(normalizeTerrainStreamOptions({ prefetch: 0, finalizeBudgetMs: 99, workerLimit: 12 }), { prefetch: 1.05, finalizeBudgetMs: 6, workerLimit: 4 });
+  assert.deepEqual(normalizeTerrainStreamOptions({ prefetch: 1.2, finalizeBudgetMs: 2, workerLimit: 1 }), { prefetch: 1.2, finalizeBudgetMs: 2, workerLimit: 1 });
+});
+
 test('startup readiness distinguishes a usable local tile from a completely settled stream', () => {
   const state = { settled: false, localVisible: true };
   assert.equal(startupTerrainReady('local', state), true);
@@ -66,7 +112,61 @@ test('startup readiness distinguishes a usable local tile from a completely sett
   assert.equal(startupPlan('unknown').id, 'performance');
 });
 
-test('local startup only opens on terrain that is actually visible under the dock', () => {
+test('startup terrain follows a restored boat but leaves new games focused on the dock', () => {
+  assert.deepEqual(startupTerrainFocus({ dockX: 12, dockZ: 70, boatX: -900, boatZ: 1200, positionRestored: true }), {
+    x: -900, z: 1200, restored: true, retargeted: true,
+  });
+  assert.deepEqual(startupTerrainFocus({ dockX: 12, dockZ: 70, boatX: -900, boatZ: 1200, positionRestored: false }), {
+    x: 12, z: 70, restored: false, retargeted: false,
+  });
+  assert.deepEqual(startupTerrainFocus({ dockX: 12, dockZ: 70, boatX: Number.NaN, boatZ: 1200, positionRestored: true }), {
+    x: 12, z: 70, restored: false, retargeted: false,
+  });
+});
+
+test('moving the stream focus reprioritizes stale dock work behind the current boat tile', () => {
+  const staleDock = { x0: 0, z0: 0, size: 100, level: 0, prio: 0, prioBias: 0 };
+  const currentBoat = { x0: 900, z0: 0, size: 100, level: 0, prio: 9, prioBias: 0 };
+  const prefetched = { x0: 900, z0: 100, size: 100, level: 0, prio: 2, prioBias: 2 };
+  const returnedBoat = { x0: 900, z0: 0, size: 100, level: 1, prio: 9, prioBias: 0 };
+  const terrain = Object.assign(Object.create(Terrain.prototype), {
+    camPos: new THREE.Vector2(950, 50), queue: [staleDock, prefetched, currentBoat], finalize: [returnedBoat], building: null, pausedBuilding: null,
+  });
+
+  terrain.reprioritizePending();
+
+  assert.equal(terrain.queue[0], currentBoat);
+  assert.equal(terrain.queue[1], prefetched);
+  assert.equal(terrain.queue[2], staleDock);
+  assert.equal(returnedBoat.prio, 0);
+});
+
+test('terrain workers are primed before the synchronous environment convolution', () => {
+  const terrain = {
+    camPos: new THREE.Vector2(), streamT: 0, queue: [1, 2], pool: { inFlight: 0 },
+    stream(now) { this.streamedAt = now; }, pump() { this.pool.inFlight = 2; },
+  };
+  const result = Terrain.prototype.prime.call(terrain, 14, -9, 500);
+  assert.deepEqual([terrain.camPos.x, terrain.camPos.y, terrain.streamT, terrain.streamedAt], [14, -9, 500, 500]);
+  assert.deepEqual(result, { queued: 2, inFlight: 2 });
+
+  const source = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  const managerSource = readFileSync(new URL('../src/environmentmap.js', import.meta.url), 'utf8');
+  const primeAt = source.indexOf('terrain.prime(startX, startZ)');
+  const captureAt = source.indexOf("environmentReflections.capture(initialReflectionState, 'initial'");
+  assert.ok(primeAt >= 0 && captureAt >= 0 && primeAt < captureAt);
+  assert.ok(managerSource.includes('generator.fromScene('));
+});
+
+test('cinematic model upgrades start behind the title without retaining the disposed warm-up tree', () => {
+  const source = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('constrainedAssetTransfer(navigator.connection)'));
+  assert.ok(source.includes('if (startup.releaseModelsAtTitle) scheduleDeferredModels(startup.titleModelReleaseDelayMs)'));
+  assert.ok(source.includes('scheduleDeferredModels(startup.modelReleaseDelayMs, true)'));
+  assert.ok(source.includes('if (!startup.deferOptionalModels) for (const [k, name]'));
+});
+
+test('local startup only opens on terrain that is actually visible under its focus', () => {
   const terrain = { visible: new Set([
     { x0: -100, z0: -100, size: 100, mesh: { visible: true } },
     { x0: 0, z0: 0, size: 100, mesh: { visible: false } },

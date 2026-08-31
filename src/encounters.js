@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { buildSkiff } from './npc.js';
-import { person, animatePerson, wave, aim } from './folk.js';
+import { person, animatePerson, wave, aim, setWranglePose } from './folk.js';
 import { crabFloat, fuelDrum, wreck } from './markers.js';
 import { gatorMesh, manateeMesh } from './wildlife.js';
 import { mulberry32 } from './noise.js';
@@ -9,20 +9,32 @@ import { findGroundingSite } from './grounding.js';
 import { makeAirRescueRig, setAirRescueRole, updateAirRescueAircraft, updateAirRescueBeam } from './airrescue.js';
 import { WORLD_HALF } from './heightfield.js';
 import { buildRaceCourse } from './racecourse.js';
+import { emitMapMarker } from './mapmarkers.js';
 import {
   canEscapePursuit, pursuitAviationAvailable, pursuitAviationDelay, pursuitAviationVisualHeld, pursuitBackupDelay,
-  pursuitLostDistance, pursuitSirenLevel, pursuitSpeed, pursuitTactic, pursuitUnitCanRam, pursuitUnitCount,
-  pursuitVisualHeld, wantedLevel,
+  pursuitChannelClosurePlan, pursuitDownburstTactic, pursuitEngineNoise, pursuitHearingRange, pursuitHornRange, pursuitLostDistance, pursuitLostProgress, pursuitSightSampleCount,
+  pursuitSearchPlan, pursuitSearchlightPlan, pursuitSearchlightVisualHeld, pursuitSearchRadius, pursuitSirenLevel, pursuitSoundContact, pursuitSoundUncertainty, pursuitSpeed, pursuitSurfaceLineOfSight, pursuitTactic,
+  pursuitUnitCanRam, pursuitUnitCount, wantedLevel,
 } from './pursuit.js';
+import { downburstCraftUrgency, downburstProbeScore, downburstReactionReady } from './downburst.js';
+import { combinedSurfaceWind, vesselLeeway, vesselWindHeel } from './vesselwind.js';
 import { emitWakeStamp } from './wakestamps.js';
+import { sampleVesselWake } from './wakefield.js';
+import { makeSurfaceSearchBeam, surfaceSearchlightResourceStats } from './surface-searchlight.js';
+import {
+  pickStormEvacuationCamp, stormEvacuationLeadSeconds, stormEvacuationWindow,
+} from './stormevacuation.js';
+import { WRANGLER_WAKE_RELEASE, wranglerAssistStep, wranglerStationQuality, wranglerWakeStep, wranglerWakeThreat } from './wrangler.js';
 
 const MPH = 2.23694;
 const clamp = (v, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
 const lerp = (a, b, t) => a + (b - a) * t;
 const smooth = (a, b, v) => { const t = clamp((v - a) / (b - a)); return t * t * (3 - 2 * t); };
 const STEER_PROBES = [-0.65, -0.3, 0, 0.3, 0.65];
+const CHANNEL_CLOSURE_LATERAL_PROBES = [0, 8, -8, 16, -16];
+const CHANNEL_CLOSURE_CLEARANCE_PROBES = [[0, 0], [4.2, 0], [-4.2, 0], [0, 7], [0, -7]];
 const MANATEE_PROBES = [0, -0.42, 0.42, -0.86, 0.86, -1.32, 1.32];
-const DEBUG_ORDER = ['distress', 'airrescue', 'grounding', 'fire', 'manatee', 'spotlight', 'race', 'patrol', 'smuggler', 'salvage', 'netline'];
+const DEBUG_ORDER = ['distress', 'airrescue', 'grounding', 'fire', 'wrangler', 'manatee', 'spotlight', 'race', 'patrol', 'smuggler', 'salvage', 'netline'];
 const ENCOUNTER_MEMORY_LIMIT = 10;
 const SPILL_POOL_SIZE = 3;
 const SIGNAL_GEOMETRY = new THREE.SphereGeometry(0.075, 8, 6);
@@ -78,6 +90,20 @@ function signalBulb(parent, color, x, y, z) {
   let material = SIGNAL_MATERIALS.get(color);
   if (!material) { material = new THREE.MeshBasicMaterial({ color, toneMapped: false }); SIGNAL_MATERIALS.set(color, material); }
   const bulb = new THREE.Mesh(SIGNAL_GEOMETRY, material); bulb.position.set(x, y, z); bulb.scale.setScalar(1.35); parent.add(bulb); return bulb;
+}
+
+function makePatrolSearchlight(boat, scene, role) {
+  const rig = new THREE.Group(); rig.name = `FWC searchlight ${role}`; rig.position.set(0, 1.08, -0.72); rig.visible = false;
+  let material = SIGNAL_MATERIALS.get(0xd9efff);
+  if (!material) { material = new THREE.MeshBasicMaterial({ color: 0xd9efff, toneMapped: false }); SIGNAL_MATERIALS.set(0xd9efff, material); }
+  const bulb = new THREE.Mesh(SIGNAL_GEOMETRY, material); bulb.scale.setScalar(1.18); rig.add(bulb);
+  let light = null;
+  if (role === 0) {
+    const target = new THREE.Object3D(); target.position.set(0, -0.55, -90);
+    light = new THREE.SpotLight(0xd9efff, 0, 145, 0.13, 0.56, 1.7); light.target = target; light.castShadow = false; rig.add(light, target);
+  }
+  const beam = makeSurfaceSearchBeam(0xd9efff, `FWC pursuit beam ${role}`); scene.add(beam); boat.add(rig);
+  return { active: false, role, rig, bulb, light, beam, plan: { active: false, night: false, role, targeted: false, worldLight: false, worldHeading: 0, relativeHeading: 0, length: 0, width: 0, intensity: 0 } };
 }
 
 function makePackage() {
@@ -216,15 +242,32 @@ function makeSpotlightRig(rr, boat, scene) {
   return { gunner, gator, eyes, target, light, pool, uniforms };
 }
 
-function boatAgent(mesh) {
-  return { mesh, x: 0, z: 0, heading: 0, speed: 0, want: 0, turn: 0, targetX: 0, targetZ: 0, decisionT: 0, active: false, tactic: { lead: 0, fore: 0, side: 0 } };
+function boatAgent(mesh, searchRole = -1, navigationLights = searchRole >= 0) {
+  const enforcement = searchRole >= 0;
+  const agent = {
+    mesh, x: 0, z: 0, heading: 0, speed: 0, want: 0, turn: 0, targetX: 0, targetZ: 0, decisionT: 0, active: false, enforcement,
+    shx: 0, shz: 0, yawKick: 0, heelKick: 0, impactCd: 0, navigationLights,
+    tactic: { lead: 0, fore: 0, side: 0 },
+  };
+  if (enforcement) Object.assign(agent, {
+    downburstResponse: 0, downburstDistance: Infinity, downburstNoticeT: 0, downburstReactionDelay: 0.38 + searchRole * 0.16, downburstReacted: false,
+    downburstField: {}, localOutflow: { x: 0, z: 0 }, surfaceWind: { x: 0, z: 0, speed: 0 }, windDrift: { x: 0, z: 0, speed: 0 },
+    windage: 0.023, windDivergence: (searchRole - 1) * 0.07, windHeelScale: 0.9, windHeel: 0,
+    weatherTactic: { load: 0, speedScale: 1, avoidance: 0, canRam: true, canBlock: true, constrained: false },
+  });
+  if (searchRole >= 0) agent.search = { active: false, role: searchRole, sector: '', targetX: 0, targetZ: 0, radius: 0, areaRadius: 0, speed: 0, holdRadius: 0 };
+  return agent;
 }
 
 export class EncounterDirector {
   constructor(o) {
     Object.assign(this, o); // scene, terrain, world, water, phys, boat, game, audio, environment, plume, spray, law, reputation
     this.next = 48; this.active = null; this.seenT = 0; this.interact = false; this.alternate = false; this.enabled = false; this.debugIndex = 0;
-    this.obs = []; this.boatObs = { ax: 0, az: 0, bx: 0, bz: 0, r: 1.05, tag: 'boat' }; this.boatObs2 = { ax: 0, az: 0, bx: 0, bz: 0, r: 1.05, tag: 'boat' }; this.echoObs = { ax: 0, az: 0, bx: 0, bz: 0, r: 1.05, tag: 'skiff' }; this.fixedObs = { x: 0, z: 0, r: 2.1, tag: 'wreck' };
+    this.obs = [];
+    this.boatObs = { ax: 0, az: 0, bx: 0, bz: 0, r: 1.05, tag: 'boat', agent: null, onHit: (into, nx, nz) => this.hitMovingBoat(this.boatObs, into, nx, nz) };
+    this.boatObs2 = { ax: 0, az: 0, bx: 0, bz: 0, r: 1.05, tag: 'boat', agent: null, onHit: (into, nx, nz) => this.hitMovingBoat(this.boatObs2, into, nx, nz) };
+    this.echoObs = { ax: 0, az: 0, bx: 0, bz: 0, r: 1.05, tag: 'skiff', agent: null, onHit: (into, nx, nz) => this.hitMovingBoat(this.echoObs, into, nx, nz) };
+    this.fixedObs = { x: 0, z: 0, r: 2.1, tag: 'wreck' };
     this.netObs = { ax: 0, az: 0, bx: 0, bz: 0, r: 0.32, tag: 'monofilament net', onHit: (into) => {
       const e = this.active; if (!e || e.type !== 'netline' || e.state === 'recovering' || e.state === 'secured' || e.hitCd > 0 || into < 1.8) return;
       e.hitCd = 3.5; e.snag = clamp((e.snag || 0) + into * 0.035, 0, 0.65);
@@ -241,9 +284,9 @@ export class EncounterDirector {
       e.hitCd = 2.8; e.scour += into * 0.18; this.game.shake = Math.max(this.game.shake, Math.min(0.28, into * 0.03));
       this.game.toast('Contact with the grounded skiff', 'Back into the deep water and pass the line at idle.', 2.8);
     } };
-    this.raceObs = { ax: 0, az: 0, bx: 0, bz: 0, r: 1.05, tag: 'racing johnboat', onHit: (into) => {
+    this.raceObs = { ax: 0, az: 0, bx: 0, bz: 0, r: 1.05, tag: 'racing johnboat', onHit: (into, nx, nz) => {
       const e = this.active; if (!e || e.type !== 'race' || (e.state !== 'countdown' && e.state !== 'running') || e.hitCd > 0 || into < 2.2) return;
-      e.hitCd = 1.8; e.rams++; e.dirty = true; this.rigs.smuggler.agent.speed *= clamp(1 - into * 0.025, 0.68, 0.92);
+      const A = this.rigs.smuggler.agent; e.hitCd = 1.8; e.rams++; e.dirty = true; A.speed *= clamp(1 - into * 0.025, 0.68, 0.92); this.impactAgent(A, into, nx, nz, 0.46);
       this.game.shake = Math.max(this.game.shake, Math.min(0.3, into * 0.032)); this.audio.warn();
       this.game.toast('Rub rails hit', e.rams > 1 ? 'That is not a clean race anymore.' : 'The johnboat crew is keeping count.', 2.4);
     } };
@@ -256,8 +299,15 @@ export class EncounterDirector {
     this.raceMarker = { x: 0, z: 0, kind: 'boat', heading: 0, color: '#f07a2e' };
     this.manateeObs = { x: 0, z: 0, r: 2.15, tag: 'entangled manatee', onHit: into => this.hitEntangledManatee(into) };
     this.manateeLineObs = { ax: 0, az: 0, bx: 0, bz: 0, r: 0.16, tag: 'crab trap line', onHit: into => this.hitManateeLine(into) };
+    this.wranglerBoatObs = [
+      { ax: 0, az: 0, bx: 0, bz: 0, r: 1.05, tag: 'gator work skiff', onHit: into => this.hitWranglerBoat(0, into) },
+      { ax: 0, az: 0, bx: 0, bz: 0, r: 1.05, tag: 'spectator skiff', onHit: into => this.hitWranglerBoat(1, into) },
+      { ax: 0, az: 0, bx: 0, bz: 0, r: 1.05, tag: 'spectator johnboat', onHit: into => this.hitWranglerBoat(2, into) },
+    ];
+    this.wranglerGatorObs = { x: 0, z: 0, r: 1.42, tag: 'nuisance alligator', onHit: into => this.hitWranglerGator(into) };
     this.phys.addObs('encounters', this.obs);
     this.rigs = this.makeRigs(); this.agents = [this.rigs.patrol.agent, ...this.rigs.patrolBackups.map(unit => unit.agent), this.rigs.smuggler.agent, this.rigs.distress.echoAgent, this.rigs.grounding.agent];
+    this.obLevel = 0; this.obPitch = 1; this.obX = 0; this.obZ = 0;
     this.salvagePieces = this.rigs.salvage.drums.map((mesh, index) => ({ mesh, index, x: 0, z: 0, vx: 0, vz: 0, found: false, ruptured: false, resolved: false, hitCd: 0, sinkT: 0, ph: index * 2.3 }));
     this.drumObs = this.salvagePieces.map((q, index) => ({ x: 0, z: 0, r: 0.52, tag: 'fuel drum', onHit: (into, nx, nz) => this.hitDrum(index, into, nx, nz) }));
     this.spills = this.makeSpills();
@@ -268,6 +318,7 @@ export class EncounterDirector {
       if (import.meta.env.DEV && e.code === 'F10' && !e.repeat && this.enabled && this.active) { e.preventDefault(); this.debugApproach(); }
       if (import.meta.env.DEV && e.code === 'F11' && !e.repeat && this.enabled && this.active) {
         if (this.active.type === 'fire' && !this.active.fireOut && !this.active.burned) { e.preventDefault(); this.active.burn = this.active.limit; }
+        else if (this.active.type === 'wrangler') { e.preventDefault(); this.debugAdvanceWrangler(); }
         else if (this.active.type === 'manatee') { e.preventDefault(); this.debugAdvanceManatee(); }
         else if (this.active.type === 'spotlight') { e.preventDefault(); this.debugAdvanceSpotlight(); }
         else if (this.active.type === 'grounding') { e.preventDefault(); this.debugAdvanceGrounding(); }
@@ -282,7 +333,12 @@ export class EncounterDirector {
     else if (this.game.save.encounterMemory.length > ENCOUNTER_MEMORY_LIMIT) this.game.save.encounterMemory.splice(0, this.game.save.encounterMemory.length - ENCOUNTER_MEMORY_LIMIT);
     this.game.save.encounterMemorySeq = Math.max(0, Number(this.game.save.encounterMemorySeq) || 0);
     this.distressEcho = null; this.patrolAlert = 0;
-    this._f = new THREE.Vector2(); this._r = new THREE.Vector2(); this._flow = new THREE.Vector2(); this._personBoat = { x: 0, z: 0, speed: 0 };
+    this._f = new THREE.Vector2(); this._r = new THREE.Vector2(); this._flow = new THREE.Vector2(); this._personBoat = { x: 0, z: 0, speed: 0 }; this._downburstProbe = {};
+    this._patrolSight = { timer: 0, clear: true, held: true, inRange: true, blockedFor: 0, clearFor: 0, occluded: false, checkedUnits: 0, samples: 0 };
+    this._patrolSound = { timer: 0, hornT: 0, hornProlonged: false, contact: false, source: '', range: 0, distance: Infinity, engineNoise: 0, fixAge: Infinity, fixX: 0, fixZ: 0, uncertainty: 0, reportCd: 0 };
+    this._patrolSearch = { active: false, x: 0, z: 0, r: 0, label: 'FWC last-fix area', color: '#5aa7ff' };
+    this.stormEvacuationUsed = false; this.stormEvacuationWeather = this.environment.key;
+    this.stormEvacuationContext = { weather: '', phase: '', progress: 0, surge: 0, surgeRate: 0, duration: 0, playerX: 0, playerZ: 0, waterLevel: 0, leadSeconds: 0 };
     this.airWashStamp = { x: 0, z: 0, radius: 8.5, height: -0.82, foam: 2.2, foamRadius: 9.5 };
   }
 
@@ -296,11 +352,12 @@ export class EncounterDirector {
 
     const patrolBoat = buildSkiff({ crew: true }); recolor(patrolBoat, 0x2d5c4b); patrolBoat.visible = false; this.scene.add(patrolBoat);
     const blue = signalLight(patrolBoat, 0x267cff, -0.25, 1.35, -0.2), red = signalLight(patrolBoat, 0xff2f25, 0.25, 1.35, -0.2);
-    const patrol = { boat: patrolBoat, blue, red, agent: boatAgent(patrolBoat) };
+    const patrol = { boat: patrolBoat, blue, red, agent: boatAgent(patrolBoat, 0), role: 0, searchlight: makePatrolSearchlight(patrolBoat, this.water.scene || this.scene, 0) };
     const patrolBackups = [0, 1].map(index => {
       const boat = buildSkiff({ crew: true, driverModel: false }); recolor(boat, index ? 0x35614f : 0x315848); boat.name = index ? 'FWC Shallow Water 4' : 'FWC Marine 12'; boat.visible = false; this.scene.add(boat);
       const blueBulb = signalBulb(boat, 0x267cff, -0.25, 1.35, -0.2), redBulb = signalBulb(boat, 0xff2f25, 0.25, 1.35, -0.2);
-      return { boat, blueBulb, redBulb, agent: boatAgent(boat), index, role: index + 1 };
+      const closure = { active: false, holding: false, announced: false, x: 0, z: 0, courseX: 0, courseZ: -1, heading: 0, remaining: 0, cooldown: index ? 1.8 : 0, plan: { eligible: false, lead: 0, duration: 0, cooldown: 0, approachSpeed: 0, setupTimeout: 0 } };
+      return { boat, blueBulb, redBulb, agent: boatAgent(boat, index + 1), closure, index, role: index + 1, searchlight: makePatrolSearchlight(boat, this.water.scene || this.scene, index + 1) };
     });
 
     const smugglerBoat = buildSkiff({ crew: true }); recolor(smugglerBoat, 0x4b3527); smugglerBoat.visible = false; this.scene.add(smugglerBoat);
@@ -321,7 +378,7 @@ export class EncounterDirector {
     const grounding = makeGroundingRig(rr, this.scene);
     const airrescue = makeAirRescueRig(rr, this.scene);
 
-    return { distress: { boat: distressBoat, survivor, passenger, flare, echoAgent: boatAgent(distressBoat) }, airrescue, grounding, patrol, patrolBackups, smuggler, salvage, netline, fire: { boat: fireBoat, operator: fireOperator, swimmer, fire }, manatee, spotlight };
+    return { distress: { boat: distressBoat, survivor, passenger, flare, echoAgent: boatAgent(distressBoat, -1, true) }, airrescue, grounding, patrol, patrolBackups, smuggler, salvage, netline, fire: { boat: fireBoat, operator: fireOperator, swimmer, fire }, manatee, spotlight };
   }
 
   spot(min = 160, max = 300, sideMax = 170) {
@@ -350,12 +407,36 @@ export class EncounterDirector {
     });
   }
 
+  syncStormEvacuationPassage() {
+    const weather = this.environment.key;
+    if (weather !== this.stormEvacuationWeather) { this.stormEvacuationWeather = weather; this.stormEvacuationUsed = false; }
+  }
+
+  stormEvacuationCamp() {
+    this.syncStormEvacuationPassage();
+    if (this.stormEvacuationUsed || !this.world?.liveCamps?.size) return null;
+    const E = this.environment, H = E.hurricane || {}, c = this.stormEvacuationContext;
+    c.weather = E.key; c.phase = H.phase || ''; c.progress = H.progress || 0; c.surge = E.values?.surge || 0; c.surgeRate = E.surgeRate || 0; c.duration = E.weatherDuration || 0;
+    if (!stormEvacuationWindow(c)) return null;
+    c.playerX = this.phys.pos.x; c.playerZ = this.phys.pos.y; c.waterLevel = E.waterLevel || 0; c.leadSeconds = stormEvacuationLeadSeconds(c);
+    return pickStormEvacuationCamp(this.world.liveCamps.values(), c);
+  }
+
+  stormEvacuationAt(camp) {
+    const dx = camp.tie.x - camp.bank.x, dz = camp.tie.z - camp.bank.z, length = Math.hypot(dx, dz) || 1;
+    const outwardX = dx / length, outwardZ = dz / length, sideX = -outwardZ, sideZ = outwardX;
+    const moored = this.world.liveCamps.get(camp.key)?.userData?.skiffWater;
+    const occupiedSide = moored ? (moored.x - camp.tie.x) * sideX + (moored.z - camp.tie.z) * sideZ : 0;
+    const side = occupiedSide >= 0 ? -1 : 1;
+    return { x: camp.tie.x + outwardX * 0.8 + sideX * side * 2.8, z: camp.tie.z + outwardZ * 0.8 + sideZ * side * 2.8, heading: Math.atan2(dx, dz) };
+  }
+
   pickType() {
     const weather = this.environment.key, night = this.environment.hour < 5.5 || this.environment.hour > 20.5;
     const heat = this.law ? this.law.attention : 0;
     const runners = this.reputation ? this.reputation.score('runners') : 0, fwc = this.reputation ? this.reputation.score('fwc') : 0;
     const region = this.regions && this.regions.current ? this.regions.current.encounters : {};
-    const weights = { distress: 0.24, airrescue: 0.065, grounding: 0.1, fire: 0.1, manatee: 0.1, spotlight: 0.08, race: 0.105, patrol: 0.2, salvage: 0.1, smuggler: 0.1, netline: 0.07 };
+    const weights = { distress: 0.24, airrescue: 0.065, grounding: 0.1, fire: 0.1, wrangler: 0.085, manatee: 0.1, spotlight: 0.08, race: 0.105, patrol: 0.2, salvage: 0.1, smuggler: 0.1, netline: 0.07 };
     weights.patrol *= (region.law ?? 1) * (1 + heat * 1.75) * (1 + Math.max(0, -fwc) * 0.16);
     weights.smuggler *= (region.runners ?? 1) * (night ? 1.9 : 1) * (1 + Math.max(0, -runners) * 0.2);
     weights.netline *= (0.72 + (region.runners ?? 1) * 0.38) * (night ? 1.24 : 1);
@@ -364,28 +445,32 @@ export class EncounterDirector {
     const falling = clamp((-this.environment.tideRate - 0.025) / 0.24), lowWater = clamp((-this.environment.waterLevel - 0.08) / 0.3);
     weights.grounding *= (falling > 0 ? 0.72 + falling * 2.15 : lowWater * 0.75) * (0.82 + this.environment.tideRange * 0.28) * (region.danger ?? 1);
     weights.fire *= (region.danger ?? 1) * (0.82 + Math.min(1.25, (this.environment.values.wind || 0) * 0.045));
+    weights.wrangler *= (night ? 0.04 : 1) * (1 - clamp(((this.environment.values.storm || 0) - 0.08) / 0.72)) * (1 - clamp(((this.environment.values.wind || 0) - 10) / 13));
     weights.manatee *= (night ? 0.42 : 1) * (1 - clamp((this.environment.values.storm || 0) - 0.45, 0, 0.86));
     weights.spotlight *= (region.runners ?? 1) * (night ? 1.9 : 0) * (1 + Math.max(0, -runners) * 0.12) * (1 - clamp((this.environment.values.storm || 0) - 0.34, 0, 0.94));
     weights.race *= (region.runners ?? 1) * (night ? 0.7 : 1) * (1 + Math.max(0, runners) * 0.045) * (1 - clamp(((this.environment.values.storm || 0) - 0.12) / 0.76));
     weights.salvage *= 0.7 + (region.danger ?? 1) * 0.45;
     if (weather === 'hurricane' || weather === 'tropical' || weather === 'thunderstorm') {
-      weights.distress *= 1.8; weights.airrescue *= 0.025; weights.grounding *= 0.12; weights.fire *= 1.35; weights.manatee *= 0.08; weights.spotlight *= 0.04; weights.race *= 0.01; weights.salvage *= 3.4; weights.patrol *= 0.18; weights.smuggler *= 0.12; weights.netline *= 0.28;
+      weights.distress *= 1.8; weights.airrescue *= 0.025; weights.grounding *= 0.12; weights.fire *= 1.35; weights.wrangler *= 0.002; weights.manatee *= 0.08; weights.spotlight *= 0.04; weights.race *= 0.01; weights.salvage *= 3.4; weights.patrol *= 0.18; weights.smuggler *= 0.12; weights.netline *= 0.28;
     } else if (weather === 'squall' || weather === 'hail') {
-      weights.distress *= 1.4; weights.airrescue *= 0.32; weights.grounding *= 0.55; weights.fire *= 1.2; weights.manatee *= 0.35; weights.spotlight *= 0.22; weights.race *= 0.12; weights.salvage *= 2; weights.patrol *= 0.55; weights.smuggler *= 0.45; weights.netline *= 0.62;
+      weights.distress *= 1.4; weights.airrescue *= 0.32; weights.grounding *= 0.55; weights.fire *= 1.2; weights.wrangler *= 0.035; weights.manatee *= 0.35; weights.spotlight *= 0.22; weights.race *= 0.12; weights.salvage *= 2; weights.patrol *= 0.55; weights.smuggler *= 0.45; weights.netline *= 0.62;
     }
     if (heat >= 3) weights.patrol *= 2.1;
     let roll = Math.random() * Object.values(weights).reduce((a, n) => a + n, 0);
-    for (const type of ['distress', 'airrescue', 'grounding', 'fire', 'manatee', 'spotlight', 'race', 'patrol', 'salvage', 'smuggler', 'netline']) { roll -= weights[type]; if (roll <= 0) return type; }
+    for (const type of ['distress', 'airrescue', 'grounding', 'fire', 'wrangler', 'manatee', 'spotlight', 'race', 'patrol', 'salvage', 'smuggler', 'netline']) { roll -= weights[type]; if (roll <= 0) return type; }
     return 'distress';
   }
 
   start(type = this.pickType(), nearby = false) {
     if (this.active) this.finish(false, true);
-    const at = type === 'grounding' ? this.groundingSpot(nearby) : nearby ? this.spot(42, 62, 38) : this.spot(); if (!at) { this.next = 20; return false; }
-    if (type === 'distress') this.startDistress(at);
+    const evacuationCamp = type === 'distress' ? this.stormEvacuationCamp() : null;
+    const at = evacuationCamp ? this.stormEvacuationAt(evacuationCamp) : type === 'grounding' ? this.groundingSpot(nearby) : nearby ? this.spot(42, 62, 38) : this.spot(); if (!at) { this.next = 20; return false; }
+    if (evacuationCamp) this.startStormEvacuation(evacuationCamp, at);
+    else if (type === 'distress') this.startDistress(at);
     else if (type === 'airrescue') this.startAirRescue(at);
     else if (type === 'grounding') this.startGrounding(at);
     else if (type === 'fire') this.startFire(at);
+    else if (type === 'wrangler') this.startWrangler(at);
     else if (type === 'manatee') this.startManatee(at);
     else if (type === 'spotlight') this.startSpotlight(at);
     else if (type === 'race') {
@@ -405,7 +490,7 @@ export class EncounterDirector {
 
   clearDistressEcho() {
     const R = this.rigs.distress;
-    this.distressEcho = null; R.echoAgent.active = false; R.boat.visible = false; R.survivor.visible = true;
+    this.distressEcho = null; R.echoAgent.active = false; this.resetAgentImpact(R.echoAgent); if (this.echoObs) this.echoObs.agent = null; R.boat.visible = false; R.survivor.visible = true;
     R.flare.group.visible = false; R.flare.light.intensity = 0; R.flare.bulb.scale.setScalar(1);
   }
 
@@ -430,31 +515,61 @@ export class EncounterDirector {
     this.active = { type: 'distress', x: at.x, z: at.z, heading: at.heading, state: 'waiting', t: 0, hold: 0, known: false, leave: 0, recognized: Boolean(this.reputation && this.reputation.score('locals') >= 3) };
   }
 
-  distressDrop(x, z) {
-    const options = [], berth = (baseX, baseZ, name, preferred = 0) => {
-      for (let i = 0; i < 16; i++) {
-        const a = preferred + (i ? Math.ceil(i / 2) * (i % 2 ? 1 : -1) * Math.PI / 8 : 0), r = 21 + (i % 3) * 3;
-        const px = baseX + Math.cos(a) * r, pz = baseZ + Math.sin(a) * r;
-        if (this.terrain.heightAt(px, pz) < -0.72 && !this.world.blockedAt(px, pz)) return { x: px, z: pz, name };
-      }
-      return { x: baseX, z: baseZ, name };
+  startStormEvacuation(camp, at) {
+    this.clearDistressEcho();
+    const R = this.rigs.distress; R.boat.visible = true; R.survivor.visible = true; R.passenger.visible = false; R.flare.group.visible = true;
+    R.boat.position.set(at.x, this.water.waveHeight(at.x, at.z, 0) - 0.05, at.z); R.boat.rotation.y = at.heading; wave(R.survivor);
+    const drop = this.stormEvacuationDrop(at.x, at.z);
+    this.active = {
+      type: 'distress', variant: 'surge-evacuation', x: at.x, z: at.z, heading: at.heading,
+      state: 'waiting', t: 0, hold: 0, known: true, leave: 0, recognized: true,
+      campKey: camp.key, campName: camp.name, bankClearance: camp.bank.h - this.environment.waterLevel, drop,
     };
+    this.stormEvacuationUsed = true;
+    this.game.toast('Surge evacuation', `Water is across the low bank at ${camp.name}. One resident needs the ${drop.name} before the backside hits.`, 4.2);
+  }
+
+  distressBerth(baseX, baseZ, name, preferred = 0) {
+    for (let i = 0; i < 16; i++) {
+      const a = preferred + (i ? Math.ceil(i / 2) * (i % 2 ? 1 : -1) * Math.PI / 8 : 0), r = 21 + (i % 3) * 3;
+      const x = baseX + Math.cos(a) * r, z = baseZ + Math.sin(a) * r;
+      if (this.terrain.heightAt(x, z) < -0.72 && !this.world.blockedAt(x, z)) return { x, z, name };
+    }
+    return { x: baseX, z: baseZ, name };
+  }
+
+  distressDrop(x, z) {
+    const options = [];
     const nc = this.world.nearestCamp(x, z, 4200);
     if (nc) {
       const c = nc.camp, dx = c.tie.x - c.bank.x, dz = c.tie.z - c.bank.z;
-      options.push(berth(c.tie.x, c.tie.z, c.name, Math.atan2(dz, dx)));
+      options.push(this.distressBerth(c.tie.x, c.tie.z, c.name, Math.atan2(dz, dx)));
     }
     const home = this.game.dockTie;
-    options.push(berth(home.x, home.z, 'tower dock', Math.atan2(home.z - z, home.x - x)));
+    options.push(this.distressBerth(home.x, home.z, 'tower dock', Math.atan2(home.z - z, home.x - x)));
     options.sort((a, b) => Math.hypot(a.x - x, a.z - z) - Math.hypot(b.x - x, b.z - z));
     return options[0];
   }
 
+  stormEvacuationDrop(x, z) {
+    const home = this.game.dockTie;
+    let best = this.distressBerth(home.x, home.z, 'tower dock', Math.atan2(home.z - z, home.x - x));
+    let bestDistance = Math.hypot(best.x - x, best.z - z);
+    for (const site of this.world.sitesNear(x, z, 2400)) {
+      if (site.kind !== 'ramp' || site.hTop < this.environment.waterLevel + 0.75) continue;
+      const berth = this.distressBerth(site.x, site.z, 'public boat ramp', site.ang);
+      const distance = Math.hypot(berth.x - x, berth.z - z);
+      if (distance < bestDistance) { best = berth; bestDistance = distance; }
+    }
+    return best;
+  }
+
   boardDistress(e) {
     if (e.state !== 'waiting') return;
-    const R = this.rigs.distress; e.state = 'aboard'; e.drop = this.distressDrop(e.x, e.z); e.boardedAt = e.t;
+    const evacuation = e.variant === 'surge-evacuation';
+    const R = this.rigs.distress; e.state = 'aboard'; e.drop ||= evacuation ? this.stormEvacuationDrop(e.x, e.z) : this.distressDrop(e.x, e.z); e.boardedAt = e.t;
     R.survivor.visible = false; R.passenger.visible = true; this.clearPrompt(); this.audio.checkpoint();
-    this.game.toast('Operator aboard', `Run him to ${e.drop.name}. Keep the front bench dry.`, 3.2);
+    this.game.toast(evacuation ? 'Resident aboard' : 'Operator aboard', evacuation ? `Run for ${e.drop.name}. The backside wind is still coming.` : `Run him to ${e.drop.name}. Keep the front bench dry.`, 3.2);
   }
 
   startGrounding(at) {
@@ -519,6 +634,7 @@ export class EncounterDirector {
     e.state = 'depart'; e.departT = 7.5; e.assisted = assisted; e.cleanTow = e.scour < 1.8; R.rope.visible = false; this.phys.towDrag = 0;
     if (this.game.wpTarget?.encounter) this.game.wpTarget = null;
     const heading = Math.atan2(-dx, -dz), A = R.agent;
+    this.resetAgentImpact(A);
     Object.assign(A, { x: e.x, z: e.z, heading, speed: 0.25, want: 5.2, turn: 0, decisionT: 0, targetX: e.x + dx / d * 320, targetZ: e.z + dz / d * 320, active: true });
     R.boat.userData.motor.rotation.x = 0.18; this.audio.checkpoint();
     this.game.toast(assisted ? 'Skiff floating clear' : 'Flood tide lifted the skiff', assisted ? 'Line is off. Let the outboard open a safe gap.' : 'The operator waited it out with the motor trimmed.', 3.2);
@@ -764,10 +880,142 @@ export class EncounterDirector {
     );
   }
 
+  startWrangler(at) {
+    this.clearDistressEcho();
+    const W = this.rigs.distress, F = this.rigs.fire, S = this.rigs.smuggler, G = this.rigs.spotlight;
+    const heading = at.heading + (Math.random() - 0.5) * 0.42, fx = -Math.sin(heading), fz = -Math.cos(heading), rx = Math.cos(heading), rz = -Math.sin(heading);
+    W.boat.visible = true; W.survivor.visible = true; W.passenger.visible = false; W.flare.group.visible = false; W.flare.light.intensity = 0;
+    W.survivor.position.set(0.68, 0.46, -0.2); W.survivor.rotation.y = Math.PI / 2; setWranglePose(W.survivor, 1);
+    F.boat.visible = true; F.operator.visible = true; F.swimmer.visible = false; animateEngineFire(F.fire, 0, 0, 0);
+    S.boat.visible = true; S.agent.active = false; S.pack.visible = false; G.gunner.visible = false; G.light.intensity = 0; G.pool.visible = false; G.eyes.visible = false;
+    G.gator.visible = true;
+    this.active = {
+      type: 'wrangler', state: 'waiting', x: at.x, z: at.z, heading, t: 0, known: false, ph: Math.random() * Math.PI * 2,
+      workX: at.x, workZ: at.z, fireX: at.x - rx * 9 + fx * 2.5, fireZ: at.z - rz * 9 + fz * 2.5,
+      crowdX: at.x + rx * 8.5 - fx * 7.5, crowdZ: at.z + rz * 8.5 - fz * 7.5,
+      fireHeading: heading + 0.38, crowdHeading: heading - 0.68,
+      gatorX: at.x + rx * 2.42 + fx * 0.12, gatorZ: at.z + rz * 2.42 + fz * 0.12, gatorHeading: heading + Math.PI / 2, gatorSpeed: 0,
+      workerProgress: 0, assist: 0, station: 0, wakeThreat: 0, wakeRisk: 0, helped: false, bet: 0, betPaid: 0,
+      hitCd: 0, gatorHitCd: 0, releaseT: 0, resolveT: 0, lungeHeading: heading, escapeHeading: heading, lungeHit: false, playerCaused: false, outcome: '',
+    };
+    this.updateWranglerRig(this.active, 0, 0);
+  }
+
+  floatWranglerBoat(mesh, x, z, heading, t, phase) {
+    const sea = this.environment.values.sea || 0, wave = this.water.waveHeight(x, z, t);
+    mesh.position.set(x, wave - 0.05, z);
+    mesh.rotation.set(Math.sin(t * 0.63 + phase) * (0.004 + sea * 0.006), heading, Math.sin(t * 0.78 + phase * 1.7) * (0.012 + sea * 0.009), 'YXZ');
+  }
+
+  updateWranglerRig(e, dt, t) {
+    const W = this.rigs.distress, F = this.rigs.fire, S = this.rigs.smuggler, G = this.rigs.spotlight, p = this.phys;
+    this.floatWranglerBoat(W.boat, e.workX, e.workZ, e.heading, t, e.ph);
+    this.floatWranglerBoat(F.boat, e.fireX, e.fireZ, e.fireHeading, t, e.ph + 1.8);
+    this.floatWranglerBoat(S.boat, e.crowdX, e.crowdZ, e.crowdHeading, t, e.ph + 3.4);
+    const wave = this.water.waveHeight(e.gatorX, e.gatorZ, t), secured = e.state === 'secured';
+    G.gator.position.set(e.gatorX, wave - (secured ? 0.31 : 0.38) + Math.sin(t * 0.62 + e.ph) * (secured ? 0.008 : 0.025), e.gatorZ);
+    G.gator.rotation.set(0, e.gatorHeading + Math.sin(t * 0.45 + e.ph) * (secured ? 0.01 : 0.035), secured ? 0.12 : Math.sin(t * 0.41 + e.ph) * 0.018, 'YXZ');
+    setWranglePose(W.survivor, e.state === 'waiting' || e.state === 'helping' ? 1 : secured ? 0.62 : 0);
+    const boat = this._personBoat; boat.x = p.pos.x; boat.z = p.pos.y; boat.speed = p.speed;
+    animatePerson(W.survivor, t, dt, boat); animatePerson(F.operator, t, dt, boat);
+    const spectators = S.boat.userData.people;
+    if (spectators) for (const spectator of spectators) animatePerson(spectator, t, dt, boat);
+  }
+
+  addWranglerBoatObstacle(index, x, z, heading) {
+    if (Math.hypot(x - this.phys.pos.x, z - this.phys.pos.y) > 70) return;
+    const fx = -Math.sin(heading), fz = -Math.cos(heading), o = this.wranglerBoatObs[index];
+    o.ax = x + fx * 2; o.az = z + fz * 2; o.bx = x - fx * 2; o.bz = z - fz * 2; this.obs.push(o);
+  }
+
+  beginWranglerAssist(e) {
+    if (!e || e.type !== 'wrangler' || e.state !== 'waiting') return false;
+    e.state = 'helping'; e.helped = true; this.clearPrompt(); this.audio.checkpoint();
+    this.game.toast('Hold the escape cut', 'Idle outside Cal’s working circle. Keep the other boats out and leave him flat water.', 3.4);
+    return true;
+  }
+
+  placeWranglerBet(e) {
+    if (!e || e.type !== 'wrangler' || !['waiting', 'helping'].includes(e.state) || e.bet) return false;
+    if ((Number(this.game.save.cash) || 0) < 50) { this.audio.fail(); this.game.toast('Short on cash', 'The spectator wants fifty before Cal reaches for the tape.', 2.8); return false; }
+    e.bet = 50; this.game.addCash(-50); this.game.save.wranglerBets = (this.game.save.wranglerBets || 0) + 1; this.game.persist();
+    this.game.bountyToast('Side bet <b>-$50</b>'); this.audio.pickup(); this.game.toast('Fifty says ten fingers', 'The purple-cap skiff is holding the money.', 2.9); return true;
+  }
+
+  secureWrangler(e, helped = false) {
+    if (!e || e.type !== 'wrangler' || e.state === 'secured' || e.state === 'loose') return false;
+    e.state = 'secured'; e.resolveT = 5.6; e.workerProgress = 1; e.assist = Math.max(e.assist, helped ? 1 : e.assist); e.outcome = helped ? 'wrangler-assisted' : 'wrangler-watched'; this.clearPrompt();
+    let payout = 0;
+    if (helped) { payout += 180; this.game.save.wranglerAssists = (this.game.save.wranglerAssists || 0) + 1; }
+    if (e.bet) { e.betPaid = 100; payout += e.betPaid; this.game.save.wranglerBetWins = (this.game.save.wranglerBetWins || 0) + 1; }
+    if (payout) { this.game.addCash(payout); this.game.bountyToast(`${helped && e.bet ? 'Capture and side bet' : helped ? 'Capture assist' : 'Side bet paid'} <b>+$${payout}</b>`); }
+    if (helped && this.reputation) {
+      this.reputation.change('locals', 0.8, 'gator-capture-assist', 'You held a flat escape lane while Cal taped a nuisance gator beside the work skiff.', true);
+      this.reputation.change('fwc', 0.55, 'gator-capture-assist', 'A licensed nuisance-gator capture finished without a wake strike or loose animal.', false);
+    }
+    if (helped && this.law) this.law.cool(0.15);
+    this.game.persist(); this.audio.complete();
+    this.game.toast('Gator taped and tagged', helped ? 'Cal still has ten fingers. The work skiff is paying for the quiet water.' : e.bet ? 'Cal still has ten fingers. The purple-cap skiff is paying up.' : 'Cal still has ten fingers. Nobody in the gallery looks surprised.', 3.8);
+    this.radio?.transmit({ channel: 'LOCAL 72', speaker: 'CYPRESS HOOK', text: 'Cal has the tape on. Keep the cut down until the work skiff clears.', priority: 1, key: 'wrangler-secured', cooldown: 28 });
+    return true;
+  }
+
+  releaseWrangler(e, reason = 'wake', playerCaused = true) {
+    if (!e || e.type !== 'wrangler' || e.state === 'loose' || e.state === 'secured') return false;
+    const p = this.phys, dx = p.pos.x - e.gatorX, dz = p.pos.y - e.gatorZ;
+    e.state = 'loose'; e.releaseT = 0; e.resolveT = 9; e.gatorSpeed = 0.4; e.playerCaused = playerCaused; e.lungeHit = false;
+    e.lungeHeading = Math.atan2(-dx, -dz); e.escapeHeading = this.departureHeading(e.gatorX, e.gatorZ, e.gatorHeading + Math.PI * 0.72);
+    e.outcome = playerCaused ? 'wrangler-wake-break' : 'wrangler-weather-break'; setWranglePose(this.rigs.distress.survivor, 0); wave(this.rigs.fire.operator);
+    if (playerCaused) {
+      const hard = reason === 'hull'; this.game.save.wranglerWakeBreaks = (this.game.save.wranglerWakeBreaks || 0) + 1;
+      if (this.law) this.law.add(hard ? 0.68 : 0.48, hard ? 'struck a nuisance-gator capture scene' : 'reckless wake at a nuisance-gator capture', false);
+      if (this.reputation) {
+        this.reputation.change('locals', hard ? -0.8 : -0.6, 'gator-capture-broken', hard ? 'You hit a boat in Cal’s nuisance-gator setup and broke his grip.' : 'Your wake broke Cal’s grip during a nuisance-gator capture.', true);
+        this.reputation.change('fwc', hard ? -0.65 : -0.45, 'gator-capture-broken', 'The licensed capture ended with a loose animal after the tower boat entered the working circle.', false);
+      }
+      this.game.persist(); this.audio.warn(); this.game.toast('That wake made the decision', e.bet ? 'Cal let go. The gator is loose and the fifty is gone.' : 'Cal let go before the chine reached his hands. The gator is coming off the skiff.', 3.8);
+    } else {
+      this.audio.warn(); this.game.toast('Weather broke the grip', e.bet ? 'The squall scattered the gallery. The purple-cap skiff handed the fifty back.' : 'Cal let go and everybody found a throttle at once.', 3.6);
+      if (e.bet) { this.game.addCash(e.bet); this.game.bountyToast('Weather refund <b>+$50</b>'); e.bet = 0; this.game.persist(); }
+    }
+    this.radio?.transmit({ channel: 'LOCAL 72', speaker: 'CYPRESS HOOK', text: 'Loose gator off Cal’s skiff. Give the work boat room.', priority: 2, key: 'wrangler-loose', cooldown: 28 });
+    return true;
+  }
+
+  hitWranglerBoat(index, into) {
+    const e = this.active; if (!e || e.type !== 'wrangler' || !['waiting', 'helping'].includes(e.state) || e.hitCd > 0 || into < 1.2) return;
+    e.hitCd = 2.2; e.wakeRisk = Math.max(e.wakeRisk, clamp(into / 4)); this.game.shake = Math.max(this.game.shake, Math.min(0.34, into * 0.04));
+    if (this.condition) this.condition.damage(0.15 + into * 0.06, into * 0.025);
+    if (into >= 2.1) this.releaseWrangler(e, 'hull', true);
+    else this.game.toast(index ? 'Spectator boat rocked' : 'Contact with Cal’s skiff', 'Back out at idle. The gator is still in his hands.', 2.8);
+  }
+
+  hitWranglerGator(into) {
+    const e = this.active; if (!e || e.type !== 'wrangler' || e.gatorHitCd > 0 || into < 0.9) return;
+    e.gatorHitCd = 2.4;
+    if (e.state === 'waiting' || e.state === 'helping') { if (this.condition) this.condition.damage(0.35 + into * 0.09, into * 0.03); this.releaseWrangler(e, 'hull', true); return; }
+    if (e.state === 'loose') { if (this.condition) this.condition.damage(0.25 + into * 0.08, into * 0.02); this.audio.thud(Math.min(1.2, 0.35 + into * 0.1)); }
+  }
+
+  debugAdvanceWrangler() {
+    const e = this.active; if (!e || e.type !== 'wrangler') return;
+    if (e.state === 'waiting') this.beginWranglerAssist(e);
+    else if (e.state === 'helping') { e.assist = 0.995; e.workerProgress = Math.max(e.workerProgress, 0.92); }
+    else if (e.state === 'secured' || e.state === 'loose') e.resolveT = 0.01;
+  }
+
+  wranglerSnapshot() {
+    const e = this.active?.type === 'wrangler' ? this.active : null;
+    return {
+      active: Boolean(e), state: e?.state || '', assist: e?.assist || 0, wakeRisk: e?.wakeRisk || 0,
+      pooled: { boats: 3, people: 4, gators: 1 }, extraRenderResources: { objects: 0, geometries: 0, materials: 0, textures: 0, lights: 0 },
+    };
+  }
+
   startManatee(at) {
     const R = this.rigs.manatee, heading = at.heading + (Math.random() - 0.5) * 0.7;
     R.animal.visible = true; R.buoy.visible = true; R.rope.visible = true; R.rope.material.opacity = 0.86;
-    this.rigs.patrol.boat.visible = false; this.rigs.patrol.agent.active = false; this.rigs.patrol.blue.light.intensity = 0; this.rigs.patrol.red.light.intensity = 0; this.resetPatrolBackups();
+    this.rigs.patrol.boat.visible = false; this.rigs.patrol.agent.active = false; this.rigs.patrol.blue.light.intensity = 0; this.rigs.patrol.red.light.intensity = 0; this.hidePatrolSearchlight(this.rigs.patrol); this.resetPatrolBackups();
     this.active = {
       type: 'manatee', x: at.x, z: at.z, heading, navHeading: heading, speed: 0.46, state: 'waiting', t: 0, known: false,
       navT: 0, ph: Math.random() * Math.PI * 2, surfaced: false, spook: 0, warnT: 0, hitCd: 0, lineHitCd: 0,
@@ -903,10 +1151,10 @@ export class EncounterDirector {
     if (this.terrain.heightAt(gatorX, gatorZ) > -0.48 || this.world.blockedAt(gatorX, gatorZ)) {
       gatorX = at.x + Math.cos(heading) * 13; gatorZ = at.z - Math.sin(heading) * 13;
     }
-    Object.assign(A, { x: at.x, z: at.z, heading, speed: 0.18, want: 0, turn: 0, decisionT: 0, active: true });
+    this.resetAgentImpact(A); Object.assign(A, { x: at.x, z: at.z, heading, speed: 0.18, want: 0, turn: 0, decisionT: 0, active: true });
     A.mesh.position.set(A.x, this.water.waveHeight(A.x, A.z, 0) - 0.05, A.z); A.mesh.rotation.set(0, heading, 0); A.mesh.visible = true;
     this.rigs.smuggler.pack.visible = false; S.gunner.visible = true; S.gator.visible = true; S.eyes.visible = false;
-    this.rigs.patrol.boat.visible = false; this.rigs.patrol.agent.active = false; this.rigs.patrol.blue.light.intensity = 0; this.rigs.patrol.red.light.intensity = 0; this.resetPatrolBackups();
+    this.rigs.patrol.boat.visible = false; this.rigs.patrol.agent.active = false; this.rigs.patrol.blue.light.intensity = 0; this.rigs.patrol.red.light.intensity = 0; this.hidePatrolSearchlight(this.rigs.patrol); this.resetPatrolBackups();
     this.active = {
       type: 'spotlight', state: 'waiting', x: A.x, z: A.z, heading, t: 0, known: false, ph: Math.random() * Math.PI * 2,
       gatorX, gatorZ, takeT: 27 + Math.random() * 7, resolveT: 0, chaseT: 0, visualT: 0, lostT: 0,
@@ -918,9 +1166,12 @@ export class EncounterDirector {
   updateSpotlightRig(e, dt, t) {
     const S = this.rigs.spotlight, A = this.rigs.smuggler.agent;
     if (e.state === 'waiting') {
+      A.heading += (Number(A.yawKick) || 0) * dt; A.x += (Number(A.shx) || 0) * dt; A.z += (Number(A.shz) || 0) * dt;
+      e.x = A.x; e.z = A.z; e.heading = A.heading;
       A.mesh.position.set(A.x, this.water.waveHeight(A.x, A.z, t) - 0.05, A.z);
-      A.mesh.rotation.set(0, A.heading, Math.sin(t * 0.72 + e.ph) * 0.025, 'YXZ');
+      A.mesh.rotation.set(0, A.heading, Math.sin(t * 0.72 + e.ph) * 0.025 + (Number(A.heelKick) || 0), 'YXZ');
       if (A.mesh.userData.motor) A.mesh.userData.motor.userData.prop.rotation.z += dt * 8;
+      this.decayAgentImpact(A, dt);
     }
     if (S.gator.visible) {
       const waveY = this.water.waveHeight(e.gatorX, e.gatorZ, t);
@@ -1032,7 +1283,7 @@ export class EncounterDirector {
     const gates = this.raceCourse(at); if (!gates) return false;
     const R = this.rigs.smuggler, A = R.agent, first = gates[0]; R.pack.visible = false;
     const heading = Math.atan2(-(first.x - at.x), -(first.z - at.z));
-    Object.assign(A, { x: at.x, z: at.z, heading, speed: 1.8, want: 4.2, turn: 0, targetX: first.x, targetZ: first.z, decisionT: 0, active: true });
+    this.resetAgentImpact(A); Object.assign(A, { x: at.x, z: at.z, heading, speed: 1.8, want: 4.2, turn: 0, targetX: first.x, targetZ: first.z, decisionT: 0, active: true });
     A.mesh.position.set(A.x, this.water.waveHeight(A.x, A.z, 0) - 0.05, A.z); A.mesh.rotation.y = A.heading; A.mesh.visible = true;
     const last = gates[gates.length - 1], fx = -Math.sin(last.heading), fz = -Math.cos(last.heading);
     this.active = {
@@ -1131,10 +1382,13 @@ export class EncounterDirector {
     if (!e || e.type !== 'patrol') return false;
     const fresh = e.state !== 'pursuit'; e.state = 'pursuit'; e.wanted = true; e.lostT = 0; e.surrender = 0;
     if (fresh) {
-      e.pursuit = 0; e.tacticT = 0; e.tacticSide = Math.random() < 0.5 ? -1 : 1; e.lastKnownX = this.phys.pos.x; e.lastKnownZ = this.phys.pos.y;
+      this.resetPatrolSight(); this.resetPatrolSound(); this.resetPatrolSearch();
+      if (this.rigs.patrol.agent.search) this.rigs.patrol.agent.search.active = false;
+      e.pursuit = 0; e.tacticT = 0; e.tacticSide = Math.random() < 0.5 ? -1 : 1; e.lastKnownX = this.phys.pos.x; e.lastKnownZ = this.phys.pos.y; e.lastKnownHeading = this.phys.heading;
       e.backupRequested = 0; e.backupCount = 0; e.units = 1; e.backupDue[0] = Infinity; e.backupDue[1] = Infinity; this.resetPatrolBackups();
       e.aviationRequested = false; e.aviationDue = Infinity; e.aviationActive = false; e.aviationVisual = false; e.aviationBeamActive = false;
       e.aviationLastSeen = 0; e.aviationAircraftDistance = Infinity; e.aviationBeamDistance = Infinity; this.resetPatrolAviation();
+      e.surfaceVisual = true; e.surfaceOccluded = false; e.visual = true; e.soundContact = false; e.sightCallCd = 0;
     }
     if (this.law) {
       if (addViolation) { this.law.stats.failureToStop = (this.law.stats.failureToStop || 0) + 1; this.law.add(0.65, reason, false); }
@@ -1143,18 +1397,18 @@ export class EncounterDirector {
     return fresh;
   }
 
-  hitPatrol(into) {
-    this.hitPatrolUnit(-1, into);
+  hitPatrol(into, nx, nz) {
+    this.hitPatrolUnit(-1, into, nx, nz);
   }
 
-  hitPatrolBackup(index, into) {
-    this.hitPatrolUnit(index, into);
+  hitPatrolBackup(index, into, nx, nz) {
+    this.hitPatrolUnit(index, into, nx, nz);
   }
 
-  hitPatrolUnit(index, into) {
+  hitPatrolUnit(index, into, nx, nz) {
     const e = this.active; if (!e || e.type !== 'patrol' || e.ramCd > 0 || into < 1.6) return;
     const R = index < 0 ? this.rigs.patrol : this.rigs.patrolBackups[index]; if (!R?.agent.active) return;
-    e.ramCd = 2.2; e.ramHits++; R.agent.speed *= clamp(1 - into * 0.025, 0.66, 0.9);
+    e.ramCd = 2.2; e.ramHits++; R.agent.speed *= clamp(1 - into * 0.025, 0.66, 0.9); this.impactAgent(R.agent, into, nx, nz, 0.44);
     if (this.law) {
       this.law.stats.patrolRams = (this.law.stats.patrolRams || 0) + 1;
       if (index >= 0) this.law.stats.backupRams = (this.law.stats.backupRams || 0) + 1;
@@ -1167,7 +1421,31 @@ export class EncounterDirector {
 
   resetPatrolBackups() {
     if (!this.rigs?.patrolBackups) return;
-    for (const R of this.rigs.patrolBackups) { R.agent.active = false; R.boat.visible = false; R.blueBulb.visible = false; R.redBulb.visible = false; }
+    for (const R of this.rigs.patrolBackups) {
+      R.agent.active = false; this.resetPatrolWeather(R.agent); if (R.agent.search) R.agent.search.active = false; this.hidePatrolSearchlight(R); R.boat.visible = false; R.blueBulb.visible = false; R.redBulb.visible = false;
+      if (R.closure) Object.assign(R.closure, { active: false, holding: false, announced: false, remaining: 0, cooldown: R.index ? 1.8 : 0 });
+    }
+  }
+
+  hidePatrolSearchlight(R) {
+    const S = R?.searchlight; if (!S) return;
+    S.active = false; S.plan.active = false; S.rig.visible = false; S.beam.visible = false; if (S.light) S.light.intensity = 0;
+  }
+
+  updatePatrolSearchlight(e, R, t, visual, targetX, targetZ) {
+    const S = R?.searchlight, A = R?.agent; if (!S || !A) return false;
+    const values = this.environment?.values || {};
+    const plan = pursuitSearchlightPlan(
+      e?.state === 'pursuit' && A.active, this.environment?.hour, this.environment?.restrictedVisibility,
+      values.storm, visual, R.role, A.x, A.z, A.heading, targetX, targetZ, e?.pursuit, S.plan,
+    );
+    S.active = plan.active; S.rig.visible = plan.active; S.beam.visible = plan.active; if (S.light) S.light.intensity = plan.intensity;
+    if (!plan.active) return false;
+    S.rig.rotation.y = plan.relativeHeading; S.beam.scale.set(plan.width, plan.length, 1);
+    const fx = -Math.sin(plan.worldHeading), fz = -Math.cos(plan.worldHeading);
+    const x = A.x + fx * plan.length * 0.5, z = A.z + fz * plan.length * 0.5;
+    S.beam.position.set(x, this.water.waveHeight(x, z, t) + 0.055, z); S.beam.rotation.set(-Math.PI / 2, plan.worldHeading, 0, 'YXZ');
+    return true;
   }
 
   resetPatrolAviation() {
@@ -1181,7 +1459,8 @@ export class EncounterDirector {
   patrolBackupSpot(index, e) {
     const p = this.phys, fx = -Math.sin(p.heading), fz = -Math.cos(p.heading), rx = Math.cos(p.heading), rz = -Math.sin(p.heading), baseSide = (index ? -1 : 1) * e.tacticSide;
     for (let i = 0; i < 48; i++) {
-      const side = baseSide * (i >= 30 ? -1 : 1), ahead = 52 + (i % 5) * 13 + Math.random() * 15, across = 118 + (i % 6) * 11 + Math.random() * 12;
+      const side = baseSide * (i >= 30 ? -1 : 1), ahead = index ? 132 + (i % 5) * 18 + Math.random() * 20 : 52 + (i % 5) * 13 + Math.random() * 15;
+      const across = index ? 78 + (i % 6) * 9 + Math.random() * 10 : 118 + (i % 6) * 11 + Math.random() * 12;
       const x = p.pos.x + fx * ahead + rx * side * across, z = p.pos.y + fz * ahead + rz * side * across;
       if (Math.abs(x) > WORLD_HALF - 90 || Math.abs(z) > WORLD_HALF - 90) continue;
       const depth = this.environment.waterLevel - this.terrain.heightAt(x, z); if (depth < 0.68 || depth > 6.8 || this.world?.blockedAt(x, z)) continue;
@@ -1194,7 +1473,8 @@ export class EncounterDirector {
   deployPatrolBackup(e, index, t) {
     const R = this.rigs.patrolBackups[index], at = this.patrolBackupSpot(index, e); if (!R || R.agent.active) return true;
     if (!at) { e.backupDue[index] = e.pursuit + 1.5; return false; }
-    const A = R.agent; Object.assign(A, { x: at.x, z: at.z, heading: at.heading, speed: 5.8, want: 10, turn: 0, targetX: this.phys.pos.x, targetZ: this.phys.pos.y, decisionT: 0, active: true });
+    const A = R.agent; Object.assign(A, { x: at.x, z: at.z, heading: at.heading, speed: 5.8, want: 10, turn: 0, targetX: this.phys.pos.x, targetZ: this.phys.pos.y, decisionT: 0, active: true }); this.resetPatrolWeather(A);
+    if (R.closure) Object.assign(R.closure, { active: false, holding: false, announced: false, remaining: 0, cooldown: index ? 1.8 : 0 });
     A.mesh.position.set(A.x, this.water.waveHeight(A.x, A.z, t) - 0.05, A.z); A.mesh.rotation.set(0, A.heading, 0); A.mesh.visible = true; R.blueBulb.visible = true; R.redBulb.visible = false;
     e.backupCount++; e.units = 1 + e.backupCount;
     if (this.law) this.law.stats.backupDeployments = (this.law.stats.backupDeployments || 0) + 1;
@@ -1254,7 +1534,7 @@ export class EncounterDirector {
     const sharedVisual = surfaceVisual || priorAirVisual;
     let targetX, targetZ;
     if (sharedVisual) {
-      e.lastKnownX = p.pos.x; e.lastKnownZ = p.pos.y; e.aviationLastSeen = 0;
+      e.lastKnownX = p.pos.x; e.lastKnownZ = p.pos.y; e.lastKnownHeading = p.heading; e.aviationLastSeen = 0;
       const phase = e.pursuit * 0.23 + e.aviationSide * 0.9, radius = 94 + Math.min(28, p.speed * 1.4);
       targetX = p.pos.x + p.vel.x * 2.1 + Math.cos(phase) * radius;
       targetZ = p.pos.y + p.vel.y * 2.1 + Math.sin(phase) * radius;
@@ -1278,14 +1558,15 @@ export class EncounterDirector {
     const beamDistance = e.aviationBeamActive ? Math.hypot(e.beamX - p.pos.x, e.beamZ - p.pos.y) : Infinity;
     const airVisual = pursuitAviationVisualHeld(aircraftDistance, beamDistance, heat, restricted, storm, regionId, true);
     e.aviationAircraftDistance = aircraftDistance; e.aviationBeamDistance = beamDistance; e.aviationVisual = airVisual;
-    if (airVisual) { e.lastKnownX = p.pos.x; e.lastKnownZ = p.pos.y; e.aviationLastSeen = 0; }
+    if (airVisual) { e.lastKnownX = p.pos.x; e.lastKnownZ = p.pos.y; e.lastKnownHeading = p.heading; e.aviationLastSeen = 0; }
     let audible = clamp(1 - (aircraftDistance - 35) / 620); audible *= audible * 0.86; this.audio.helicopter(audible, 0.96 + Math.min(0.16, Math.hypot(e.hvx, e.hvz) / 150), e.hx, e.hz);
     return surfaceVisual || airVisual;
   }
 
   startPatrol(at, options = {}) {
-    this.resetPatrolBackups(); this.resetPatrolAviation();
-    const A = this.rigs.patrol.agent; Object.assign(A, { x: at.x, z: at.z, heading: at.heading, speed: Number(options.speed) || 4, want: 8, turn: 0, active: true });
+    this.resetPatrolBackups(); this.resetPatrolAviation(); this.resetPatrolSight(); this.resetPatrolSound(); this.resetPatrolSearch();
+    const A = this.rigs.patrol.agent; Object.assign(A, { x: at.x, z: at.z, heading: at.heading, speed: Number(options.speed) || 4, want: 8, turn: 0, active: true }); this.resetPatrolWeather(A);
+    if (A.search) A.search.active = false; this.hidePatrolSearchlight(this.rigs.patrol);
     A.decisionT = 0; A.mesh.position.set(A.x, this.water.waveHeight(A.x, A.z, 0) - 0.05, A.z); A.mesh.rotation.y = A.heading;
     A.mesh.visible = true;
     const goodwill = Number(this.game.save.goodwill) || 0, fwcStanding = this.reputation ? this.reputation.score('fwc') : 0;
@@ -1293,7 +1574,8 @@ export class EncounterDirector {
       type: 'patrol', x: at.x, z: at.z, state: options.pursuit ? 'pursuit' : 'approach', t: 0, comply: 0, warned: false, pursuit: 0, known: Boolean(options.pursuit),
       wanted: Boolean(options.pursuit || (this.law && this.law.attention >= 1.2) || fwcStanding <= -4), recognized: fwcStanding >= 2 || goodwill >= 4,
       lostT: 0, surrender: 0, tacticT: 0, tacticSide: Math.random() < 0.5 ? -1 : 1, contactCd: 0, ramCd: 0, ramHits: options.impact ? 1 : 0,
-      lastKnownX: this.phys.pos.x, lastKnownZ: this.phys.pos.y, backupRequested: 0, backupCount: 0, units: 1, backupDue: [Infinity, Infinity],
+      surfaceVisual: true, surfaceOccluded: false, visual: true, soundContact: false, sightCallCd: 0,
+      lastKnownX: this.phys.pos.x, lastKnownZ: this.phys.pos.y, lastKnownHeading: this.phys.heading, backupRequested: 0, backupCount: 0, units: 1, backupDue: [Infinity, Infinity],
       aviationRequested: false, aviationDue: Infinity, aviationActive: false, aviationVisual: false, aviationBeamActive: false,
       aviationLastSeen: 0, aviationAircraftDistance: Infinity, aviationBeamDistance: Infinity,
     };
@@ -1303,7 +1585,7 @@ export class EncounterDirector {
   startSmuggler(at) {
     const R = this.rigs.smuggler; R.pack.visible = true; R.pack.position.set(at.x, this.water.waveHeight(at.x, at.z, 0) + 0.05, at.z);
     const a = at.heading + Math.PI * 0.6, A = R.agent;
-    Object.assign(A, { x: at.x + Math.cos(a) * 115, z: at.z + Math.sin(a) * 115, heading: at.heading, speed: 4, want: 6, active: true });
+    this.resetAgentImpact(A); Object.assign(A, { x: at.x + Math.cos(a) * 115, z: at.z + Math.sin(a) * 115, heading: at.heading, speed: 4, want: 6, active: true });
     A.decisionT = 0; A.mesh.position.set(A.x, this.water.waveHeight(A.x, A.z, 0) - 0.05, A.z); A.mesh.rotation.y = A.heading; A.mesh.visible = true;
     const standing = this.reputation ? this.reputation.score('runners') : 0;
     this.active = { type: 'smuggler', x: at.x, z: at.z, state: 'waiting', t: 0, known: false, chase: 0, originX: at.x, originZ: at.z, trusted: standing >= 3, hostile: standing <= -3 };
@@ -1399,7 +1681,7 @@ export class EncounterDirector {
   startNetline(at) {
     const R = this.rigs.netline, rx = Math.cos(at.heading), rz = -Math.sin(at.heading), half = 11;
     R.visible = true; R.position.set(at.x, this.water.waveHeight(at.x, at.z, 0) + 0.02, at.z); R.rotation.set(0, at.heading, 0); R.scale.set(1, 1, 1);
-    this.rigs.patrol.boat.visible = false; this.rigs.patrol.agent.active = false;
+    this.rigs.patrol.boat.visible = false; this.rigs.patrol.agent.active = false; this.hidePatrolSearchlight(this.rigs.patrol);
     this.rigs.smuggler.boat.visible = false; this.rigs.smuggler.agent.active = false; this.rigs.smuggler.pack.visible = false;
     this.active = {
       type: 'netline', x: at.x, z: at.z, heading: at.heading, state: 'waiting', t: 0, known: false, choice: '',
@@ -1418,7 +1700,7 @@ export class EncounterDirector {
     else if (e.type === 'salvage') target = e.pieces.find(q => !q.resolved) || e;
     else if (e.type === 'fire' && e.aboard && (e.fireOut || e.burned) && e.drop) target = e.drop;
     const dx = target.x - p.pos.x, dz = target.z - p.pos.y, d = Math.hypot(dx, dz) || 1;
-    const gap = e.type === 'patrol' ? 18 : e.type === 'distress' ? 9 : e.type === 'airrescue' ? 20 : e.type === 'fire' ? (e.aboard && (e.fireOut || e.burned) ? 8 : e.overboard ? 5 : 11) : e.type === 'manatee' ? (e.state === 'cutting' ? 5.5 : 19) : e.type === 'spotlight' ? 38 : e.type === 'race' && e.state === 'challenge' ? 15 : e.type === 'smuggler' && e.state === 'waiting' ? 5 : e.type === 'netline' ? 15 : 0;
+    const gap = e.type === 'patrol' ? 18 : e.type === 'distress' ? 9 : e.type === 'airrescue' ? 20 : e.type === 'fire' ? (e.aboard && (e.fireOut || e.burned) ? 8 : e.overboard ? 5 : 11) : e.type === 'wrangler' ? 24 : e.type === 'manatee' ? (e.state === 'cutting' ? 5.5 : 19) : e.type === 'spotlight' ? 38 : e.type === 'race' && e.state === 'challenge' ? 15 : e.type === 'smuggler' && e.state === 'waiting' ? 5 : e.type === 'netline' ? 15 : 0;
     const x = target.x - dx / d * gap, z = target.z - dz / d * gap;
     p.reset(x, z, p.heading); p.y = this.water.waveHeight(x, z, 0);
   }
@@ -1464,13 +1746,13 @@ export class EncounterDirector {
   }
 
   beginDistressEcho(e) {
-    if (e.type !== 'distress' || (e.state !== 'repair' && e.state !== 'aboard')) return false;
+    if (e.type !== 'distress' || e.variant === 'surge-evacuation' || (e.state !== 'repair' && e.state !== 'aboard')) return false;
     const R = this.rigs.distress, mode = e.state === 'repair' ? 'depart' : 'adrift';
     const heading = mode === 'depart' ? this.departureHeading(e.x, e.z, e.heading) : e.heading;
     this.distressEcho = { mode, x: e.x, z: e.z, heading, t: mode === 'depart' ? 34 : 80, ph: e.t || 0 };
     R.boat.position.set(e.x, this.water.waveHeight(e.x, e.z, 0) - 0.05, e.z); R.boat.rotation.set(0, heading, 0); R.boat.visible = true;
     R.survivor.visible = mode === 'depart'; R.passenger.visible = false; R.flare.group.visible = mode === 'adrift';
-    const A = R.echoAgent;
+    const A = R.echoAgent; this.resetAgentImpact(A);
     if (mode === 'depart') Object.assign(A, { x: e.x, z: e.z, heading, speed: 0.8, want: 5.4, turn: 0, decisionT: 0, targetX: e.x - Math.sin(heading) * 420, targetZ: e.z - Math.cos(heading) * 420, active: true });
     else A.active = false;
     return true;
@@ -1492,7 +1774,7 @@ export class EncounterDirector {
     if (R.survivor.visible && d < 180) { const boat = this._personBoat; boat.x = this.phys.pos.x; boat.z = this.phys.pos.y; boat.speed = this.phys.speed; animatePerson(R.survivor, t, dt, boat); }
     if (d < 70) {
       const fx = -Math.sin(E.heading), fz = -Math.cos(E.heading), o = this.echoObs;
-      o.ax = E.x + fx * 2; o.az = E.z + fz * 2; o.bx = E.x - fx * 2; o.bz = E.z - fz * 2; o.tag = E.mode === 'depart' ? 'repaired skiff' : 'abandoned skiff'; this.obs.push(o);
+      o.ax = E.x + fx * 2; o.az = E.z + fz * 2; o.bx = E.x - fx * 2; o.bz = E.z - fz * 2; o.tag = E.mode === 'depart' ? 'repaired skiff' : 'abandoned skiff'; o.agent = E.mode === 'depart' ? A : null; this.obs.push(o);
     }
   }
 
@@ -1505,14 +1787,16 @@ export class EncounterDirector {
     this.clearPrompt(); this.obs.length = 0;
     if (e.type === 'distress') { if (!(success && this.beginDistressEcho(e))) this.clearDistressEcho(); }
     else if (!this.distressEcho) this.rigs.distress.boat.visible = false;
+    setWranglePose(this.rigs.distress.survivor, 0); this.rigs.distress.survivor.position.set(0, 0.5, -0.55); this.rigs.distress.survivor.rotation.y = Math.PI;
     this.rigs.distress.passenger.visible = false;
-    this.rigs.patrol.boat.visible = false; this.rigs.patrol.agent.active = false; this.rigs.patrol.blue.light.intensity = 0; this.rigs.patrol.red.light.intensity = 0; this.resetPatrolBackups();
+    this.rigs.patrol.boat.visible = false; this.rigs.patrol.agent.active = false; this.resetPatrolWeather(this.rigs.patrol.agent); this.rigs.patrol.blue.light.intensity = 0; this.rigs.patrol.red.light.intensity = 0; this.hidePatrolSearchlight(this.rigs.patrol); this.resetPatrolBackups();
     this.rigs.smuggler.boat.visible = false; this.rigs.smuggler.agent.active = false; this.rigs.smuggler.pack.visible = false;
     this.rigs.salvage.wreck.visible = false; for (const d of this.rigs.salvage.drums) d.visible = false;
     this.rigs.netline.visible = false; this.rigs.netline.scale.set(1, 1, 1); this.rigs.netline.rotation.z = 0;
     this.rigs.fire.boat.visible = false; this.rigs.fire.operator.visible = true; this.rigs.fire.swimmer.visible = false; animateEngineFire(this.rigs.fire.fire, 0, 0, 0);
     this.rigs.grounding.boat.visible = false; this.rigs.grounding.operator.visible = true; this.rigs.grounding.rope.visible = false; this.rigs.grounding.lamp.light.intensity = 0; this.rigs.grounding.agent.active = false;
-    this.resetPatrolAviation();
+    for (const A of this.agents) this.resetAgentImpact(A);
+    this.resetPatrolAviation(); this.resetPatrolSound(); this.resetPatrolSearch();
     this.rigs.manatee.animal.visible = false; this.rigs.manatee.buoy.visible = false; this.rigs.manatee.rope.visible = false; this.rigs.manatee.rope.material.opacity = 0.86;
     this.rigs.spotlight.gunner.visible = false; this.rigs.spotlight.gator.visible = false; this.rigs.spotlight.eyes.visible = false; this.rigs.spotlight.light.intensity = 0; this.rigs.spotlight.pool.visible = false; this.rigs.spotlight.uniforms.uOpacity.value = 0;
     if (e.type === 'fire' && e.aboard) this.phys.loaded = 0;
@@ -1525,17 +1809,87 @@ export class EncounterDirector {
     this.next = this.patrolAlert > 0 ? Math.min(normalDelay, this.patrolAlert >= 3 ? 1.5 : this.patrolAlert >= 2 ? 3 : 8) : normalDelay;
   }
 
+  resetAgentImpact(A) {
+    if (!A) return A;
+    A.shx = 0; A.shz = 0; A.yawKick = 0; A.heelKick = 0; A.impactCd = 0;
+    return A;
+  }
+
+  impactAgent(A, into, nx, nz, shoveScale = 0.44, contactAlong = null) {
+    const hit = clamp(Number(into) || 0, 0, 12), normalLength = Math.hypot(nx, nz);
+    if (!A || hit <= 0 || !Number.isFinite(normalLength) || normalLength < 1e-5 || (Number(A.impactCd) || 0) > 0) return false;
+    nx /= normalLength; nz /= normalLength;
+    const impulse = Math.min(4.8, hit * Math.max(0.1, Number(shoveScale) || 0.44));
+    A.shx = (Number(A.shx) || 0) - nx * impulse; A.shz = (Number(A.shz) || 0) - nz * impulse;
+    const shoveSpeed = Math.hypot(A.shx, A.shz), maxShove = 5.2;
+    if (shoveSpeed > maxShove) { const scale = maxShove / shoveSpeed; A.shx *= scale; A.shz *= scale; }
+    const fx = -Math.sin(A.heading), fz = -Math.cos(A.heading);
+    const derivedAlong = this.phys?.pos ? (this.phys.pos.x - A.x) * fx + (this.phys.pos.y - A.z) * fz : 0;
+    const along = clamp(contactAlong === null ? derivedAlong : Number(contactAlong) || 0, -2, 2);
+    const forceX = -nx * impulse, forceZ = -nz * impulse, torque = (fz * along) * forceX - (fx * along) * forceZ;
+    A.yawKick = clamp((Number(A.yawKick) || 0) + clamp(torque * 0.1, -0.85, 0.85), -1.1, 1.1);
+    const rightX = -Math.cos(A.heading), rightZ = Math.sin(A.heading), contactSide = nx * rightX + nz * rightZ;
+    A.heelKick = clamp((Number(A.heelKick) || 0) + contactSide * hit * 0.022, -0.22, 0.22);
+    A.impactCd = 0.16;
+    return true;
+  }
+
+  decayAgentImpact(A, dt) {
+    if (!A) return;
+    const step = Math.max(0, Number(dt) || 0), shoveDecay = Math.exp(-step * 1.9);
+    A.impactCd = Math.max(0, (Number(A.impactCd) || 0) - step);
+    A.shx = (Number(A.shx) || 0) * shoveDecay; A.shz = (Number(A.shz) || 0) * shoveDecay;
+    A.yawKick = (Number(A.yawKick) || 0) * Math.exp(-step * 3.2); A.heelKick = (Number(A.heelKick) || 0) * Math.exp(-step * 2.8);
+  }
+
+  hitMovingBoat(obstacle, into, nx, nz) {
+    const A = obstacle?.agent;
+    if (!A?.active || into < 0.65 || !this.impactAgent(A, into, nx, nz, 0.42)) return false;
+    A.speed *= clamp(1 - into * 0.03, 0.68, 0.98);
+    return true;
+  }
+
+  resetPatrolWeather(A) {
+    this.resetAgentImpact(A);
+    if (!A?.enforcement) return;
+    A.downburstResponse = 0; A.downburstDistance = Infinity; A.downburstNoticeT = 0; A.downburstReacted = false; A.windHeel = 0;
+    downburstCraftUrgency(null, A.x, A.z, 'john', A.downburstField); A.localOutflow.x = 0; A.localOutflow.z = 0;
+    A.surfaceWind.x = 0; A.surfaceWind.z = 0; A.surfaceWind.speed = 0; A.windDrift.x = 0; A.windDrift.z = 0; A.windDrift.speed = 0;
+    pursuitDownburstTactic(0, 0, A.weatherTactic);
+  }
+
+  updatePatrolDownburst(A, dt) {
+    if (!A?.enforcement) return null;
+    const step = Math.max(0, Number(dt) || 0), cell = this.hazards?.downburst, active = Boolean(cell?.active);
+    const field = downburstCraftUrgency(cell, A.x, A.z, 'john', A.downburstField), target = field.urgency;
+    A.downburstDistance = field.distance;
+    A.downburstNoticeT = target > 0.025 ? A.downburstNoticeT + step : Math.max(0, A.downburstNoticeT - step * 1.7);
+    const aware = downburstReactionReady(field, A.downburstNoticeT, A.downburstReactionDelay), desired = aware ? target : 0;
+    const rate = desired > A.downburstResponse ? 2.8 : 1.2;
+    A.downburstResponse += (desired - A.downburstResponse) * (1 - Math.exp(-step * rate));
+    if (aware) A.downburstReacted = true;
+    if (!active && A.downburstResponse < 0.015) { A.downburstNoticeT = 0; A.downburstReacted = false; }
+    A.localOutflow.x = Number.isFinite(field.windX) ? field.windX : 0; A.localOutflow.z = Number.isFinite(field.windZ) ? field.windZ : 0;
+    const values = this.environment?.values || {}, gustValue = Number(this.environment?.gust), gust = Number.isFinite(gustValue) ? Math.max(0, gustValue) : 1;
+    const wind = combinedSurfaceWind(this.environment?.windDir, Math.max(0, (Number(values.wind) || 0) * gust), A.localOutflow, A.surfaceWind);
+    vesselLeeway(wind, wind.speed, A.windage, A.windDivergence, A.windDrift); A.windHeel = vesselWindHeel(wind, wind.speed, A.heading, A.windHeelScale);
+    return pursuitDownburstTactic(A.downburstResponse, field.intensity, A.weatherTactic);
+  }
+
   updateAgent(A, dt, t, targetX, targetZ, maxSpeed, holdRadius = 0) {
     if (!A.active) return;
     A.decisionT -= dt;
     if (A.decisionT <= 0) {
       A.decisionT = 0.1; A.targetX = targetX; A.targetZ = targetZ;
-      // Three cheap probes keep pursuit boats in navigable water. Decisions run at 10 Hz; motion stays smooth at frame rate.
+      // Five cheap probes keep pursuit boats in navigable water. Decisions run at 10 Hz; motion stays smooth at frame rate.
       let best = 0, score = -1e9;
       for (const da of STEER_PROBES) {
         const h = A.heading + da, x = A.x - Math.sin(h) * 24, z = A.z - Math.cos(h) * 24;
         const depth = this.environment.waterLevel - this.terrain.heightAt(x, z), toward = Math.hypot(targetX - x, targetZ - z);
-        const s = Math.min(4, depth) - Math.abs(da) * 0.7 - toward * 0.006;
+        let s = Math.min(4, depth) - Math.abs(da) * 0.7 - toward * 0.006;
+        if (A.enforcement && A.weatherTactic.avoidance > 0.01 && this.hazards?.downburst?.active) {
+          s += downburstProbeScore(this.hazards.downburst, A.downburstField, x, z, -Math.sin(h), -Math.cos(h), 'john', A.weatherTactic.avoidance, this._downburstProbe);
+        }
         if (depth > 0.55 && s > score) { score = s; best = da; }
       }
       A.choice = best;
@@ -1543,19 +1897,69 @@ export class EncounterDirector {
     const direct = Math.atan2(-(A.targetX - A.x), -(A.targetZ - A.z));
     let dh = Math.atan2(Math.sin(direct - A.heading), Math.cos(direct - A.heading)); dh += A.choice || 0;
     const turn = clamp(dh * 2.1, -1.35, 1.35), d = Math.hypot(A.targetX - A.x, A.targetZ - A.z);
-    const want = maxSpeed * (holdRadius && d < holdRadius ? clamp(d / holdRadius, 0.05, 1) : 1) * (1 - Math.min(0.35, Math.abs(dh) * 0.22));
-    A.speed += (want - A.speed) * (1 - Math.exp(-dt * (want > A.speed ? 0.7 : 2.4))); A.heading += turn * dt;
+    const weatherScale = A.enforcement ? A.weatherTactic.speedScale : 1;
+    const want = maxSpeed * weatherScale * (holdRadius && d < holdRadius ? clamp(d / holdRadius, 0.05, 1) : 1) * (1 - Math.min(0.35, Math.abs(dh) * 0.22));
+    A.want = want; A.turn = turn;
+    A.speed += (want - A.speed) * (1 - Math.exp(-dt * (want > A.speed ? 0.7 : 2.4))); A.heading += (turn + (Number(A.yawKick) || 0)) * dt;
     const fx = -Math.sin(A.heading), fz = -Math.cos(A.heading);
-    const flow = this.currents ? this.currents.flowAt(A.x, A.z, this._flow) : null;
-    A.x += (fx * A.speed + (flow ? flow.x : 0)) * dt; A.z += (fz * A.speed + (flow ? flow.y : 0)) * dt;
-    const y = this.water.waveHeight(A.x, A.z, t); A.mesh.position.set(A.x, y - 0.05, A.z); A.mesh.rotation.set(A.speed * 0.005, A.heading, -turn * A.speed * 0.018, 'YXZ');
+    const flow = this.currents ? this.currents.flowAt(A.x, A.z, this._flow) : null, drift = A.enforcement ? A.windDrift : null;
+    A.x += (fx * A.speed + (flow ? flow.x : 0) + (drift ? drift.x : 0) + (Number(A.shx) || 0)) * dt; A.z += (fz * A.speed + (flow ? flow.y : 0) + (drift ? drift.z : 0) + (Number(A.shz) || 0)) * dt;
+    const y = this.water.waveHeight(A.x, A.z, t), windHeel = A.enforcement ? A.windHeel : 0;
+    A.mesh.position.set(A.x, y - 0.05, A.z); A.mesh.rotation.set(A.speed * 0.005, A.heading, -turn * A.speed * 0.018 + windHeel + (Number(A.heelKick) || 0), 'YXZ');
     if (A.mesh.userData.motor) { A.mesh.userData.motor.rotation.y = -turn * 0.35; A.mesh.userData.motor.userData.prop.rotation.z += dt * (6 + A.speed * 5); }
+    this.decayAgentImpact(A, dt);
+  }
+
+  patrolChannelClosureClear(x, z, courseX, courseZ) {
+    const sideX = -courseZ, sideZ = courseX;
+    for (const probe of CHANNEL_CLOSURE_CLEARANCE_PROBES) {
+      const px = x + sideX * probe[0] + courseX * probe[1], pz = z + sideZ * probe[0] + courseZ * probe[1];
+      if (Math.abs(px) > WORLD_HALF - 90 || Math.abs(pz) > WORLD_HALF - 90 || this.world?.blockedAt(px, pz)) return false;
+      const depth = this.environment.waterLevel - this.terrain.heightAt(px, pz); if (depth < 0.72 || depth > 6.8) return false;
+    }
+    return true;
+  }
+
+  beginPatrolChannelClosure(e, R, heat, visual) {
+    const A = R.agent, C = R.closure, p = this.phys; if (!A.active || !C || C.active || C.cooldown > 0) return false;
+    if (A.weatherTactic?.canBlock === false) { C.cooldown = Math.max(C.cooldown, 1.5); return false; }
+    const distance = Math.hypot(A.x - p.pos.x, A.z - p.pos.y), plan = pursuitChannelClosurePlan(R.role, heat, distance, p.speed, visual, C.plan);
+    if (!plan.eligible) { C.cooldown = 0.75; return false; }
+    const velocity = Math.hypot(p.vel.x, p.vel.y), courseX = velocity > 2.5 ? p.vel.x / velocity : -Math.sin(p.heading), courseZ = velocity > 2.5 ? p.vel.y / velocity : -Math.cos(p.heading);
+    const sideX = -courseZ, sideZ = courseX;
+    for (const offset of CHANNEL_CLOSURE_LATERAL_PROBES) {
+      const lateral = offset * (e.tacticSide < 0 ? -1 : 1), x = p.pos.x + courseX * plan.lead + sideX * lateral, z = p.pos.y + courseZ * plan.lead + sideZ * lateral;
+      if (!this.patrolChannelClosureClear(x, z, courseX, courseZ)) continue;
+      let heading = Math.atan2(-sideX, -sideZ), opposite = heading + Math.PI;
+      if (Math.abs(Math.atan2(Math.sin(opposite - A.heading), Math.cos(opposite - A.heading))) < Math.abs(Math.atan2(Math.sin(heading - A.heading), Math.cos(heading - A.heading)))) heading = opposite;
+      heading = Math.atan2(Math.sin(heading), Math.cos(heading));
+      Object.assign(C, { active: true, holding: false, announced: false, x, z, courseX, courseZ, heading, remaining: plan.setupTimeout, cooldown: 0 });
+      if (this.law) this.law.stats.channelClosures = (this.law.stats.channelClosures || 0) + 1;
+      return true;
+    }
+    C.cooldown = 2.5; return false;
+  }
+
+  endPatrolChannelClosure(R) {
+    const C = R.closure; if (!C) return;
+    C.active = false; C.holding = false; C.announced = false; C.remaining = 0; C.cooldown = Math.max(C.cooldown, C.plan.cooldown || 12);
+  }
+
+  holdPatrolChannel(A, C, dt, t) {
+    const dh = Math.atan2(Math.sin(C.heading - A.heading), Math.cos(C.heading - A.heading)), turn = clamp(dh * 2.2, -1.1, 1.1), want = 0.35;
+    A.targetX = C.x; A.targetZ = C.z; A.decisionT = 0.1; A.speed += (want - A.speed) * (1 - Math.exp(-dt * 3.2)); A.heading += (turn + (Number(A.yawKick) || 0)) * dt;
+    const fx = -Math.sin(A.heading), fz = -Math.cos(A.heading), flow = this.currents ? this.currents.flowAt(A.x, A.z, this._flow) : null, drift = A.enforcement ? A.windDrift : null;
+    A.x += (fx * A.speed + (flow ? flow.x : 0) + (drift ? drift.x : 0) + (Number(A.shx) || 0)) * dt; A.z += (fz * A.speed + (flow ? flow.y : 0) + (drift ? drift.z : 0) + (Number(A.shz) || 0)) * dt;
+    const y = this.water.waveHeight(A.x, A.z, t), windHeel = A.enforcement ? A.windHeel : 0;
+    A.mesh.position.set(A.x, y - 0.05, A.z); A.mesh.rotation.set(A.speed * 0.005, A.heading, -turn * A.speed * 0.018 + windHeel + (Number(A.heelKick) || 0), 'YXZ');
+    if (A.mesh.userData.motor) { A.mesh.userData.motor.rotation.y = -turn * 0.35; A.mesh.userData.motor.userData.prop.rotation.z += dt * (6 + A.speed * 5); }
+    this.decayAgentImpact(A, dt);
   }
 
   addBoatObstacle(A, tag = 'boat', slot = 0) {
     if (!A.active || Math.hypot(A.x - this.phys.pos.x, A.z - this.phys.pos.y) > 70) return;
     const fx = -Math.sin(A.heading), fz = -Math.cos(A.heading);
-    const o = slot ? this.boatObs2 : this.boatObs; o.ax = A.x + fx * 2; o.az = A.z + fz * 2; o.bx = A.x - fx * 2; o.bz = A.z - fz * 2; o.tag = tag; this.obs.push(o);
+    const o = slot ? this.boatObs2 : this.boatObs; o.ax = A.x + fx * 2; o.az = A.z + fz * 2; o.bx = A.x - fx * 2; o.bz = A.z - fz * 2; o.tag = tag; o.agent = A; this.obs.push(o);
   }
 
   addPatrolObstacle(A) {
@@ -1585,8 +1989,8 @@ export class EncounterDirector {
   }
 
   updateDistress(e, dt, t) {
-    const R = this.rigs.distress;
-    if (this.currents && e.state !== 'repair') { const f = this.currents.flowAt(e.x, e.z, this._flow); e.x += f.x * dt * 0.58; e.z += f.y * dt * 0.58; }
+    const R = this.rigs.distress, evacuation = e.variant === 'surge-evacuation';
+    if (this.currents && !evacuation && e.state !== 'repair') { const f = this.currents.flowAt(e.x, e.z, this._flow); e.x += f.x * dt * 0.58; e.z += f.y * dt * 0.58; }
     const d = Math.hypot(e.x - this.phys.pos.x, e.z - this.phys.pos.y);
     R.boat.position.x = e.x; R.boat.position.z = e.z;
     R.boat.position.y = this.water.waveHeight(e.x, e.z, t) - 0.05; R.boat.rotation.z = Math.sin(t * 0.8) * 0.025;
@@ -1594,13 +1998,23 @@ export class EncounterDirector {
     if (R.passenger.visible) animatePerson(R.passenger, t, dt);
     if (R.survivor.userData.waveT <= 0 && d < 130) wave(R.survivor);
     const pulse = 0.5 + 0.5 * Math.sin(t * 7); R.flare.light.intensity = 50 + pulse * 95; R.flare.bulb.scale.setScalar(0.7 + pulse * 0.8);
-    if (d < 120) this.known(e, 'Distress flare', e.recognized ? 'He knows the hull and is waving you in.' : 'A skiff is dead in the water ahead.');
-    if (e.known && e.state !== 'aboard') this.point(e.x, e.z, 'distress flare', '#ff5a36');
-    if (d < 70 && R.boat.visible) { const o = this.boatObs; o.ax = e.x - Math.sin(e.heading) * 2; o.az = e.z - Math.cos(e.heading) * 2; o.bx = e.x + Math.sin(e.heading) * 2; o.bz = e.z + Math.cos(e.heading) * 2; o.tag = 'boat'; this.obs.push(o); }
+    if (d < 120) this.known(e, evacuation ? 'Surge pickup' : 'Distress flare', evacuation ? `${e.campName} has one resident waiting at the dock.` : e.recognized ? 'He knows the hull and is waving you in.' : 'A skiff is dead in the water ahead.');
+    if (e.known && e.state !== 'aboard') this.point(e.x, e.z, evacuation ? `${e.campName} pickup` : 'distress flare', '#ff5a36');
+    if (d < 70 && R.boat.visible) { const o = this.boatObs; o.ax = e.x - Math.sin(e.heading) * 2; o.az = e.z - Math.cos(e.heading) * 2; o.bx = e.x + Math.sin(e.heading) * 2; o.bz = e.z + Math.cos(e.heading) * 2; o.tag = 'boat'; o.agent = null; this.obs.push(o); }
+    if (evacuation && e.state === 'waiting') {
+      const phase = this.environment.hurricane?.phase;
+      if (this.environment.key !== 'hurricane' || phase === 'back-eyewall' || phase === 'trailing-bands') {
+        this.game.toast('Pickup window closed', this.environment.key === 'hurricane' ? `They have gone back inside at ${e.campName}. Backside wind has closed the dock.` : `Water is falling. ${e.campName} has cancelled the pickup.`, 3.8);
+        this.finish(false); return;
+      }
+    }
     if (e.state === 'waiting' && d < 13 && this.phys.speed * MPH < 6 && this.canInteract()) {
-      this.setPrompt('hold steady for a fuel-line repair <i>· F bring the operator aboard</i>');
-      if (this.interact) { e.state = 'repair'; this.clearPrompt(); this.game.toast('Hold her steady', 'He is clearing the fuel line.', 2.4); }
-      else if (this.alternate) this.boardDistress(e);
+      this.setPrompt(evacuation ? `bring the ${e.campName} resident aboard` : 'hold steady for a fuel-line repair <i>· F bring the operator aboard</i>');
+      if (this.interact) {
+        if (evacuation) this.boardDistress(e);
+        else { e.state = 'repair'; this.clearPrompt(); this.game.toast('Hold her steady', 'He is clearing the fuel line.', 2.4); }
+      }
+      else if (!evacuation && this.alternate) this.boardDistress(e);
     }
     if (e.state === 'repair') {
       if (d < 15 && this.phys.speed * MPH < 7) e.hold += dt; else e.hold = Math.max(0, e.hold - dt * 1.5);
@@ -1610,10 +2024,11 @@ export class EncounterDirector {
       const q = e.drop, dd = Math.hypot(q.x - this.phys.pos.x, q.z - this.phys.pos.y);
       this.point(q.x, q.z, q.name, '#7be08a');
       if (dd < 13 && this.phys.speed * MPH < 5 && !this.game.dockJob && !this.game.atBoard) {
-        this.setPrompt(`put the operator ashore at ${q.name}`);
+        this.setPrompt(`put the ${evacuation ? 'resident' : 'operator'} ashore at ${q.name}`);
         if (this.interact) {
           if (this.law) this.law.cool(0.3);
-          this.complete('Safe berth reached', `${q.name} took him in. His skiff can wait for daylight.`, 275, 1.25, 'You carried a stranded operator to a safe berth.', 'distress-berth', q.name);
+          if (evacuation) this.complete('Surge evacuation complete', `The resident from ${e.campName} is ashore at ${q.name}. Nobody goes back until the water drops.`, 420, 2, `You evacuated a resident from ${e.campName} ahead of the backside surge.`, 'surge-evacuation', `${e.campName} to ${q.name}`);
+          else this.complete('Safe berth reached', `${q.name} took him in. His skiff can wait for daylight.`, 275, 1.25, 'You carried a stranded operator to a safe berth.', 'distress-berth', q.name);
         }
       }
     }
@@ -1830,6 +2245,79 @@ export class EncounterDirector {
       if (e.overboard) this.point(e.swimmerX, e.swimmerZ, 'operator in the water', '#ff5a36');
       else this.point(e.x, e.z, e.fireOut ? 'disabled skiff' : 'burning skiff', e.fireOut ? '#7be08a' : '#ff5a36');
     }
+  }
+
+  updateWrangler(e, dt, t) {
+    const p = this.phys, values = this.environment.values, dx = e.gatorX - p.pos.x, dz = e.gatorZ - p.pos.y;
+    let d = Math.hypot(dx, dz), sceneD = Math.hypot(e.workX - p.pos.x, e.workZ - p.pos.y);
+    e.hitCd = Math.max(0, e.hitCd - dt); e.gatorHitCd = Math.max(0, e.gatorHitCd - dt);
+    if (sceneD < 145) this.known(e, 'Nuisance-gator job', 'Big Cal has both hands on a nuisance gator. Half of Cypress Hook is watching from boats.');
+    if (e.known && e.state !== 'loose') this.point(e.workX, e.workZ, e.state === 'secured' ? 'taped gator' : 'gator capture', e.state === 'secured' ? '#7be08a' : '#e7a34d');
+
+    this.addWranglerBoatObstacle(0, e.workX, e.workZ, e.heading);
+    this.addWranglerBoatObstacle(1, e.fireX, e.fireZ, e.fireHeading);
+    this.addWranglerBoatObstacle(2, e.crowdX, e.crowdZ, e.crowdHeading);
+    if (d < 88) { this.wranglerGatorObs.x = e.gatorX; this.wranglerGatorObs.z = e.gatorZ; this.obs.push(this.wranglerGatorObs); }
+
+    if (e.state === 'waiting' || e.state === 'helping') {
+      const wind = Math.max(0, (values.wind || 0) * (this.environment.gust || 1));
+      const unsafeWeather = values.storm > 0.82 || wind > 22 || this.environment.key === 'hurricane' || this.environment.key === 'tropical';
+      if (unsafeWeather) this.releaseWrangler(e, 'weather', false);
+      else {
+        const closing = d > 0.01 ? (p.vel.x * dx + p.vel.y * dz) / d : p.speed;
+        e.wakeThreat = wranglerWakeThreat(d, p.speed, closing, p.airborne); e.wakeRisk = wranglerWakeStep(e.wakeRisk, dt, e.wakeThreat);
+        if (e.wakeRisk >= WRANGLER_WAKE_RELEASE) this.releaseWrangler(e, 'wake', true);
+      }
+    }
+
+    if (e.state === 'waiting' || e.state === 'helping') {
+      e.workerProgress = clamp(e.workerProgress + dt * (0.021 + (e.state === 'helping' ? 0.004 : 0)) * (1 - e.wakeRisk * 0.72));
+      if (this.alternate && d < 42 && this.canInteract()) this.placeWranglerBet(e);
+      if (e.state === 'waiting' && d < 42 && this.canInteract()) {
+        if (p.speed < 2.7 && !p.airborne) {
+          this.setPrompt(`hold the escape cut for Cal <i>· E help${e.bet ? ' · $50 riding' : ' · F $50 says he keeps all ten'}</i>`);
+          if (this.interact) this.beginWranglerAssist(e);
+        } else this.setPrompt('idle outside Cal’s working circle <i>· wake will break his grip</i>', 'SLOW');
+      }
+      if (e.state === 'helping') {
+        e.station = wranglerStationQuality(d, p.speed, p.airborne); e.assist = wranglerAssistStep(e.assist, dt, d, p.speed, p.airborne);
+        if (e.station > 0.35) this.setPrompt(`hold the escape cut <i>· ${Math.round(e.assist * 100)}%${e.bet ? ' · $50 riding' : ' · F side bet'}</i>`, 'IDLE');
+        else if (d < 17) this.setPrompt(`back outside 55 ft and idle <i>· ${Math.round(e.assist * 100)}%</i>`, 'BACK');
+        else this.setPrompt(`close to 55–100 ft and idle <i>· ${Math.round(e.assist * 100)}%</i>`, 'HOLD');
+      }
+      if (e.assist >= 1) this.secureWrangler(e, true);
+      else if (e.workerProgress >= 1) this.secureWrangler(e, false);
+    }
+
+    if (e.state === 'secured') {
+      e.resolveT -= dt; this.updateWranglerRig(e, dt, t);
+      if (e.resolveT <= 0) this.complete('Gator loaded for removal', e.helped ? 'Cal is clear of the water. The work skiff remembers who held the cut.' : 'The tape held. Cypress Hook is already improving the story.', 0, 0, '', e.outcome);
+      return;
+    }
+
+    if (e.state === 'loose') {
+      e.releaseT += dt; e.resolveT -= dt;
+      const target = e.releaseT < 3.1 ? e.lungeHeading : e.escapeHeading;
+      const dh = Math.atan2(Math.sin(target - e.gatorHeading), Math.cos(target - e.gatorHeading));
+      e.gatorHeading += clamp(dh, -dt * (e.releaseT < 3.1 ? 1.65 : 0.82), dt * (e.releaseT < 3.1 ? 1.65 : 0.82));
+      const want = e.releaseT < 3.1 ? 3.7 : 2.15; e.gatorSpeed += (want - e.gatorSpeed) * (1 - Math.exp(-dt * 2.1));
+      const gx = -Math.sin(e.gatorHeading), gz = -Math.cos(e.gatorHeading), flow = this.currents ? this.currents.flowAt(e.gatorX, e.gatorZ, this._flow) : null;
+      e.gatorX += (gx * e.gatorSpeed + (flow ? flow.x * 0.35 : 0)) * dt; e.gatorZ += (gz * e.gatorSpeed + (flow ? flow.y * 0.35 : 0)) * dt;
+      d = Math.hypot(e.gatorX - p.pos.x, e.gatorZ - p.pos.y);
+      if (!e.lungeHit && e.releaseT < 3.4 && d < 2.8) {
+        const hx = p.pos.x - e.gatorX, hz = p.pos.y - e.gatorZ, n = Math.hypot(hx, hz) || 1; e.lungeHit = true;
+        p.vel.x += hx / n * 2.4; p.vel.y += hz / n * 2.4; p.vy = Math.max(p.vy, 1.25); p.rollVel += (Math.random() < 0.5 ? -1 : 1) * 2.2;
+        p.hit = Math.max(p.hit, 4.8); p.hitNormal.set(hx / n, hz / n); p.hitTag = 'gator';
+        if (this.condition) this.condition.damage(0.75, 0.08); this.audio.thud(1.25); this.game.shake = Math.max(this.game.shake, 0.62);
+        this.game.toast('Gator under the chine', 'It hit the hull once and turned for the deep water.', 3.2);
+      }
+      this.updateWranglerRig(e, dt, t);
+      if (e.known) this.point(e.gatorX, e.gatorZ, 'loose gator', '#ff744f');
+      if (e.resolveT <= 0) this.complete('Gator loose in the cut', e.playerCaused ? 'Cal has the work skiff. The incident report has your wake.' : 'The weather ended the capture. Cal is counting hands before he tries again.', 0, 0, '', e.outcome);
+      return;
+    }
+
+    this.updateWranglerRig(e, dt, t);
   }
 
   updateManatee(e, dt, t) {
@@ -2079,6 +2567,153 @@ export class EncounterDirector {
     this.game.save.encounters.patrol = (this.game.save.encounters.patrol || 0) + 1; this.remember(seized ? 'patrol-seizure' : 'patrol-cited'); this.game.persist(); this.finish(true);
   }
 
+  resetPatrolSight() {
+    const sight = this._patrolSight || (this._patrolSight = {});
+    Object.assign(sight, { timer: 0, clear: true, held: true, inRange: true, directHeld: true, beamHeld: false, beamUnits: 0, blockedFor: 0, clearFor: 0, occluded: false, checkedUnits: 0, samples: 0 });
+  }
+
+  resetPatrolSound() {
+    const sound = this._patrolSound || (this._patrolSound = {});
+    Object.assign(sound, { timer: 0, hornT: 0, hornProlonged: false, contact: false, source: '', range: 0, distance: Infinity, engineNoise: 0, fixAge: Infinity, fixX: 0, fixZ: 0, uncertainty: 0, reportCd: 0 });
+  }
+
+  resetPatrolSearch() {
+    const search = this._patrolSearch || (this._patrolSearch = { label: 'FWC last-fix area', color: '#5aa7ff' });
+    search.active = false; search.x = 0; search.z = 0; search.r = 0;
+  }
+
+  markPatrolSearch(e, heat) {
+    const search = this._patrolSearch || (this._patrolSearch = { label: 'FWC last-fix area', color: '#5aa7ff' });
+    if (!e || e.state !== 'pursuit' || e.visual) { search.active = false; return null; }
+    const sound = this._patrolSound || {};
+    search.active = true; search.x = e.lastKnownX; search.z = e.lastKnownZ;
+    search.r = pursuitSearchRadius(heat, e.lostT, e.soundContact, sound.uncertainty, sound.fixAge);
+    emitMapMarker(this.game, search.x, search.z, 'search', search.color, 0, false, '', false, false, false, true, search.r);
+    return search;
+  }
+
+  pursuitSearchArea() {
+    return this._patrolSearch?.active ? this._patrolSearch : null;
+  }
+
+  notePlayerHorn(prolonged = false) {
+    const e = this.active; if (!e || e.type !== 'patrol' || e.state !== 'pursuit') return false;
+    const sound = this._patrolSound || (this._patrolSound = {});
+    sound.hornT = Math.max(Number(sound.hornT) || 0, prolonged ? 4.6 : 0.6); sound.hornProlonged = Boolean(prolonged || (sound.hornProlonged && sound.hornT > 0)); sound.timer = 0;
+    return true;
+  }
+
+  reportPatrolSoundContact(e, source) {
+    const horn = source !== 'engine', detail = horn
+      ? 'The patrol line has a rough bearing, not visual. Stay quiet and move off that cut.'
+      : 'They have a rough bearing, not visual. Idle the fan and stay behind cover.';
+    this.game.toast(horn ? 'Horn gave away the cut' : 'FWC heard the prop', detail, 3);
+    this.radio?.transmit({
+      channel: 'FWC TAC', speaker: 'FWC 27 · WARDEN SOTO',
+      text: horn ? 'Horn contact behind the bank. Shift the search to that cut; no visual.' : 'Prop noise behind the bank. Work that cut from the rough bearing; no visual.',
+      priority: 3, key: horn ? 'patrol-horn-contact' : 'patrol-engine-contact', cooldown: horn ? 11 : 8,
+    });
+    const sound = this._patrolSound; sound.reportCd = horn ? 12 : 9;
+    if (this.law) this.law.stats.soundContacts = (this.law.stats.soundContacts || 0) + 1;
+  }
+
+  patrolSurfaceSound(e, dt, heat, visual = false) {
+    const sound = this._patrolSound || (this._patrolSound = {}), step = Math.max(0, Number(dt) || 0);
+    sound.hornT = Math.max(0, (Number(sound.hornT) || 0) - step); sound.reportCd = Math.max(0, (Number(sound.reportCd) || 0) - step);
+    sound.fixAge = Number.isFinite(sound.fixAge) ? Math.min(999, sound.fixAge + step) : Infinity;
+    if (visual) { sound.contact = false; sound.source = ''; sound.range = 0; sound.timer = 0; return false; }
+    sound.timer = Math.max(-0.25, (Number(sound.timer) || 0) - step); if (sound.timer > 0) return Boolean(sound.contact);
+    sound.timer = 0.25;
+
+    const values = this.environment?.values || {}, banked = Boolean(e.surfaceOccluded), nearest = this.patrolNearestDistance();
+    const engineNoise = pursuitEngineNoise(this.phys.rpm, this.phys.speed, this.phys.throttle, this.phys.wet);
+    const engineRange = pursuitHearingRange(engineNoise, heat, values.wind, values.rain, values.storm, banked);
+    const hornActive = sound.hornT > 0, hornRange = hornActive ? pursuitHornRange(sound.hornProlonged, values.wind, values.rain, values.storm, banked) : 0;
+    const hornHeard = hornActive && pursuitSoundContact(nearest, hornRange), engineHeard = pursuitSoundContact(nearest, engineRange), contact = hornHeard || engineHeard;
+    const source = hornHeard ? (sound.hornProlonged ? 'fog horn' : 'horn') : engineHeard ? 'engine' : '';
+    const range = hornHeard ? hornRange : engineHeard ? engineRange : Math.max(hornRange, engineRange);
+    sound.distance = nearest; sound.range = range; sound.engineNoise = engineNoise;
+
+    if (contact) {
+      const signal = clamp(1 - nearest / Math.max(1, range)), refresh = !sound.contact || sound.source !== source || sound.fixAge >= (source === 'engine' ? 1.15 : 1.8);
+      if (refresh) {
+        const uncertainty = pursuitSoundUncertainty(source, signal), interval = source === 'engine' ? 1.15 : 1.8;
+        const sample = Math.floor((Number(e.pursuit) || 0) / interval), phase = sample * 2.399963 + wantedLevel(heat) * 0.91 + (source === 'engine' ? 0.4 : 2.2);
+        sound.uncertainty = uncertainty; sound.fixX = this.phys.pos.x + Math.cos(phase) * uncertainty; sound.fixZ = this.phys.pos.y + Math.sin(phase) * uncertainty; sound.fixAge = 0;
+        e.lastKnownX = sound.fixX; e.lastKnownZ = sound.fixZ;
+      }
+      if (sound.reportCd <= 0 && (Number(e.lostT) || 0) > 0.3) this.reportPatrolSoundContact(e, source);
+    }
+    sound.contact = contact; sound.source = source;
+    return contact;
+  }
+
+  patrolAgentWithinVisualRange(agent, lostDistance, searchlight) {
+    if (!agent?.active) return false;
+    const player = this.phys.pos, distance = Math.hypot(agent.x - player.x, agent.z - player.y);
+    if (!Number.isFinite(distance)) return false;
+    if (distance <= lostDistance) return true;
+    const values = this.environment?.values || {};
+    return pursuitSearchlightVisualHeld(distance, 0, this.environment?.restrictedVisibility, values.storm, searchlight?.plan?.active);
+  }
+
+  patrolAgentHasVisual(agent, lostDistance, sight, searchlight) {
+    if (!agent?.active) return false;
+    const player = this.phys.pos, distance = Math.hypot(agent.x - player.x, agent.z - player.y);
+    if (!Number.isFinite(distance)) return false;
+    const direct = distance <= lostDistance, plan = searchlight?.plan, values = this.environment?.values || {};
+    const playerBearing = Math.atan2(-(player.x - agent.x), -(player.y - agent.z));
+    const bearingError = plan ? Math.atan2(Math.sin(playerBearing - plan.worldHeading), Math.cos(playerBearing - plan.worldHeading)) : Infinity;
+    const beam = pursuitSearchlightVisualHeld(distance, bearingError, this.environment?.restrictedVisibility, values.storm, plan?.active);
+    if (!direct && !beam) return false;
+    sight.checkedUnits++; sight.samples += Math.max(0, pursuitSightSampleCount(distance) - 1);
+    if (beam) sight.beamUnits++;
+    const clear = pursuitSurfaceLineOfSight(this.terrain, agent.x, agent.z, player.x, player.y, this.environment.waterLevel);
+    if (clear && direct) sight.directHeld = true;
+    if (clear && beam) sight.beamHeld = true;
+    return clear;
+  }
+
+  patrolSurfaceVisual(dt, lostDistance) {
+    const sight = this._patrolSight || (this._patrolSight = {}), main = this.rigs.patrol;
+    let inRange = this.patrolAgentWithinVisualRange(main.agent, lostDistance, main.searchlight);
+    if (!inRange) for (const unit of this.rigs.patrolBackups) if (this.patrolAgentWithinVisualRange(unit.agent, lostDistance, unit.searchlight)) { inRange = true; break; }
+    if (!inRange) {
+      sight.inRange = false; sight.held = false; sight.directHeld = false; sight.beamHeld = false; sight.beamUnits = 0; sight.blockedFor = 0; sight.clearFor = 0; sight.occluded = false;
+      return false;
+    }
+    if (!sight.inRange) sight.timer = 0;
+    sight.inRange = true; sight.timer = Math.max(-0.2, (Number(sight.timer) || 0) - Math.max(0, dt));
+    if (sight.timer <= 0) {
+      sight.checkedUnits = 0; sight.samples = 0; sight.directHeld = false; sight.beamHeld = false; sight.beamUnits = 0;
+      sight.clear = this.patrolAgentHasVisual(main.agent, lostDistance, sight, main.searchlight);
+      if (!sight.clear) for (const unit of this.rigs.patrolBackups) if (this.patrolAgentHasVisual(unit.agent, lostDistance, sight, unit.searchlight)) { sight.clear = true; break; }
+      sight.occluded = sight.checkedUnits > 0 && !sight.clear; sight.timer = 0.2;
+    }
+    if (sight.clear) {
+      sight.blockedFor = Math.max(0, (Number(sight.blockedFor) || 0) - dt * 2); sight.clearFor = (Number(sight.clearFor) || 0) + dt;
+      if (sight.held || sight.clearFor >= 0.12) sight.held = true;
+    } else {
+      sight.clearFor = 0; sight.blockedFor = (Number(sight.blockedFor) || 0) + dt;
+      if (sight.blockedFor >= 0.32) sight.held = false;
+    }
+    return Boolean(sight.held);
+  }
+
+  reportPatrolVisualTransition(e, previous, current) {
+    if (previous === current || e.pursuit < 0.8 || e.sightCallCd > 0) return;
+    e.sightCallCd = current ? 8 : 11;
+    if (!current) {
+      const bank = Boolean(e.surfaceOccluded), detail = bank ? 'The bank is between you and the patrol line. They are working from the last fix.' : 'The surface units are working from your last reported position.';
+      this.game.toast('FWC visual broken', detail, 3);
+      this.radio?.transmit({ channel: 'FWC TAC', speaker: 'FWC 27 · WARDEN SOTO', text: bank ? 'Visual broken behind the bank. Hold the last cut and work from Tower Boat’s last fix.' : 'Visual broken. Surface units hold the last fix and search the adjoining cuts.', priority: 3, key: 'patrol-visual-broken', cooldown: 10 });
+    } else if (e.lostT > 0.35) {
+      const beam = Boolean(e.surfaceVisual && this._patrolSight.beamHeld);
+      this.game.toast('FWC visual reacquired', beam ? 'A searchlight found the hull again.' : 'A surface unit has the hull again.', 2.4);
+      this.radio?.transmit({ channel: 'FWC TAC', speaker: 'FWC 27 · WARDEN SOTO', text: beam ? 'Searchlight has the hull. Move on the beam.' : 'Tower Boat reacquired. Surface line is back on the hull.', priority: 3, key: 'patrol-visual-reacquired', cooldown: 8 });
+    }
+  }
+
   patrolNearestDistance() {
     const p = this.phys, main = this.rigs.patrol.agent; let nearest = main.active ? Math.hypot(main.x - p.pos.x, main.z - p.pos.y) : Infinity;
     for (const R of this.rigs.patrolBackups) if (R.agent.active) nearest = Math.min(nearest, Math.hypot(R.agent.x - p.pos.x, R.agent.z - p.pos.y));
@@ -2087,10 +2722,38 @@ export class EncounterDirector {
 
   pursuitSnapshot() {
     const e = this.active?.type === 'patrol' && this.active.state === 'pursuit' ? this.active : null;
+    const closure = this.rigs.patrolBackups[1]?.closure;
+    const mainLight = this.rigs.patrol.searchlight, marineLight = this.rigs.patrolBackups[0]?.searchlight, shallowLight = this.rigs.patrolBackups[1]?.searchlight;
+    const lightResources = surfaceSearchlightResourceStats();
     const finite = value => Number.isFinite(value) ? Math.round(value * 10) / 10 : null;
+    const weatherUnit = (callSign, unit) => ({
+      callSign, active: Boolean(e && unit.active), response: finite(unit.downburstResponse), load: finite(unit.weatherTactic?.load),
+      localOutflow: finite(unit.downburstField?.speed), wind: finite(unit.surfaceWind?.speed), leeway: finite(unit.windDrift?.speed), heel: finite(unit.windHeel),
+      ramSafe: unit.weatherTactic?.canRam !== false, blockSafe: unit.weatherTactic?.canBlock !== false,
+    });
     return {
       active: Boolean(e), wantedLevel: wantedLevel(this.law?.attention || 0), surfaceUnits: e ? e.units : 0,
-      sharedVisual: Boolean(e?.visual), surfaceVisual: Boolean(e?.surfaceVisual), lostFor: finite(e?.lostT),
+      sharedVisual: Boolean(e?.visual), surfaceVisual: Boolean(e?.surfaceVisual), surfaceOccluded: Boolean(e?.surfaceOccluded), lostFor: finite(e?.lostT),
+      surfaceSight: { held: Boolean(this._patrolSight.held), directHeld: Boolean(this._patrolSight.directHeld), beamHeld: Boolean(this._patrolSight.beamHeld), beamUnits: this._patrolSight.beamUnits, checkedUnits: this._patrolSight.checkedUnits, terrainSamples: this._patrolSight.samples },
+      soundContact: {
+        active: Boolean(e?.soundContact), source: e ? this._patrolSound.source : '', engineNoise: e ? finite(this._patrolSound.engineNoise) : null,
+        range: e ? finite(this._patrolSound.range) : null, distance: e ? finite(this._patrolSound.distance) : null,
+        uncertainty: e ? finite(this._patrolSound.uncertainty) : null, fixAge: e ? finite(this._patrolSound.fixAge) : null,
+      },
+      searchArea: { active: Boolean(e && this._patrolSearch.active), radius: e ? finite(this._patrolSearch.r) : null, centerX: e ? finite(this._patrolSearch.x) : null, centerZ: e ? finite(this._patrolSearch.z) : null },
+      surfaceSearch: [
+        { callSign: 'FWC 27', active: Boolean(e && this.rigs.patrol.agent.search?.active), sector: this.rigs.patrol.agent.search?.sector || '', targetX: finite(this.rigs.patrol.agent.search?.targetX), targetZ: finite(this.rigs.patrol.agent.search?.targetZ), radius: finite(this.rigs.patrol.agent.search?.radius), areaRadius: finite(this.rigs.patrol.agent.search?.areaRadius) },
+        ...this.rigs.patrolBackups.map((unit, index) => ({ callSign: index ? 'Shallow Water 4' : 'Marine 12', active: Boolean(e && unit.agent.search?.active), sector: unit.agent.search?.sector || '', targetX: finite(unit.agent.search?.targetX), targetZ: finite(unit.agent.search?.targetZ), radius: finite(unit.agent.search?.radius), areaRadius: finite(unit.agent.search?.areaRadius) })),
+      ],
+      surfaceWeather: [
+        weatherUnit('FWC 27', this.rigs.patrol.agent), weatherUnit('Marine 12', this.rigs.patrolBackups[0].agent), weatherUnit('Shallow Water 4', this.rigs.patrolBackups[1].agent),
+      ],
+      searchlights: {
+        activeBeams: e ? Number(Boolean(mainLight?.active)) + Number(Boolean(marineLight?.active)) + Number(Boolean(shallowLight?.active)) : 0,
+        worldLights: e && mainLight?.plan.worldLight ? 1 : 0, sharedGeometries: lightResources.geometries,
+        sharedMaterials: lightResources.materials, textures: lightResources.textures, geometryBytes: lightResources.geometryBytes,
+      },
+      channelClosure: { active: Boolean(e && closure?.active), holding: Boolean(e && closure?.holding), cooldown: e && closure ? finite(closure.cooldown) : null },
       aviation: {
         requested: Boolean(e?.aviationRequested), active: Boolean(e?.aviationActive), directVisual: Boolean(e?.aviationVisual), beamActive: Boolean(e?.aviationBeamActive),
         dueIn: e?.aviationRequested && !e.aviationActive ? finite(Math.max(0, e.aviationDue - e.pursuit)) : null,
@@ -2101,11 +2764,13 @@ export class EncounterDirector {
   }
 
   attemptPatrolRam(e, R, role, distance, heat, stars) {
-    const A = R.agent, p = this.phys; if (!pursuitUnitCanRam(role, heat) || distance >= 6.4 || e.contactCd > 0 || A.speed <= 5) return false;
+    const A = R.agent, p = this.phys; if (!pursuitUnitCanRam(role, heat) || A.weatherTactic?.canRam === false || distance >= 6.4 || e.contactCd > 0 || A.speed <= 5) return false;
     const dx = p.pos.x - A.x, dz = p.pos.y - A.z, dd = Math.hypot(dx, dz) || 1, nx = dx / dd, nz = dz / dd;
     const afx = -Math.sin(A.heading), afz = -Math.cos(A.heading), closing = afx * nx + afz * nz; if (closing <= 0.28) return false;
+    const relativeClosing = Math.max(0, A.speed * closing - (p.vel.x * nx + p.vel.y * nz));
     const backup = role > 0, force = backup ? 1.2 + stars * 0.34 : 1.65 + stars * 0.42, cross = afx * nz - afz * nx, impactSide = cross < 0 ? -1 : 1;
     e.contactCd = Math.max(backup ? 2.6 : 2.2, 4.25 - stars * 0.3); e.ramCd = Math.max(e.ramCd, 0.8); A.speed *= backup ? 0.72 : 0.68;
+    this.impactAgent(A, Math.max(2.2, relativeClosing), nx, nz, backup ? 0.32 : 0.36, 1.8);
     p.vel.x += nx * force + afx * (backup ? 0.62 : 0.75); p.vel.y += nz * force + afz * (backup ? 0.62 : 0.75); p.hit = Math.max(p.hit, (backup ? 3.8 : 4.1) + stars * 0.52); p.hitNormal.set(nx, nz); p.hitTag = 'boat';
     p.angVel += impactSide * (backup ? 1.05 + stars * 0.2 : 1.25 + stars * 0.25); p.rollVel += impactSide * (backup ? 1.18 + stars * 0.2 : 1.4 + stars * 0.24); this.game.shake = Math.max(this.game.shake, (backup ? 0.26 : 0.3) + stars * 0.04);
     if (this.condition) this.condition.damage((backup ? 0.26 : 0.35) + stars * 0.16, backup ? 0.04 : 0.06);
@@ -2119,15 +2784,42 @@ export class EncounterDirector {
   }
 
   updatePatrolBackup(e, R, dt, t, heat, stars, visual) {
-    const A = R.agent, p = this.phys; if (!A.active) return Infinity;
+    const A = R.agent, p = this.phys; if (!A.active) { this.hidePatrolSearchlight(R); return Infinity; }
+    if (visual && A.search) A.search.active = false;
+    const weather = this.updatePatrolDownburst(A, dt), C = R.closure; if (C) C.cooldown = Math.max(0, C.cooldown - dt);
+    if (C?.active && weather?.canBlock === false) this.endPatrolChannelClosure(R);
     let d = Math.hypot(A.x - p.pos.x, A.z - p.pos.y), tx, tz, maxSpeed, holdRadius = 0;
+    if (C?.active) {
+      C.remaining -= dt;
+      const toX = C.x - p.pos.x, toZ = C.z - p.pos.y, along = toX * C.courseX + toZ * C.courseZ, lateral = Math.abs(toX * -C.courseZ + toZ * C.courseX);
+      if (!visual || stars < 4 || C.remaining <= 0 || along < -11 || (along < 35 && lateral > 68)) this.endPatrolChannelClosure(R);
+    }
+    if (R.role === 2 && !C?.active && C?.cooldown <= 0 && stars >= 4 && visual) this.beginPatrolChannelClosure(e, R, heat, visual);
+    if (C?.active) {
+      let targetDistance = Math.hypot(C.x - A.x, C.z - A.z);
+      if (C.holding && targetDistance > 14) C.holding = false;
+      if (C.holding) this.holdPatrolChannel(A, C, dt, t);
+      else {
+        this.updateAgent(A, dt, t, C.x, C.z, C.plan.approachSpeed, 18); targetDistance = Math.hypot(C.x - A.x, C.z - A.z);
+        if (targetDistance < 7.5) {
+          C.holding = true; C.remaining = C.plan.duration;
+          if (!C.announced) { C.announced = true; this.audio.horn(0.24); this.game.toast('FWC roadblock ahead', 'Shallow Water Four is broadside on your line. Change cut or stop.', 3); }
+        }
+      }
+      this.updatePatrolSearchlight(e, R, t, visual, p.pos.x, p.pos.y);
+      d = Math.hypot(A.x - p.pos.x, A.z - p.pos.y); this.addPatrolBackupObstacle(A, R.index); this.markPatrolBackup(A, R.index);
+      const blink = Math.floor((t + R.index * 0.11) * 5.2) % 2; R.blueBulb.visible = Boolean(blink); R.redBulb.visible = !blink;
+      if (!C.holding) this.attemptPatrolRam(e, R, R.role, d, heat, stars);
+      return d;
+    }
     if (visual) {
       const tactic = pursuitTactic(R.role, heat, d, e.tacticSide, A.tactic), pfx = -Math.sin(p.heading), pfz = -Math.cos(p.heading), prx = Math.cos(p.heading), prz = -Math.sin(p.heading);
       tx = p.pos.x + p.vel.x * tactic.lead + pfx * tactic.fore + prx * tactic.side; tz = p.pos.y + p.vel.y * tactic.lead + pfz * tactic.fore + prz * tactic.side;
       maxSpeed = Math.min(19.5, pursuitSpeed(heat, p.speed) * (R.role === 1 ? 1.025 : 0.985));
     } else {
-      const phase = e.pursuit * (0.2 + R.index * 0.035) + R.index * Math.PI, radius = 18 + stars * 4.5 + R.index * 8;
-      tx = e.lastKnownX + Math.cos(phase) * radius; tz = e.lastKnownZ + Math.sin(phase) * radius; maxSpeed = 8.6 + stars * 0.65; holdRadius = 10;
+      const sound = this._patrolSound || {}, search = A.search;
+      if (!search.active || A.decisionT <= dt) pursuitSearchPlan(R.role, heat, e.lostT, e.lastKnownHeading, e.pursuit, e.lastKnownX, e.lastKnownZ, e.soundContact, sound.uncertainty, sound.fixAge, search);
+      tx = search.targetX; tz = search.targetZ; maxSpeed = search.speed; holdRadius = search.holdRadius;
     }
     const lead = this.rigs.patrol.agent;
     if (lead.active && lead !== A) {
@@ -2139,33 +2831,42 @@ export class EncounterDirector {
       const sx = A.x - other.x, sz = A.z - other.z, separation = Math.hypot(sx, sz);
       if (separation < 16) { const n = separation || 1, push = (16 - separation) * 1.4; tx += sx / n * push; tz += sz / n * push; }
     }
-    this.updateAgent(A, dt, t, tx, tz, maxSpeed, holdRadius); d = Math.hypot(A.x - p.pos.x, A.z - p.pos.y); this.addPatrolBackupObstacle(A, R.index); this.markPatrolBackup(A, R.index);
+    this.updateAgent(A, dt, t, tx, tz, maxSpeed, holdRadius);
+    this.updatePatrolSearchlight(e, R, t, visual, visual ? p.pos.x : A.search?.targetX ?? tx, visual ? p.pos.y : A.search?.targetZ ?? tz);
+    d = Math.hypot(A.x - p.pos.x, A.z - p.pos.y); this.addPatrolBackupObstacle(A, R.index); this.markPatrolBackup(A, R.index);
     const blink = Math.floor((t + R.index * 0.11) * 5.2) % 2; R.blueBulb.visible = Boolean(blink); R.redBulb.visible = !blink;
     this.attemptPatrolRam(e, R, R.role, d, heat, stars); return d;
   }
 
   updatePatrol(e, dt, t) {
     const A = this.rigs.patrol.agent, p = this.phys; let d = Math.hypot(A.x - p.pos.x, A.z - p.pos.y);
+    this.updatePatrolDownburst(A, dt);
     e.contactCd = Math.max(0, e.contactCd - dt); e.ramCd = Math.max(0, e.ramCd - dt);
+    e.sightCallCd = Math.max(0, (Number(e.sightCallCd) || 0) - dt); const priorSharedVisual = Boolean(e.visual);
     const heat = this.law?.attention || (e.wanted ? 1.2 : 0), stars = wantedLevel(heat);
     let tx = p.pos.x + p.vel.x * 1.5, tz = p.pos.y + p.vel.y * 1.5, maxSpeed = 8.4, holdRadius = e.state === 'check' ? 24 : 0;
     if (e.state === 'pursuit') {
       e.pursuit += dt; e.tacticT -= dt; this.schedulePatrolBackups(e, heat, t);
       if (e.tacticT <= 0) { e.tacticT = 4.5 + Math.random() * 3.5; e.tacticSide *= -1; }
-      const lostDistance = pursuitLostDistance(heat, this.environment.restrictedVisibility || 0, this.environment.values.storm || 0);
-      const surfaceVisual = pursuitVisualHeld(this.patrolNearestDistance(), lostDistance), visual = this.updatePatrolAviation(e, dt, t, surfaceVisual, heat);
-      e.surfaceVisual = surfaceVisual;
-      if (visual) { e.lastKnownX = p.pos.x; e.lastKnownZ = p.pos.y; }
+      const lostDistance = pursuitLostDistance(heat, this.environment.restrictedVisibility || 0, this.environment.values.storm || 0, this.environment.night || 0, this.environment.moonlight || 0);
+      const surfaceVisual = this.patrolSurfaceVisual(0, lostDistance), visual = this.updatePatrolAviation(e, dt, t, surfaceVisual, heat);
+      e.surfaceVisual = surfaceVisual; e.surfaceOccluded = Boolean(this._patrolSight.occluded);
+      e.soundContact = this.patrolSurfaceSound(e, dt, heat, visual);
+      if (visual) { e.lastKnownX = p.pos.x; e.lastKnownZ = p.pos.y; e.lastKnownHeading = p.heading; if (A.search) A.search.active = false; }
       if (visual) {
         const tactic = pursuitTactic(0, heat, d, e.tacticSide, A.tactic), pfx = -Math.sin(p.heading), pfz = -Math.cos(p.heading), prx = Math.cos(p.heading), prz = -Math.sin(p.heading);
         tx = p.pos.x + p.vel.x * tactic.lead + pfx * tactic.fore + prx * tactic.side; tz = p.pos.y + p.vel.y * tactic.lead + pfz * tactic.fore + prz * tactic.side;
         maxSpeed = pursuitSpeed(heat, p.speed); holdRadius = 0;
       } else {
-        const phase = e.pursuit * 0.17, radius = 14 + stars * 3.6; tx = e.lastKnownX + Math.cos(phase) * radius; tz = e.lastKnownZ + Math.sin(phase) * radius; maxSpeed = 8.4 + stars * 0.68; holdRadius = 10;
+        const sound = this._patrolSound || {}, search = A.search;
+        if (!search.active || A.decisionT <= dt) pursuitSearchPlan(0, heat, e.lostT, e.lastKnownHeading, e.pursuit, e.lastKnownX, e.lastKnownZ, e.soundContact, sound.uncertainty, sound.fixAge, search);
+        tx = search.targetX; tz = search.targetZ; maxSpeed = search.speed; holdRadius = search.holdRadius;
       }
       e.visual = visual;
     }
-    this.updateAgent(A, dt, t, tx, tz, maxSpeed, holdRadius); d = Math.hypot(A.x - p.pos.x, A.z - p.pos.y); this.addPatrolObstacle(A);
+    this.updateAgent(A, dt, t, tx, tz, maxSpeed, holdRadius);
+    this.updatePatrolSearchlight(e, this.rigs.patrol, t, Boolean(e.visual), e.visual ? p.pos.x : A.search?.targetX ?? tx, e.visual ? p.pos.y : A.search?.targetZ ?? tz);
+    d = Math.hypot(A.x - p.pos.x, A.z - p.pos.y); this.addPatrolObstacle(A);
     const blink = Math.floor(t * 5) % 2; this.rigs.patrol.blue.light.intensity = blink ? 80 : 5; this.rigs.patrol.red.light.intensity = blink ? 5 : 80;
     if (d < 150) this.known(e, e.wanted ? 'FWC intercept' : 'FWC patrol', e.wanted ? 'They matched the hull. Idle and let them come alongside.' : 'Blue lights. They want the prop at idle.');
     if (e.known) this.point(A.x, A.z, 'FWC patrol', '#5aa7ff');
@@ -2197,14 +2898,21 @@ export class EncounterDirector {
         if (unitDistance < nearest) { nearest = unitDistance; sirenX = R.agent.x; sirenZ = R.agent.z; }
       }
       this.audio.patrolSiren(pursuitSirenLevel(nearest, heat, true), heat, sirenX, sirenZ);
-      const lostDistance = pursuitLostDistance(heat, this.environment.restrictedVisibility || 0, this.environment.values.storm || 0), surfaceVisual = pursuitVisualHeld(nearest, lostDistance), visual = surfaceVisual || Boolean(e.aviationVisual);
-      e.surfaceVisual = surfaceVisual;
-      e.visual = visual; if (visual) { e.lastKnownX = p.pos.x; e.lastKnownZ = p.pos.y; }
+      const lostDistance = pursuitLostDistance(heat, this.environment.restrictedVisibility || 0, this.environment.values.storm || 0, this.environment.night || 0, this.environment.moonlight || 0), surfaceVisual = this.patrolSurfaceVisual(dt, lostDistance), visual = surfaceVisual || Boolean(e.aviationVisual);
+      e.surfaceVisual = surfaceVisual; e.surfaceOccluded = Boolean(this._patrolSight.occluded);
+      e.visual = visual; e.soundContact = !visual && Boolean(e.soundContact);
+      if (visual) {
+        e.lastKnownX = p.pos.x; e.lastKnownZ = p.pos.y; e.lastKnownHeading = p.heading;
+        if (A.search) A.search.active = false;
+        for (const unit of this.rigs.patrolBackups) if (unit.agent.search) unit.agent.search.active = false;
+      }
+      this.law?.setPursuitVisual?.(visual); this.reportPatrolVisualTransition(e, priorSharedVisual, visual);
       const stopped = nearest < 19 && p.speed * MPH < 4.5 && !p.airborne && p.wipeT <= 0;
       e.surrender = stopped ? e.surrender + dt : Math.max(0, e.surrender - dt * 1.4);
       if (stopped) this.setPrompt(`hold idle <i>· ${e.units > 1 ? 'patrol line alongside' : 'patrol alongside'} · ${Math.max(0, 4 - e.surrender).toFixed(1)}s</i>`, 'STOP');
       if (e.surrender >= 4) { this.resolvePatrolStop(e); return; }
-      e.lostT = visual ? Math.max(0, e.lostT - dt * 2.2) : e.lostT + dt;
+      e.lostT = pursuitLostProgress(e.lostT, dt, visual, e.soundContact);
+      this.markPatrolSearch(e, heat);
       if (canEscapePursuit(heat, e.pursuit, e.lostT, this.environment.restrictedVisibility || 0)) {
         if (this.law) this.law.escaped();
         this.complete('Visual broken', 'The patrol line lost the hull, but FWC kept the wanted report open.', 0, 0, '', 'patrol-escaped');
@@ -2378,7 +3086,7 @@ export class EncounterDirector {
   canInteract() { return !this.game.dockCamp && !this.game.dockJob && !this.game.atBoard; }
 
   update(dt, t, enabled = true) {
-    this.enabled = enabled; this.obs.length = 0;
+    this.enabled = enabled; this.obs.length = 0; this.syncStormEvacuationPassage();
     this.audio.helicopter(0);
     this.audio.patrolSiren(0);
     this.updateSpills(this.game.paused ? 0 : dt);
@@ -2397,6 +3105,7 @@ export class EncounterDirector {
     else if (e.type === 'airrescue') this.updateAirRescue(e, dt, t);
     else if (e.type === 'grounding') this.updateGrounding(e, dt, t);
     else if (e.type === 'fire') this.updateFire(e, dt, t);
+    else if (e.type === 'wrangler') this.updateWrangler(e, dt, t);
     else if (e.type === 'manatee') this.updateManatee(e, dt, t);
     else if (e.type === 'spotlight') this.updateSpotlight(e, dt, t);
     else if (e.type === 'race') this.updateRace(e, dt, t);
@@ -2411,6 +3120,26 @@ export class EncounterDirector {
     this.interact = false; this.alternate = false;
   }
 
+  updateOutboardAudio(audible = true) {
+    this.obLevel = 0; this.obPitch = 1; this.obX = 0; this.obZ = 0;
+    if (!audible) return;
+    for (const A of this.agents) {
+      if (!A.active || A.speed <= 0.05) continue;
+      const d = Math.hypot(A.x - this.phys.pos.x, A.z - this.phys.pos.y); if (d >= 165) continue;
+      const level = (0.22 + 0.74 * Math.min(1, A.speed / 11)) * (1 - d / 165);
+      if (level <= this.obLevel) continue;
+      this.obLevel = level; this.obPitch = A === this.rigs.smuggler.agent ? 1.16 : A.enforcement ? 1.06 : 1; this.obX = A.x; this.obZ = A.z;
+    }
+  }
+
+  wakeHeightAt(x, z, t) { return sampleVesselWake(this.agents, x, z, t, 12.4, 0.11); }
+
+  visitActiveVessels(visitor) {
+    for (let i = 0; i < this.agents.length; i++) {
+      const agent = this.agents[i]; if (agent.active) visitor(agent.x, agent.z, agent.speed, 'skiff', agent);
+    }
+  }
+
   stamps(out) {
     for (const A of this.agents) {
       if (!A.active || A.speed < 2 || Math.hypot(A.x - this.phys.pos.x, A.z - this.phys.pos.y) > 85) continue;
@@ -2421,6 +3150,10 @@ export class EncounterDirector {
     const e = this.active;
     if (e?.type === 'airrescue' && ['approach', 'hoist'].includes(e.state) && e.hy < 38 && Math.hypot(e.hx - this.phys.pos.x, e.hz - this.phys.pos.y) < 110) {
       const strength = clamp((38 - e.hy) / 16), stamp = this.airWashStamp; stamp.x = e.hx; stamp.z = e.hz; stamp.height = -0.72 * strength; stamp.foam = 2.4 * strength; stamp.radius = 7.5 + strength * 3; stamp.foamRadius = 8.5 + strength * 4; emitWakeStamp(out, stamp.x, stamp.z, stamp.radius, stamp.height, stamp.foam, stamp.foamRadius);
+    }
+    if (e?.type === 'wrangler' && e.state === 'loose' && e.gatorSpeed > 0.5 && Math.hypot(e.gatorX - this.phys.pos.x, e.gatorZ - this.phys.pos.y) < 85) {
+      const fx = -Math.sin(e.gatorHeading), fz = -Math.cos(e.gatorHeading), strength = clamp(e.gatorSpeed / 3.7);
+      emitWakeStamp(out, e.gatorX - fx * 0.8, e.gatorZ - fz * 0.8, 0.75, -0.18 * strength, 0.62 * strength, 0.7);
     }
   }
 }

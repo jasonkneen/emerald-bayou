@@ -2,6 +2,7 @@ import { WORLD_HALF, HOME_X, HOME_Z } from './heightfield.js';
 import { fmtDist } from './game.js';
 import { REGIONS, regionAt } from './regions.js';
 import { MAX_DRAW_PIXELS, pixelRatioFor } from './renderquality.js';
+import { minimapTileColumn, minimapTileRow } from './hud.js';
 
 const MILE = 1609.344;
 const REGION_LABEL_OFFSET = {
@@ -20,7 +21,7 @@ export class WorldMap {
     this.T = terrain; this.mini = minimap; this.G = game; this.W = world;
     this.el = document.getElementById('bigmap'); this.canvas = document.getElementById('bigmapCanvas'); this.ctx = this.canvas.getContext('2d');
     this.legend = document.getElementById('bigmapLegend');
-    this.tiles = new Map(); this.inFlight = 0;
+    this.tiles = new Map(); this.inFlight = 0; this.tileGeneration = 0; this.tileReleases = 0; this.releasedBackingBytes = 0;
     this.open = false; this.scale = 0.04; this.cx = 0; this.cz = 0; this.follow = true;
     this.dpr = 1;
     this.drag = null;
@@ -46,13 +47,26 @@ export class WorldMap {
     // The chart can otherwise keep an 8K RGBA canvas alive for the rest of the session after being opened once.
     this.canvas.width = 1; this.canvas.height = 1; this.dpr = 1;
   }
+  releaseTiles() {
+    let released = 0, count = 0;
+    for (const tile of this.tiles.values()) if (tile.canvas) {
+      released += tile.canvas.width * tile.canvas.height * 4; tile.canvas.width = 0; tile.canvas.height = 0; tile.canvas = null; count++;
+    }
+    this.tiles.clear(); this.tileGeneration++; this.tileReleases += count; this.releasedBackingBytes += released; return released;
+  }
+  hibernate() {
+    const before = this.canvas.width * this.canvas.height * 4, released = this.releaseTiles();
+    if (this.open) { this.canvas.width = 1; this.canvas.height = 1; this.dpr = 1; }
+    return released + Math.max(0, before - this.canvas.width * this.canvas.height * 4);
+  }
+  resume() { if (!this.open) return false; this.fit(); return true; }
   memoryStats() {
     const width = this.canvas.width, height = this.canvas.height, pixels = width * height;
     let cachedTiles = 0, tilePixels = 0;
     for (const tile of this.tiles.values()) if (tile.canvas) { cachedTiles++; tilePixels += tile.canvas.width * tile.canvas.height; }
     return {
       open: this.open, width, height, pixels, pixelRatio: this.dpr, maxPixels: MAX_DRAW_PIXELS,
-      cachedTiles, pendingTiles: this.tiles.size - cachedTiles, tilePixels,
+      cachedTiles, pendingTiles: this.tiles.size - cachedTiles, tilePixels, tileReleases: this.tileReleases, releasedBackingBytes: this.releasedBackingBytes,
       canvasBackingBytes: pixels * 4, tileBackingBytes: tilePixels * 4, estimatedBackingBytes: (pixels + tilePixels) * 4,
     };
   }
@@ -60,18 +74,19 @@ export class WorldMap {
     const key = `${i},${j}`;
     let t = this.tiles.get(key); if (t) return t.canvas;
     if (this.inFlight >= 4) return null;
-    t = { canvas: null }; this.tiles.set(key, t); this.inFlight++;
+    const generation = this.tileGeneration;
+    t = { canvas: null, generation }; this.tiles.set(key, t); this.inFlight++;
     this.T.tile(i * COARSE, j * COARSE, COARSE, COARSE_PX, 'chart').then(rgba => {
+      this.inFlight--; if (generation !== this.tileGeneration || this.tiles.get(key) !== t) return;
       const c = document.createElement('canvas'); c.width = COARSE_PX; c.height = COARSE_PX;
       c.getContext('2d').putImageData(new ImageData(rgba, COARSE_PX, COARSE_PX), 0, 0); t.canvas = c; if (this.open) this.render();
-    }).catch(() => { this.tiles.delete(key); }) // failed tile: drop the placeholder so a later pass retries it
-      .finally(() => { this.inFlight--; }); // the slot comes back exactly once, even if the success path throws
+    }, () => { this.inFlight--; if (generation === this.tileGeneration && this.tiles.get(key) === t) this.tiles.delete(key); });
     return null;
   }
   render() {
     if (!this.open) return;
     const c = this.ctx, W = this.canvas.width, H = this.canvas.height, dpr = this.dpr;
-    const p = this.G.phys;
+    const p = this.G.phys, pursuitSearch = this.G.encounters?.pursuitSearchArea?.() || null;
     if (this.follow) { this.cx = p.pos.x; this.cz = p.pos.y; }
     c.setTransform(1, 0, 0, 1, 0, 0);
     c.fillStyle = '#0b1512'; c.fillRect(0, 0, W, H);
@@ -87,7 +102,7 @@ export class WorldMap {
       else { c.fillStyle = '#14251d'; c.fillRect(x0, z0, COARSE, COARSE); }
     }
     // fine tiles where the minimap has them, once zoomed in enough to matter
-    if (this.scale > 0.12) for (const [key, t] of this.mini.tiles) { if (!t.canvas) continue; const [i, j] = key.split(',').map(Number); const x0 = i * 200, z0 = j * 200; if (x0 + 200 < this.cx - R || x0 > this.cx + R || z0 + 200 < this.cz - R || z0 > this.cz + R) continue; c.drawImage(t.canvas, x0, z0, 200, 200); }
+    if (this.scale > 0.12) for (const [key, t] of this.mini.tiles) { if (!t.canvas) continue; const i = minimapTileColumn(key), j = minimapTileRow(key), x0 = i * 200, z0 = j * 200; if (x0 + 200 < this.cx - R || x0 > this.cx + R || z0 + 200 < this.cz - R || z0 > this.cz + R) continue; c.drawImage(t.canvas, x0, z0, 200, 200); }
     // world rim
     c.lineWidth = 2 / k; c.strokeStyle = 'rgba(243,237,224,0.35)'; c.strokeRect(-WORLD_HALF, -WORLD_HALF, WORLD_HALF * 2, WORLD_HALF * 2);
     // mile grid
@@ -108,11 +123,17 @@ export class WorldMap {
       }
       c.restore();
     }
+    if (pursuitSearch) {
+      c.save(); c.beginPath(); c.arc(pursuitSearch.x, pursuitSearch.z, pursuitSearch.r, 0, Math.PI * 2); c.fillStyle = 'rgba(75,145,235,0.07)'; c.fill();
+      c.setLineDash([9 / k, 6 / k]); c.lineWidth = 1.8 / k; c.strokeStyle = 'rgba(105,175,255,0.72)'; c.stroke(); c.setLineDash([]);
+      c.beginPath(); c.moveTo(pursuitSearch.x - 4 / k, pursuitSearch.z); c.lineTo(pursuitSearch.x + 4 / k, pursuitSearch.z); c.moveTo(pursuitSearch.x, pursuitSearch.z - 4 / k); c.lineTo(pursuitSearch.x, pursuitSearch.z + 4 / k); c.strokeStyle = 'rgba(185,220,255,0.82)'; c.stroke(); c.restore();
+    }
     c.restore();
     // markers in screen space
     const toS = (x, z) => [W / 2 + (x - this.cx) * k, H / 2 + (z - this.cz) * k];
     const font = (px, w = 500) => `${w} ${px * dpr}px "Avenir Next Condensed", "Avenir Next", sans-serif`;
     const label = (x, y, text, col = '#f3ede0', px = 13, dy = 0) => { c.font = font(px, 600); c.textAlign = 'left'; c.textBaseline = 'middle'; c.fillStyle = 'rgba(8,20,15,0.8)'; c.fillText(text, x + 9 * dpr + 1, y + dy + 1); c.fillStyle = col; c.fillText(text, x + 9 * dpr, y + dy); };
+    if (pursuitSearch) { const [x, y] = toS(pursuitSearch.x, pursuitSearch.z); if (x > -80 && y > -40 && x < W + 40 && y < H + 40) label(x, y, 'FWC LAST-FIX AREA', '#69afff', 10, -14 * dpr); }
     // home
     { const [x, y] = toS(HOME_X + 65, HOME_Z - 115); c.fillStyle = '#e5c063'; c.beginPath(); c.moveTo(x, y - 7 * dpr); c.lineTo(x + 5 * dpr, y + 5 * dpr); c.lineTo(x - 5 * dpr, y + 5 * dpr); c.closePath(); c.fill(); label(x, y, 'Tower · home', '#e5c063'); }
     // camps: known ones named, seen ones as marks
@@ -198,6 +219,6 @@ export class WorldMap {
     const recoveryLegend = recoveryMarks.map(m => `<div>Storm recovery · ${m.label}</div>`).join('');
     const navigationLegend = navigationMarks.map(m => `<div>Aid report · ${m.label}</div>`).join('');
     const fieldFound = fieldMarks.filter(mark => mark.found).length, liveField = fieldMarks.find(mark => mark.live);
-    this.legend.innerHTML = `<div class="h">Chart</div><div>${region.name} &nbsp;·&nbsp; ${(WORLD_HALF * 2 / MILE).toFixed(0)} miles square</div><div>${known.length} camps found &nbsp;·&nbsp; ${(this.G.save.regions || []).length} / ${REGIONS.length} regions seen &nbsp;·&nbsp; ${(this.G.save.traps || []).length} traps recovered &nbsp;·&nbsp; ${fieldFound} field notes</div>${nc ? `<div>Nearest camp ${nc.camp.name ? (known.includes(nc.camp.key) ? nc.camp.name : 'unknown') : ''} · ${fmtDist(nc.d)}</div>` : ''}${liveCall ? `<div>Live dispatch · ${liveCall.label}</div>` : ''}${liveField ? `<div>Live field sign · ${liveField.label}</div>` : ''}${navigationLegend}${recoveryLegend}${storyLegend}<div class="keys">scroll zoom · drag pan · Tab close</div>`;
+    this.legend.innerHTML = `<div class="h">Chart</div><div>${region.name} &nbsp;·&nbsp; ${(WORLD_HALF * 2 / MILE).toFixed(0)} miles square</div><div>${known.length} camps found &nbsp;·&nbsp; ${(this.G.save.regions || []).length} / ${REGIONS.length} regions seen &nbsp;·&nbsp; ${(this.G.save.traps || []).length} traps recovered &nbsp;·&nbsp; ${fieldFound} field notes</div>${nc ? `<div>Nearest camp ${nc.camp.name ? (known.includes(nc.camp.key) ? nc.camp.name : 'unknown') : ''} · ${fmtDist(nc.d)}</div>` : ''}${pursuitSearch ? `<div>FWC search · ${Math.round(pursuitSearch.r)} m around last fix</div>` : ''}${liveCall ? `<div>Live dispatch · ${liveCall.label}</div>` : ''}${liveField ? `<div>Live field sign · ${liveField.label}</div>` : ''}${navigationLegend}${recoveryLegend}${storyLegend}<div class="keys">scroll zoom · drag pan · Tab close</div>`;
   }
 }

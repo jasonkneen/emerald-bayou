@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AdaptiveQualityController, gpuQualityCeiling, initialQualityLevel, msaaSamplesFor, pixelRatioFor, qualityProfile, webglRendererName } from '../src/renderquality.js';
+import { AdaptiveQualityController, environmentMapBudget, gpuQualityCeiling, initialQualityLevel, msaaSamplesFor, pixelRatioFor, qualityProfile, webglRendererName } from '../src/renderquality.js';
 import { WAKE_SIZE, Water } from '../src/water.js';
 
 test('caps dense displays by drawing-pixel budget', () => {
@@ -22,9 +22,14 @@ test('starts conservatively only when hardware signals justify it', () => {
 test('caps known old and software GPUs without penalizing modern discrete renderers', () => {
   assert.equal(gpuQualityCeiling('ANGLE (Intel, Intel(R) HD Graphics 5000 OpenGL Engine)'), 1);
   assert.equal(gpuQualityCeiling('Intel(R) UHD Graphics 630'), 2);
-  assert.equal(gpuQualityCeiling('ANGLE (NVIDIA, GeForce GTX 960 Direct3D11)'), 2);
+  assert.equal(gpuQualityCeiling('ANGLE (NVIDIA, GeForce GTX 960 Direct3D11)'), 1);
+  assert.equal(gpuQualityCeiling('ANGLE (NVIDIA, GeForce GTX 980 Ti Direct3D11)'), 1);
+  assert.equal(gpuQualityCeiling('ANGLE (NVIDIA, GeForce GTX 1060 Direct3D11)'), 2);
+  assert.equal(gpuQualityCeiling('ANGLE (NVIDIA, GeForce GTX 1080 Direct3D11)'), 2);
   assert.equal(gpuQualityCeiling('ANGLE (NVIDIA, GeForce RTX 4070 Direct3D11)'), 3);
   assert.equal(gpuQualityCeiling('Google SwiftShader'), 0);
+  assert.equal(initialQualityLevel({ deviceMemory: 16, hardwareConcurrency: 12, maxTextureSize: 16384, gpuRenderer: 'NVIDIA GeForce GTX 960' }), 1);
+  assert.equal(initialQualityLevel({ deviceMemory: 16, hardwareConcurrency: 12, maxTextureSize: 16384, gpuRenderer: 'NVIDIA GeForce GTX 1060' }), 2);
   assert.equal(initialQualityLevel({ deviceMemory: 16, hardwareConcurrency: 12, maxTextureSize: 16384, gpuRenderer: 'Intel Iris Pro 5200' }), 1);
 });
 
@@ -38,6 +43,32 @@ test('removes multisample attachments on performance profiles', () => {
   assert.equal(msaaSamplesFor(1200, 800, 0), 0);
   assert.equal(msaaSamplesFor(1200, 800, 2), 2);
   assert.equal(msaaSamplesFor(2000, 1000, 4), 2);
+});
+
+test('bounds startup environment convolution without reducing the live world', () => {
+  const sizes = [0, 1, 2, 3].map(level => qualityProfile(level).environmentMapSize);
+  assert.deepEqual(sizes, [32, 64, 128, 128]);
+  const fallback = environmentMapBudget(sizes[0]), performance = environmentMapBudget(sizes[1]), cinematic = environmentMapBudget(sizes[3]);
+  assert.deepEqual(cinematic, {
+    cubeSize: 128, width: 384, height: 512, pixels: 196608, colorBytes: 1572864, depthBytes: 786432,
+    retainedBytes: 2359296, peakTargetBytes: 3932160,
+  });
+  assert.equal(performance.retainedBytes, 1032192);
+  assert.ok(performance.retainedBytes < cinematic.retainedBytes * 0.45);
+  assert.ok(fallback.peakTargetBytes < cinematic.peakTargetBytes * 0.25);
+});
+
+test('keeps synchronous sky convolution out of gameplay on every tier', () => {
+  const refresh = [0, 1, 2, 3].map(level => qualityProfile(level).environmentMapRefreshSeconds);
+  assert.deepEqual(refresh, [0, 0, 0, 0]);
+});
+
+test('scales distant storm-sky detail without changing world simulation', () => {
+  assert.deepEqual([0, 1, 2, 3].map(level => qualityProfile(level).skyWeatherDetail), [0, 0.45, 0.75, 1]);
+});
+
+test('disables hull-scar shader work on fallback and scales it above that tier', () => {
+  assert.deepEqual([0, 1, 2, 3].map(level => qualityProfile(level).hullDamageDetail), [0, 0.5, 0.78, 1]);
 });
 
 test('scales wake simulation cost without shrinking its world-space footprint', () => {
@@ -54,8 +85,20 @@ test('scales wake simulation cost without shrinking its world-space footprint', 
   assert.ok(fallback.wakeResolution ** 2 < cinematic.wakeResolution ** 2 * 0.15);
 });
 
+test('bounds rebuildable radar history by graphics tier without changing map scale', () => {
+  assert.deepEqual([0, 1, 2, 3].map(level => qualityProfile(level).minimapTileLimit), [160, 192, 224, 256]);
+});
+
 test('keeps the atmospheric mist shader off the two old-hardware profiles', () => {
   assert.deepEqual([0, 1, 2, 3].map(level => qualityProfile(level).surfaceMist), [0, 0, 0.65, 1]);
+});
+
+test('reserves refractive heat haze for balanced and cinematic hardware', () => {
+  assert.deepEqual([0, 1, 2, 3].map(level => qualityProfile(level).heatHaze), [0, 0, 0.58, 1]);
+});
+
+test('reserves moving cloud shadows for balanced and cinematic hardware', () => {
+  assert.deepEqual([0, 1, 2, 3].map(level => qualityProfile(level).cloudShadows), [0, 0, 0.58, 1]);
 });
 
 test('reserves procedural precipitation impacts for balanced and cinematic water', () => {
@@ -64,6 +107,10 @@ test('reserves procedural precipitation impacts for balanced and cinematic water
 
 test('scales the nocturnal point draw down to zero on fallback hardware', () => {
   assert.deepEqual([0, 1, 2, 3].map(level => qualityProfile(level).fireflyPoints), [0, 72, 153, 243]);
+});
+
+test('keeps the atmospheric spotlight off fallback hardware and scales one retained draw above it', () => {
+  assert.deepEqual([0, 1, 2, 3].map(level => qualityProfile(level).spotlightVolume), [0, 0.42, 0.75, 1]);
 });
 
 test('passes rain and hail conditions into the existing water surface uniforms', () => {

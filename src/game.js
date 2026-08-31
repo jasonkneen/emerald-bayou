@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { Beacon, crabFloat, kayak, fuelDrum, raceCase, wreck, shack } from './markers.js';
 import { mulberry32 } from './noise.js';
 import { WORLD_HALF } from './heightfield.js';
-import { cargoEjectionReason, rampPoint, splitRemaining } from './raceformats.js';
+import { cargoEjectionReason, raceCourseDistances, raceCourseProgress, racePositionLabel, rampPoint, splitRemaining } from './raceformats.js';
 import { emitMapMarker, MapMarkerPool } from './mapmarkers.js';
 
 const SAVE_KEY = 'emeraldBayou.save.v2';
@@ -20,6 +20,9 @@ export const fmtDist = (m) => m < 300 ? `${Math.round(m * FT / 10) * 10} ft` : m
 const setHTML = (el, html) => { if (el.__html !== html) { el.__html = html; el.innerHTML = html; } };
 const setText = (el, text) => { if (el.__text !== text) { el.__text = text; el.textContent = text; } };
 const MEDALS = ['BRONZE', 'SILVER', 'GOLD'];
+export const HUD_REFRESH_HZ = 12;
+const HUD_REFRESH_INTERVAL = 1 / HUD_REFRESH_HZ;
+export const SAVE_DEFER_MS = 40;
 
 export class Game {
   constructor(o) {
@@ -30,6 +33,8 @@ export class Game {
     this.state = null; // active mission runtime
     this.paused = false; this.playing = false; this.inputLock = false; this.menuOpen = false; this.resultOpen = false;
     this.sel = 0; this.systemSel = 0; this.menuTab = 'jobs'; this.resetArmedUntil = 0; this.resetTimer = 0; this.persistenceDisabled = false;
+    this.persistTimer = null; this.persistPending = false;
+    this.persistenceStats = { requests: 0, writes: 0, coalesced: 0, errors: 0, lastMs: 0, maxMs: 0, lastChars: 0 };
     this.beacon = new Beacon(0xf07a2e, 5); this.beacon2 = new Beacon(0xf3ede0, 4.5); this.beacon2.uniforms.alpha.value = 0.35;
     this.scene.add(this.beacon.group, this.beacon2.group);
     this.el = {
@@ -41,7 +46,12 @@ export class Game {
     this.nearCamp = null; this.nearTraps = []; this.scanT = 0; this.dockCamp = null; this.mapOpen = false; this.map = null;
     this.noWakeScan = { key: '', label: '', kind: '', d: Infinity, radius: 0, limit: 8, priority: 0, animal: null };
     this.noWakeOverT = 0; this.noWakeCooldown = 0; this.manateeWarnCooldown = 0; this.noWakeHudKey = '';
-    this.toastT = 0; this.bountyT = 0; this.shake = 0; this.wpTarget = null; this.mapMarkers = []; this.mapMarkerPool = new MapMarkerPool();
+    this.toastT = 0; this.bountyT = 0; this.shake = 0; this.wpTarget = null; this.mapMarkers = []; this.mapMarkerPool = new MapMarkerPool(); this.hudT = 0;
+    // Campaign races borrow the one mission johnboat already retained for the poacher chase. Its collider is a
+    // permanent one-slot array, emptied between races, so rematches do not create new physics records.
+    this.missionRivalObstacles = [];
+    this.missionRivalObstacle = { ax: 0, az: 0, bx: 0, bz: 0, r: 1.05, tag: 'racing johnboat', onHit: (into, nx, nz) => this.hitMissionRival(into, nx, nz) };
+    this.phys.addObs?.('mission-rival', this.missionRivalObstacles);
     this.missions = buildMissions(this);
     this.jobs = this.buildJobs();
     this.bounties = new Bounties(this);
@@ -51,7 +61,7 @@ export class Game {
     this._v = new THREE.Vector3(); this._f = new THREE.Vector2();
     this.fx = null; // set by main: { thud(), splash() } hooks not needed; main reads phys
     window.addEventListener('keydown', e => this.onKey(e));
-    this.pagehideHandler = () => this.persist();
+    this.pagehideHandler = () => this.flushPersistence(true);
     window.addEventListener('pagehide', this.pagehideHandler);
     this.renderHud();
   }
@@ -101,6 +111,7 @@ export class Game {
       || (s.discoveries?.found || []).length
       || (s.navigationAids?.reports || []).length
       || Number(s.fishing?.total)
+      || Number(s.marshFire?.stats?.contained)
       || (story.stage && story.stage !== 'dormant') || travelled
     );
   }
@@ -108,6 +119,7 @@ export class Game {
   requestNewGame() {
     if (this.newGameArmed()) {
       this.persistenceDisabled = true;
+      this.cancelPersistence();
       try { localStorage.removeItem(SAVE_KEY); localStorage.removeItem('emeraldBayou.save.v1'); } catch (error) { /* an unavailable store already has nothing durable to clear */ }
       location.reload(); return true;
     }
@@ -130,7 +142,31 @@ export class Game {
     };
     return true;
   }
-  persist() { if (this.persistenceDisabled) return; this.captureBoatPosition(); try { localStorage.setItem(SAVE_KEY, JSON.stringify(this.save)); } catch (e) { /* ignore */ } }
+  cancelPersistence() {
+    if (this.persistTimer !== null && this.persistTimer !== undefined) clearTimeout(this.persistTimer);
+    this.persistTimer = null; this.persistPending = false;
+  }
+  flushPersistence(force = false) {
+    if (this.persistTimer !== null && this.persistTimer !== undefined) clearTimeout(this.persistTimer);
+    this.persistTimer = null;
+    if (this.persistenceDisabled || (!this.persistPending && !force)) { this.persistPending = false; return false; }
+    this.persistPending = false; this.captureBoatPosition();
+    const started = performance.now();
+    try {
+      const payload = JSON.stringify(this.save); localStorage.setItem(SAVE_KEY, payload);
+      const elapsed = performance.now() - started, stats = this.persistenceStats;
+      stats.writes++; stats.lastMs = elapsed; stats.maxMs = Math.max(stats.maxMs, elapsed); stats.lastChars = payload.length;
+      return true;
+    } catch (e) { this.persistenceStats.errors++; return false; }
+  }
+  persist() {
+    if (this.persistenceDisabled) return false;
+    const stats = this.persistenceStats; stats.requests++;
+    this.persistPending = true;
+    if (this.persistTimer !== null && this.persistTimer !== undefined) { stats.coalesced++; return false; }
+    this.persistTimer = setTimeout(() => { this.persistTimer = null; this.flushPersistence(); }, SAVE_DEFER_MS);
+    return true;
+  }
   addCash(n) { this.save.cash += n; this.persist(); }
   unlocked(i) { return i === 0 || this.save.done.includes(this.missions[i - 1].id) || this.save.done.includes(this.missions[i].id) || this.debugUnlock; }
   unlockAll() { this.debugUnlock = true; this.renderMenu(); }
@@ -148,6 +184,25 @@ export class Game {
   mph() { return this.phys.speed * MPH; }
   river(z, side = 0) { return { x: this.T.riverCenterX(z) + side * this.T.riverHalfWidth(z) * 0.45, z }; }
   headingTo(ax, az, bx, bz) { return Math.atan2(-(bx - ax), -(bz - az)); }
+  beginMissionRival() { this.missionRivalObstacles[0] = this.missionRivalObstacle; this.missionRivalObstacles.length = 1; this.syncMissionRival(); }
+  syncMissionRival() {
+    const skiff = this.skiff, obstacle = this.missionRivalObstacle;
+    if (!skiff?.active || !this.state?.rivalRace) { this.missionRivalObstacles.length = 0; return; }
+    const fx = -Math.sin(skiff.heading), fz = -Math.cos(skiff.heading);
+    obstacle.ax = skiff.pos.x + fx * 2; obstacle.az = skiff.pos.y + fz * 2;
+    obstacle.bx = skiff.pos.x - fx * 2; obstacle.bz = skiff.pos.y - fz * 2;
+  }
+  endMissionRival() { this.missionRivalObstacles.length = 0; }
+  hitMissionRival(into, nx, nz) {
+    const s = this.state;
+    if (!s?.rivalRace || s.rivalHitCd > 0 || into < 2.2) return;
+    s.rivalHitCd = 1.8; s.rivalRams++; this.skiff.speed *= Math.max(0.68, Math.min(0.92, 1 - into * 0.025));
+    const fx = -Math.sin(this.skiff.heading), fz = -Math.cos(this.skiff.heading);
+    const contactAlong = (this.phys.pos.x - this.skiff.pos.x) * fx + (this.phys.pos.y - this.skiff.pos.y) * fz;
+    this.skiff.applyImpact?.(into, nx, nz, contactAlong);
+    this.shake = Math.max(this.shake, Math.min(0.3, into * 0.032)); this.audio.warn();
+    this.toast('Rub rails hit', s.rivalRams > 1 ? 'That is not a clean race anymore.' : 'The johnboat crew is keeping count.', 2.4);
+  }
   toast(text, sub = '', dur = 2.6) { this.el.toast.innerHTML = `${text}${sub ? `<small>${sub}</small>` : ''}`; this.el.toast.classList.add('on'); this.toastT = dur; }
   bountyToast(text) { this.el.bounty.innerHTML = text; this.el.bounty.classList.add('on'); this.bountyT = 4; }
   fadeTo(fn) { this.el.fade.classList.add('on'); setTimeout(() => { fn(); setTimeout(() => this.el.fade.classList.remove('on'), 150); }, 420); }
@@ -234,7 +289,7 @@ export class Game {
     this.renderHud();
   }
   showResult(title, lines, fail) {
-    this.el.result.innerHTML = `<h2 class="${fail ? 'fail' : ''}">${fail ? title : 'Mission complete'}</h2>${fail ? '' : `<div class="lines" style="font-size:24px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase">${title}</div>`}<div class="lines">${lines.map(l => `<div>${l}</div>`).join('')}</div><div class="foot">Enter · continue &nbsp;&nbsp; R · retry &nbsp;&nbsp; M · jobs board</div>`;
+    this.el.result.innerHTML = `<h2 class="${fail ? 'fail' : ''}">${fail ? title : 'Mission complete'}</h2>${fail ? '' : `<div class="lines" style="font-size:24px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase">${title}</div>`}<div class="lines">${lines.map(l => `<div>${l}</div>`).join('')}</div><div class="foot"><span class="input-keyboard">Enter · continue &nbsp;&nbsp; R · retry &nbsp;&nbsp; M · jobs board</span><span class="input-gamepad">A / Cross · continue &nbsp;&nbsp; Y / Triangle · retry &nbsp;&nbsp; B / Circle · jobs board</span></div>`;
     this.el.result.classList.remove('hidden'); this.resultOpen = true; this.paused = true; document.getElementById('hud').classList.add('dim'); this.lastMission = this.state ? this.state.m : this.lastMission;
   }
   closeResult() { this.el.result.classList.add('hidden'); this.resultOpen = false; this.paused = this.menuOpen; if (!this.menuOpen) document.getElementById('hud').classList.remove('dim'); }
@@ -314,24 +369,27 @@ export class Game {
     records.push(['Aid reports', `${Math.max(0, Number(this.save.navigationAids?.stats?.reports) || 0)}`]);
     records.push(['Fish landed', `${Math.max(0, Number(this.save.fishing?.total) || 0)}`]);
     records.push(['Fish released', `${Math.max(0, Number(this.save.fishing?.released) || 0)}`]);
+    records.push(['Fish taken by gators', `${Math.max(0, Number(this.save.fishing?.gatorLosses) || 0)}`]);
+    records.push(['Marsh fires contained', `${Math.max(0, Number(this.save.marshFire?.stats?.contained) || 0)}`]);
     const wanted = Math.max(0, Math.min(5, Math.ceil(Number(this.law?.attention) || 0)));
     const deeds = (this.reputation?.deeds || []).slice(-6).reverse();
     const deedRows = deeds.length ? deeds.map(deed => `<div class="deed"><b>${esc(deed.faction)} ${deed.delta > 0 ? '+' : ''}${Number(deed.delta).toFixed(1)}</b>${esc(deed.text)}</div>`).join('') : '<div class="deed">Nobody has made up their mind about this hull yet.</div>';
     const quality = esc(this.getQualityLabel?.() || 'Auto');
     const resetArmed = this.newGameArmed();
     let kicker = '', title = '', copy = '', content = '', keyHelp = '';
+    const inputHelp = (keyboard, gamepad) => `<span class="input-keyboard">${keyboard}</span><span class="input-gamepad">${gamepad}</span>`;
     if (this.menuTab === 'jobs') {
       kicker = 'Jobs board'; title = 'Work the water'; copy = 'Races, freight, rescues and recovery work. Finished jobs stay open for better times and repeat pay.';
       content = `<div class="menu-grid"><div><div class="list">${rows}</div><div class="stats">Bankroll <b>${fmtCash(this.save.cash)}</b> &nbsp;·&nbsp; style <b>${this.tricks.total.toLocaleString()} pts</b> &nbsp;·&nbsp; complete <b>${this.save.done.length} / ${this.missions.length}</b></div></div><aside><section class="menu-card"><div class="h">Today's bounties</div>${bl}</section><section class="menu-card"><div class="h">Story on the water</div><div class="deed"><b>Main line</b>${esc(storyLine)}</div><div class="deed"><b>Residents</b>${esc(contractLine)}</div></section></aside></div>`;
-      keyHelp = '<span><b>↑ ↓</b> choose &nbsp; <b>Enter</b> start</span><span><b>M / Esc</b> back to the water</span>';
+      keyHelp = inputHelp('<span><b>↑ ↓</b> choose &nbsp; <b>Enter</b> start</span><span><b>M / Esc</b> back to the water</span>', '<span><b>D-pad ↑ ↓</b> choose &nbsp; <b>A / Cross</b> start</span><span><b>Menu / B</b> back to the water</span>');
     } else if (this.menuTab === 'world') {
       kicker = 'Living world'; title = 'Water remembers'; copy = 'Calls, favors and collisions change how camps, runners and FWC receive this boat.';
       content = `<div class="world-grid"><section class="menu-card"><div class="h">Current picture</div><div class="kpis"><div class="kpi"><b>${encounterCount}</b><span>encounters</span></div><div class="kpi"><b>${regionsSeen}/${regionTotal}</b><span>regions</span></div><div class="kpi"><b>${incidentResolved}/${incidentHeard}</b><span>calls resolved</span></div><div class="kpi"><b>${wanted ? '★'.repeat(wanted) : 'Clear'}</b><span>FWC wanted</span></div><div class="kpi"><b>${citations}</b><span>citations</span></div><div class="kpi"><b>${Number(incidents.fwc) || 0}/${Number(incidents.runners) || 0}</b><span>FWC / runners</span></div></div></section><section class="menu-card"><div class="h">Standing</div><div class="standing"><span>Locals</span><b>${esc(standing.locals)}</b><em>${this.reputation ? this.reputation.score('locals').toFixed(1) : '0.0'}</em></div><div class="standing"><span>FWC</span><b>${esc(standing.fwc)}</b><em>${this.reputation ? this.reputation.score('fwc').toFixed(1) : '0.0'}</em></div><div class="standing"><span>Backchannel</span><b>${esc(standing.runners)}</b><em>${this.reputation ? this.reputation.score('runners').toFixed(1) : '0.0'}</em></div></section><section class="menu-card"><div class="h">Open threads</div><div class="deed"><b>Story</b>${esc(storyLine)}</div><div class="deed"><b>Resident work</b>${esc(contractLine)}</div><div class="deed"><b>Conditions</b>${esc(this.getWorldLabel?.() || 'South Florida backcountry')}</div></section><section class="menu-card"><div class="h">What people remember</div>${deedRows}</section><section class="menu-card field-notes"><div class="h">Field notes · ${fieldNoteCount} / ${fieldNotes.length || 3}</div><div class="field-note-grid">${fieldNoteRows}</div></section></div>`;
-      keyHelp = '<span><b>Tab / ← →</b> change section</span><span><b>Esc</b> back to the water</span>';
+      keyHelp = inputHelp('<span><b>Tab / ← →</b> change section</span><span><b>Esc</b> back to the water</span>', '<span><b>D-pad ← →</b> change section</span><span><b>Menu / B</b> back to the water</span>');
     } else if (this.menuTab === 'records') {
       kicker = 'Boat log'; title = 'Records'; copy = 'Fastest runs, biggest air, field work and catches measured over the gunwale.';
       content = `<div class="records-grid"><section class="menu-card"><div class="h">Hull &amp; style</div>${records.slice(0, 6).map(([k,v]) => `<div class="r"><span>${k}</span><b>${v}</b></div>`).join('')}</section><section class="menu-card"><div class="h">Backcountry work</div>${records.slice(6).map(([k,v]) => `<div class="r"><span>${k}</span><b>${v}</b></div>`).join('')}<div class="r"><span>Jobs finished</span><b>${this.save.done.length} / ${this.missions.length}</b></div><div class="r"><span>Camp runs</span><b>${Number(this.save.runs) || 0}</b></div><div class="r"><span>Cash earned</span><b>${fmtCash(this.save.cash)}</b></div></section><section class="menu-card fishing-log"><div class="h">Catch-and-release log · ${fishLogged} / ${fishingEntries.length || 6} species</div><div class="fish-log-grid">${fishingRows}</div></section></div>`;
-      keyHelp = '<span><b>Tab / ← →</b> change section</span><span><b>Esc</b> back to the water</span>';
+      keyHelp = inputHelp('<span><b>Tab / ← →</b> change section</span><span><b>Esc</b> back to the water</span>', '<span><b>D-pad ← →</b> change section</span><span><b>Menu / B</b> back to the water</span>');
     } else {
       kicker = 'Paused'; title = 'Tower radio'; copy = 'Resume the water, set the rendering budget, or return to the title.';
       const systemActions = [
@@ -342,8 +400,8 @@ export class Game {
       if (this.hasProgress()) systemActions.push(['new', resetArmed ? 'Confirm new game' : 'New game', resetArmed ? 'Select again now to clear jobs, cash, records and world history' : 'Start over at the tower dock; graphics choice is kept', resetArmed ? 'Clear save' : 'Reset', resetArmed]);
       this.systemSel = Math.max(0, Math.min(this.systemSel, systemActions.length - 1));
       const actions = systemActions.map(([action, name, detail, value, danger], i) => `<button type="button" class="system-action ${i === this.systemSel ? 'sel' : ''} ${danger ? 'danger' : ''}" data-action="${action}"><strong>${name}</strong><small>${detail}</small><em>${value}</em></button>`).join('');
-      content = `<div class="menu-grid"><div class="system-list">${actions}</div><aside><section class="menu-card"><div class="h">On the water</div><div class="keys">W / S throttle · A / D rudder<br>Drag to look · wheel to change camera distance<br>C cast / reel · X cut or reel in<br>L spotlight · H horn · Tab chart · M jobs<br>In dense fog: H sounds one prolonged blast<br>In the air: S nose up · Shift nose down · A / D spin<br>R reset the hull</div></section></aside></div>`;
-      keyHelp = '<span><b>↑ ↓ / Enter</b> choose &nbsp; <b>Tab / ← →</b> change section</span><span><b>Esc</b> resume</span>';
+      content = `<div class="menu-grid"><div class="system-list">${actions}</div><aside><section class="menu-card"><div class="h">On the water</div><div class="keys"><span class="input-keyboard">W / S throttle · A / D rudder<br>Drag to look · wheel to change chase distance · V camera<br>E interact · C cast / reel · X cut line or cage debris · G anchor<br>L spotlight · H horn · Tab chart · M jobs<br>In dense fog: H sounds one prolonged blast<br>In the air: S nose up · Shift nose down · A / D spin<br>R reset the hull</span><span class="input-gamepad">RT / LT throttle · left stick rudder · click for camera<br>Right stick look · click to centre<br>A / Cross interact · B / Circle alternate or cut debris<br>X / Square cast or reel · Y / Triangle anchor<br>LB spotlight · RB horn · D-pad up jobs<br>View chart · Menu / Options pause<br>In the air: left stick pitches and spins</span></div></section></aside></div>`;
+      keyHelp = inputHelp('<span><b>↑ ↓ / Enter</b> choose &nbsp; <b>Tab / ← →</b> change section</span><span><b>Esc</b> resume</span>', '<span><b>D-pad / A</b> choose &nbsp; <b>← →</b> change section</span><span><b>Menu / B</b> resume</span>');
     }
     const tabs = { jobs: ['▤', 'Jobs'], world: ['⌖', 'World'], records: ['△', 'Records'], system: ['⚙', 'System'] };
     const rail = MENU_TABS.map(tab => `<button type="button" class="rail-tab ${tab === this.menuTab ? 'active' : ''}" data-tab="${tab}" ${tab === this.menuTab ? 'aria-current="page"' : ''}><span>${tabs[tab][0]}</span>${tabs[tab][1]}</button>`).join('');
@@ -401,6 +459,7 @@ export class Game {
     if ((e.code === 'KeyC' || e.code === 'KeyX') && this.fishing?.capturesInput(e)) return;
     if ((e.code === 'KeyE' || e.code === 'KeyF') && this.story?.capturesInput(e.code)) return;
     if ((e.code === 'KeyE' || e.code === 'KeyF') && this.aftermath?.capturesInput(e.code)) return;
+    if (e.code === 'KeyE' && this.marshFire?.capturesInput(e.code)) return;
     if (e.code === 'KeyE' && this.navigationAids?.capturesInput(e.code)) return;
     if (e.code === 'KeyE' && !this.state && !this.paused) { if (this.dockJob) { if (this.unlocked(this.dockJob.i)) this.start(this.dockJob.i); else this.toast('Locked', `Finish ${this.missions[this.dockJob.i - 1].title} first`, 2); return; } if (this.dockCamp) { this.startRun(this.dockCamp); return; } if (this.atBoard) { this.openMenu(); return; } }
     if (e.code === 'KeyR' && this.state && (this.state.m.countdown || this.state.m.restartOnR)) { this.start(this.missions.indexOf(this.state.m)); }
@@ -634,7 +693,7 @@ export class Game {
       }
     }
     this.collectMarkers(t);
-    this.renderHud(true);
+    this.refreshHud(dt);
   }
   // everything the radar shows: the objective (pinned to the edge when off the radar), job posts, camps, homesteads,
   // ramps, other boats, anglers, the bull, traps close by, home
@@ -661,6 +720,13 @@ export class Game {
       for (const b of this.life.traffic.boats) if (b.active) emitMapMarker(this, b.x, b.z, 'boat', b.profile?.color || (b.kind === 'canoe' ? 'rgba(225,205,150,0.95)' : b.kind === 'air' ? 'rgba(240,235,220,0.95)' : 'rgba(125,175,235,0.95)'), b.heading);
       for (const { a } of this.life.traffic.liveAnglers.values()) emitMapMarker(this, a.x, a.z, 'angler');
     }
+  }
+  refreshHud(dt) {
+    this.hudT += Number.isFinite(dt) ? Math.max(0, dt) : 0;
+    if (this.hudT + 1e-9 < HUD_REFRESH_INTERVAL) return false;
+    this.hudT %= HUD_REFRESH_INTERVAL;
+    this.renderHud(true);
+    return true;
   }
   renderHud(light = false) {
     const s = this.state, e = this.el;
@@ -701,7 +767,7 @@ export class Game {
       const b = this.bounties.today().filter(x => !x.done)[0];
       const nc = this.nearCamp; const known = nc && this.save.camps.includes(nc.camp.key);
       const campLine = nc ? `<div class="obj">${known ? nc.camp.name : 'Unknown camp'} · ${fmtDist(nc.d)}</div>` : '';
-      setHTML(e.mission, `<div class="title">Free ride</div>${campLine}<div class="hint">C · fish &nbsp; M · jobs board &nbsp; Tab · chart</div>${b ? `<div class="sub">Bounty · ${b.text} · ${fmtCash(b.pay)}</div>` : ''}`);
+      setHTML(e.mission, `<div class="title">Free ride</div>${campLine}<div class="hint"><span class="input-keyboard">C · fish &nbsp; M · jobs board &nbsp; Tab · chart</span><span class="input-gamepad">X / Square · fish &nbsp; D-pad up · jobs &nbsp; View · chart</span></div>${b ? `<div class="sub">Bounty · ${b.text} · ${fmtCash(b.pay)}</div>` : ''}`);
       setHTML(e.timer, ''); setHTML(e.wp, '');
       this.wpTarget = (nc && nc.d > 60 && nc.d < 5000) ? { x: nc.camp.tie.x, z: nc.camp.tie.z, label: known ? nc.camp.name : 'camp' } : null;
     }
@@ -763,6 +829,7 @@ const BOUNTY_POOL = [
   { id: 'dolphinpass', text: 'Keep a steady course when dolphins join the bow', kind: 'dolphinpass', target: 1, pay: 200 },
   { id: 'catch3', text: 'Land and release three fish', kind: 'catch', target: 1, count: 3, pay: 180 },
   { id: 'snook', text: 'Land a common snook', kind: 'fishspecies', target: 'common-snook', pay: 220 },
+  { id: 'fireline', text: 'Knock down a marsh fire from the water', kind: 'marshfire', target: 1, pay: 260 },
 ];
 class Bounties {
   constructor(G) {
@@ -820,6 +887,36 @@ export function buildMissions(G) {
     markers(s, G, out) { for (let k = s.i; k < Math.min(gates.length, s.i + 3); k++) out.push({ x: gates[k].x, z: gates[k].z, color: k === s.i ? '#f07a2e' : 'rgba(243,237,224,0.6)', r: k === s.i ? 5 : 3 }); },
   });
 
+  const contestedSequence = (gates, start, speed = 11.4) => {
+    const base = sequence(gates), line = start(G), heading = G.headingTo(line.x, line.z, gates[0].x, gates[0].z);
+    const rightX = -Math.cos(heading), rightZ = Math.sin(heading);
+    let rivalStart = { x: line.x + rightX * 6, z: line.z + rightZ * 6 };
+    if (T.heightAt(rivalStart.x, rivalStart.z) > -0.35) rivalStart = { x: line.x - rightX * 6, z: line.z - rightZ * 6 };
+    const path = [rivalStart, ...gates], distances = raceCourseDistances(line, gates);
+    return {
+      setup(s, G) {
+        base.setup(s, G); s.rivalRace = true; s.rivalHitCd = 0; s.rivalRams = 0; s.racePosition = 'Side by side with Mud Hen';
+        // Eight metres keeps the johnboat inside the nine-metre race gates instead of taking the chase AI's wider cut.
+        G.skiff.start(path, speed, 8); G.beginMissionRival?.();
+      },
+      cleanup(s, G) { G.endMissionRival?.(); G.skiff.stop(); },
+      update(s, G, dt, t) {
+        s.rivalHitCd = Math.max(0, s.rivalHitCd - dt);
+        G.skiff.update(dt, t); G.syncMissionRival?.();
+        const result = base.update(s, G, dt, t);
+        const playerProgress = raceCourseProgress(line, gates, distances, s.i, G.phys.pos.x, G.phys.pos.y);
+        const rivalNextGate = Math.max(0, G.skiff.i - 1);
+        const rivalProgress = raceCourseProgress(line, gates, distances, rivalNextGate, G.skiff.pos.x, G.skiff.pos.y);
+        s.racePosition = racePositionLabel(playerProgress, rivalProgress);
+        if (result === 'done') return result;
+        if (G.skiff.done) return { fail: 'Mud Hen crossed first.' };
+        return result;
+      },
+      hud(s) { const h = base.hud(s); return { ...h, sub: `${h.sub ? `${h.sub} · ` : ''}${s.racePosition}${s.rivalRams ? ' · rough line' : ''}` }; },
+      markers(s, G, out) { base.markers(s, G, out); out.push({ x: G.skiff.pos.x, z: G.skiff.pos.y, color: '#e5c063', r: 3.5, heading: G.skiff.heading }); },
+    };
+  };
+
   const kickers = T.bars.filter(b => b.kind === 'kicker');
   const nearestBar = (z, kind) => T.bars.filter(b => b.kind === kind).sort((a, b) => Math.abs(a.z - z) - Math.abs(b.z - z))[0];
   const creekPt = (z) => ({ x: T.riverCenterX(z) - 150 - 30 * Math.sin(z * 0.02), z });
@@ -874,7 +971,8 @@ export function buildMissions(G) {
   // 3. Cypress Sprint (river race) ----------------------------------------------------------
   const sprintZ = [30, -40, -110, -170, -240, -300, -360, -430, -500, -570, -640];
   const sprintGates = sprintZ.map((z, i) => gateAt(G.river(z, i % 3 === 1 ? 0.6 : i % 3 === 2 ? -0.6 : 0)));
-  const sprint = { id: 'sprint', title: 'Cypress Sprint', desc: 'Eleven gates straight down the main channel. Gold under 1:03.', reward: 500, countdown: true, gold: 63, silver: 76, bronze: 95, start: (G) => ({ x: G.startX, z: G.startZ + 20, heading: 0 }), ...sequence(sprintGates) };
+  const sprintStart = (G) => ({ x: G.startX, z: G.startZ + 20, heading: 0 });
+  const sprint = { id: 'sprint', title: 'Cypress Sprint', desc: 'Eleven gates straight down the main channel. Gold under 1:03.', reward: 500, countdown: true, gold: 63, silver: 76, bronze: 95, start: sprintStart, ...contestedSequence(sprintGates, sprintStart) };
 
   // 4. Trap line ----------------------------------------------------------------------------
   const trapSpots = (() => {
@@ -1154,7 +1252,8 @@ export function buildMissions(G) {
   for (let z = -340; z <= 20; z += 60) { const c = creekPt(z); tourGates.push({ x: c.x, z, r: 8, label: '' }); }
   { const a = T.riverCenterX(-60), c = creekPt(-60); tourGates.push({ x: a + (c.x - a) * 0.5, z: -60, r: 10, label: 'Back across to the river' }); }
   tourGates.push({ ...gateAt(G.river(G.startZ)), label: 'Finish at the start' });
-  const tour = { id: 'tour', title: 'Bayou Grand Tour', desc: `The big lap: down the river, across the back pools, up the creek and back over the flats. ${tourGates.length} gates. Gold under 1:50.`, reward: 900, countdown: true, gold: 110, silver: 135, bronze: 170, start: (G) => ({ x: G.startX, z: G.startZ + 20, heading: 0 }), ...sequence(tourGates) };
+  const tourStart = (G) => ({ x: G.startX, z: G.startZ + 20, heading: 0 });
+  const tour = { id: 'tour', title: 'Bayou Grand Tour', desc: `The big lap: down the river, across the back pools, up the creek and back over the flats. ${tourGates.length} gates. Gold under 1:50.`, reward: 900, countdown: true, gold: 110, silver: 135, bronze: 170, start: tourStart, ...contestedSequence(tourGates, tourStart) };
 
   // 14. Split clock -------------------------------------------------------------------------
   // Every gate starts a new deadline. A weak leg cannot be hidden inside one very fast straight, so the driver has

@@ -18,7 +18,7 @@ Rendering / world (the hot path):
 - `heightfield.js` — the terrain function. **Plain JS, no three.js import**: the main thread and the
   `terrain.worker.js` pool evaluate the same code. Never import three (or anything DOM-touching) here.
 - `terrain.js` — quadtree streaming: 100 m level-0 chunks out to 3200 m tiles, 7.2 km radius. Workers return
-  height/normal/biome grids; the main thread turns them into geometry inside a 4 ms/frame budget.
+  height/normal/biome grids; the main thread turns them into geometry inside a per-tier frame budget.
   Level-0 chunks keep their height grid after build (physics samples it); higher levels drop theirs.
 - `vegetation.js` — per-chunk instanced foliage, built by a generator that yields per 100 m cell.
   Instances are compact attributes (float3 position, snorm16 quaternion, half-float scale/colour/crown).
@@ -29,7 +29,8 @@ Rendering / world (the hot path):
 - `post.js` — HDR pipeline: MSAA scene RT → composite (+water/fx overlays) → bloom → grade (fog/ACES) →
   FXAA → DoF+sharpen; bloom and the final pass switch off at the lower quality tiers (`setQuality`).
 - `renderquality.js` — the quality system: `QUALITY_PROFILES` (fallback → cinematic; pixel budget, DPR cap,
-  MSAA, shadow size, reflection scale/interval/mipmaps, bloom/final toggles), hardware-signal initial tier
+  MSAA, shadow size, reflection scale/interval/mipmaps, wake sim resolution/stamps, mist/lens/firefly
+  budgets, minimap cache, bloom/final toggles), hardware-signal initial tier
   (`initialQualityLevel` + `gpuQualityCeiling` from the WebGL renderer string), and the runtime
   `AdaptiveQualityController` (windowed frame sampling with cooldowns). `displaysettings.js` persists the
   player's auto/pinned preference (title-screen "graphics" action, key `emeraldBayou.renderQuality`);
@@ -88,7 +89,7 @@ finds), `navigationaids.js` (channel markers) + `navigationrules.js` (sound-sign
 - Spray/Plume keep their live particles packed in [0, count): dead ones are swap-removed, the draw range
   tracks `count`, and only the live prefix of each attribute uploads (`updateAttributePrefix` in `cache.js`).
   Preserve the compaction if you touch their buffers — cost must stay bounded by live particles, not capacity.
-- Heavy work streams: terrain finalize has a 4 ms budget, vegetation yields per cell, the radar redraws at
+- Heavy work streams: terrain finalize has a per-tier budget (4 ms at cinematic), vegetation yields per cell, the radar redraws at
   30 Hz and the chart at 15 Hz (`frameNo` cadence in `main.js`). Match that pattern for new systems.
 - Quality tiers own every screen-space budget: the initial tier comes from hardware signals at boot, the
   `AdaptiveQualityController` steps it at runtime after sustained missed budgets, and every change funnels

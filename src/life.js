@@ -1,8 +1,8 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { mulberry32 } from './noise.js';
-import { buildSkiff } from './npc.js';
-import { buildAirboat, loadDriver } from './airboat.js';
+import { buildModelBoatFallback, buildSkiff } from './npc.js';
+import { buildAirboat, installDriver, registerAirboatEnvironmentWetness, updateSeatedDriverPose } from './airboat.js';
 import { HOME_X, HOME_Z, WORLD_HALF } from './heightfield.js';
 import * as TEX from './textures.js';
 import { spawn, loadGeo, SPEC } from './models.js';
@@ -17,7 +17,14 @@ import {
   evaluateNavigationEncounter, navigationEncounterOutranks, navigationLightVisibility,
 } from './navigationrules.js';
 import { waterspoutAvoidanceStrength, waterspoutProbeScore, waterspoutReactionReady } from './waterspout.js';
+import { downburstCraftUrgency, downburstProbeScore, downburstReactionReady } from './downburst.js';
 import { sampleTrafficWake, wakeSampleAt } from './wakefield.js';
+import { combinedSurfaceWind, vesselLeeway, vesselWindHeel } from './vesselwind.js';
+import { makeSurfaceSearchBeam } from './surface-searchlight.js';
+import {
+  clearManateeAvoidance, copyManateeAvoidance, createManateeAvoidance, evaluateManateeApproach,
+  manateeProbeScore, manateeReactionReady, manateeSpeedScale,
+} from './wildlifetraffic.js';
 
 // The bayou's small life: mullet jumping, bait boiling away from the bow, deadhead logs and dead snags in the still
 // water (with an anhinga drying its wings), other boats running the channels, and anglers anchored in the pools who
@@ -37,6 +44,21 @@ function fishGeo() {
   const fin = new THREE.ConeGeometry(0.04, 0.07, 3); fin.scale(0.3, 1, 1); fin.translate(0, 0.07, 0.02);
   return mergeGeometries([body, tail, fin].map(g => g.toNonIndexed()), false);
 }
+
+const TURTLE_FALLBACK_GEO = sharedResource((() => {
+  const shell = new THREE.SphereGeometry(0.32, 10, 7); shell.scale(1.18, 0.48, 1.55); shell.translate(0, 0.08, 0);
+  const head = new THREE.SphereGeometry(0.1, 8, 6); head.scale(0.9, 0.75, 1.2); head.translate(0, 0.08, -0.5);
+  const parts = [shell, head];
+  for (const side of [-1, 1]) for (const z of [-0.24, 0.24]) {
+    const foot = new THREE.SphereGeometry(0.08, 6, 4); foot.scale(1.45, 0.34, 0.72); foot.translate(side * 0.32, 0.02, z); parts.push(foot);
+  }
+  return mergeGeometries(parts.map(geometry => geometry.toNonIndexed()), false);
+})());
+const TURTLE_FALLBACK_MAT = sharedResource(new THREE.MeshStandardMaterial({ color: 0x53664a, roughness: 0.9, metalness: 0.02 }));
+export function buildTurtleFallback() {
+  const mesh = new THREE.Mesh(TURTLE_FALLBACK_GEO, TURTLE_FALLBACK_MAT); mesh.name = 'procedural cooter'; mesh.castShadow = true; mesh.receiveShadow = true; return mesh;
+}
+
 export class Fish {
   constructor(terrain, scene, fx) {
     this.T = terrain; this.fx = fx; // fx: { plume, spray, audio, emitStamp }
@@ -190,7 +212,7 @@ export class Debris {
       const m = new THREE.Mesh(this.logGeos[d.v], this.logMats[d.m]); m.scale.set(d.r, d.r, d.len); m.castShadow = true; m.receiveShadow = true;
       const g = new THREE.Group(); g.add(m); g.position.set(d.x, -0.1, d.z); g.rotation.y = d.ang;
       // cooters sunning in a row on top, ready to drop off
-      if (d.nt) { const rr = mulberry32(d.ts); g.userData.turtles = []; for (let i = 0; i < d.nt; i++) { const side = rr() < 0.5 ? -1 : 1; const tt = spawn('turtle_boat'); tt.position.set(side * 0.05, d.r * 0.95, (i - (d.nt - 1) / 2) * 1.0 + (rr() - 0.5) * 0.3); tt.rotation.y = side * Math.PI / 2 + (rr() - 0.5) * 1.2; tt.scale.setScalar(0.8 + rr() * 0.5); g.add(tt); g.userData.turtles.push({ m: tt, home: tt.position.clone(), rot: tt.rotation.y, side, st: 0, t: 0 }); } }
+      if (d.nt) { const rr = mulberry32(d.ts); g.userData.turtles = []; for (let i = 0; i < d.nt; i++) { const side = rr() < 0.5 ? -1 : 1; const tt = spawn('turtle_boat', buildTurtleFallback()); tt.position.set(side * 0.05, d.r * 0.95, (i - (d.nt - 1) / 2) * 1.0 + (rr() - 0.5) * 0.3); tt.rotation.y = side * Math.PI / 2 + (rr() - 0.5) * 1.2; tt.scale.setScalar(0.8 + rr() * 0.5); g.add(tt); g.userData.turtles.push({ m: tt, home: tt.position.clone(), rot: tt.rotation.y, side, st: 0, t: 0 }); } }
       return g;
     }
     const g = new THREE.Group();
@@ -260,6 +282,7 @@ const ANGLER_WAKE = ['Slow down! You are rocking my boat!', 'Idle speed, you foo
 const STEER_PROBES = [-0.7, -0.35, 0, 0.35, 0.7];
 const SHELTER_RELEASE_MARGIN = 0.09;
 const TOW_BERTH_RADII = [6.5, 8.5, 10.5, 12.5];
+const TRAFFIC_DRIVER_POSE_RANGE = 120;
 const wrapAngle = a => Math.atan2(Math.sin(a), Math.cos(a));
 const TRAFFIC_PROFILES = [
   { id: 'net-nine', callsign: 'NET BOAT 9', operator: 'EDDIE MORA', job: 'mullet netter', duty: [4.5, 14], threshold: 0.12, cruise: 0.72, work: [18, 34, 0.72], maxStorm: 0.58, channel: 'CH 16', faction: 'locals', color: '#78a6bd' },
@@ -300,14 +323,6 @@ const GEAR_MATS = {
   red: new THREE.MeshBasicMaterial({ color: 0xff3028, toneMapped: false }), green: new THREE.MeshBasicMaterial({ color: 0x35ff86, toneMapped: false }),
   blue: new THREE.MeshBasicMaterial({ color: 0x2d82ff, toneMapped: false }), warm: new THREE.MeshBasicMaterial({ color: 0xffe7b3, toneMapped: false }),
 };
-const SEARCH_BEAM_GEO = new THREE.PlaneGeometry(1, 1);
-const searchBeamMaterial = color => new THREE.ShaderMaterial({
-  uniforms: { color: { value: new THREE.Color(color) } },
-  vertexShader: 'varying vec2 vUv; void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}',
-  fragmentShader: 'uniform vec3 color; varying vec2 vUv; void main(){float v=vUv.y;float width=mix(0.06,0.7,v);float side=1.0-smoothstep(width*0.54,width,abs(vUv.x-0.5)*2.0);float fade=smoothstep(0.0,0.09,v)*(1.0-smoothstep(0.68,1.0,v));gl_FragColor=vec4(color,side*fade*0.075);}',
-  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, toneMapped: false,
-});
-const SEARCH_BEAM_MATS = { patrol: searchBeamMaterial(0xd9efff), courier: searchBeamMaterial(0xffe1b5) };
 const shiftOn = (hour, duty) => duty[0] < duty[1] ? hour >= duty[0] && hour < duty[1] : hour >= duty[0] || hour < duty[1];
 const RECOLOR_MATERIALS = new Map();
 function recolor(group, from, to) {
@@ -357,18 +372,50 @@ function fisherman(rr) {
   g.traverse(o => { if (o.isMesh) o.castShadow = true; });
   return g;
 }
+
+export function createTrafficDriverPoseInput() {
+  return {
+    speed: 0, steer: 0, angVel: 0, pitch: 0, roll: 0, apparentWind: 0, rpm: 0,
+    airborne: false, airTime: 0, impact: 0, hit: 0, heading: 0, hitNormal: new THREE.Vector2(),
+  };
+}
+
+// Ambient airboat operators use the same retained whole-body spring as the player. The input record belongs to the
+// persistent boat, and animation LOD keeps invisible body motion out of the far-field traffic simulation.
+export function updateTrafficDriverPose(boat, dt, time, distance) {
+  const driver = boat?.driver, input = boat?.driverPoseInput;
+  if (!driver || !input || distance > TRAFFIC_DRIVER_POSE_RANGE) return null;
+  const speed = Math.max(0, Number(boat.speed) || 0), max = Math.max(0.01, Number(boat.max) || 0.01);
+  const heading = Number(boat.heading) || 0, forwardX = -Math.sin(heading), forwardZ = -Math.cos(heading);
+  const wind = boat.surfaceWind, windSpeed = Math.max(0, Number(wind?.speed) || 0);
+  const airX = (Number(wind?.x) || 0) * windSpeed - forwardX * speed;
+  const airZ = (Number(wind?.z) || 0) * windSpeed - forwardZ * speed;
+  input.speed = speed;
+  input.steer = Math.max(-1, Math.min(1, (Number(boat.turn) || 0) / 1.54));
+  input.angVel = Number(boat.turn) || 0;
+  input.pitch = Number(boat.pitch) || 0;
+  input.roll = Number(boat.roll) || 0;
+  input.apparentWind = Math.hypot(airX, airZ);
+  input.rpm = boat.collision?.active ? 0 : Math.min(1, speed / max * 0.82 + (speed > 0.05 ? 0.1 : 0));
+  input.heading = heading;
+  const state = updateSeatedDriverPose(driver, input, dt, time);
+  input.hit = 0; input.impact = 0;
+  return state;
+}
+
 export class Traffic {
   constructor(terrain, scene, phys, fx) {
     this.T = terrain; this.scene = scene; this.phys = phys; this.fx = fx; // { plume, spray, audio, waveFn, emitStamp, game }
+    this.obLevel = 0; this.obPitch = 1; this.obX = 0; this.obZ = 0;
     this.rand = mulberry32(4242);
     this.boats = [];
     const saved = fx.game.save.traffic;
     this.state = saved && saved.version === 1 ? saved : { version: 1, operators: {} };
     this.state.operators ||= {}; fx.game.save.traffic = this.state;
     const john = (hull) => { const m = buildSkiff({ crew: true }); if (hull) recolor(m, 0x6f7570, hull); return { kind: 'john', mesh: m, crew: m.userData.crew, people: m.userData.people, max: 6.5 + this.rand() * 2.5 }; };
-    const air = (hull) => { const b = buildAirboat(); recolor(b.group, 0xd8dcda, hull); loadDriver(b.group).catch(() => {}); return { kind: 'air', mesh: b.group, prop: b.prop, blur: b.blur, rudders: b.rudders, max: 10.5 + this.rand() * 2.5 }; };
-    const cruiser = () => { const m = spawn('boat_dreams'); const rr = this.rand; const d = person(rr, { pose: 'sit', hat: true, drive: true }); d.position.set(0.45, 0.95, 0.3); d.rotation.y = Math.PI; m.add(d); const pas = person(rr, { pose: 'sit', hat: false, vest: true }); pas.position.set(-0.45, 0.95, 0.3); pas.rotation.y = Math.PI; m.add(pas); pair(d, pas); return { kind: 'cruiser', mesh: m, max: 8.5 + rr() * 2, people: [d, pas] }; };
-    const skiff = () => { const m = spawn('beau_boat'); const rr = this.rand; const d = person(rr, { pose: 'sit', hat: true, drive: true }); d.position.set(0, 0.32, 0.7); d.rotation.y = Math.PI; m.add(d); return { kind: 'skiff', mesh: m, max: 5 + rr() * 1.5, people: [d] }; };
+    const air = (hull) => { const b = buildAirboat(); recolor(b.group, 0xd8dcda, hull); const wetSurfaces = registerAirboatEnvironmentWetness(b.group), driver = installDriver(b.group); return { kind: 'air', mesh: b.group, prop: b.prop, blur: b.blur, rudders: b.rudders, driver, driverPoseInput: createTrafficDriverPoseInput(), wetSurfaces, max: 10.5 + this.rand() * 2.5 }; };
+    const cruiser = () => { const m = spawn('boat_dreams', buildModelBoatFallback('boat_dreams')); const rr = this.rand; const d = person(rr, { pose: 'sit', hat: true, drive: true }); d.position.set(0.45, 0.95, 0.3); d.rotation.y = Math.PI; m.add(d); const pas = person(rr, { pose: 'sit', hat: false, vest: true }); pas.position.set(-0.45, 0.95, 0.3); pas.rotation.y = Math.PI; m.add(pas); pair(d, pas); return { kind: 'cruiser', mesh: m, max: 8.5 + rr() * 2, people: [d, pas] }; };
+    const skiff = () => { const m = spawn('beau_boat', buildModelBoatFallback('beau_boat')); const rr = this.rand; const d = person(rr, { pose: 'sit', hat: true, drive: true }); d.position.set(0, 0.32, 0.7); d.rotation.y = Math.PI; m.add(d); return { kind: 'skiff', mesh: m, max: 5 + rr() * 1.5, people: [d] }; };
     const paddlers = () => ({ kind: 'canoe', mesh: canoe(this.rand), max: 1.3 + this.rand() * 0.4 });
     const hulls = [john(0), john(0x4c6b4a), cruiser(), skiff(), air(0x315e50), air(0x4b3527), paddlers()];
     for (let i = 0; i < hulls.length; i++) {
@@ -380,10 +427,20 @@ export class Traffic {
       const shelter = { active: false, arrived: false, kind: '', key: '', name: '', x: 0, z: 0, heading: 0, distance: 0 };
       const collision = { active: false, stage: '', t: 0, elapsed: 0, hold: 0, farT: 0, signalT: 0, impact: 0, distance: Infinity, prevState: 'transit', prevRetiring: false, prevLeg: 0, prevWorkT: 0, prevWorkRig: false, marker: { x: 0, z: 0, label: '', color: '#f06c38', trafficCollision: profile.id } };
       const navigation = createNavigationEncounter();
-      Object.assign(b, { profile, record, shelter, collision, navigation, navTargetBoat: null, navSignalTarget: '', shelterSlot: i, assisting: false, active: false, retiring: false, state: 'off', spawnT: 3 + i * 2.7, leg: 0, routeBias: 0, workT: 0, greetT: 0, wakeT: 0, x: 1e9, z: 1e9, heading: 0, speed: 0, turn: 0, roll: 0, pitch: 0, waterRoll: 0, waterPitch: 0, weatherSpeedScale: 1, hornT: 0, fogHornT: 6 + i * 16, fogSignalIndex: i, signalYield: 0, signalT: 0, signalSide: -1, signalReplyT: 0, signalReplyLong: false, navEvalT: i * 0.014, navSignalT: 0, navSignalState: 0, yellT: 0, ground: 0, shx: 0, shz: 0, pursuitYield: 0, pursuitNoticeT: 0, pursuitReactionDelay: 0.42 + this.rand() * 0.58, pursuitYieldSide: i & 1 ? 1 : -1, pursuitReacted: false, spoutAvoidance: 0, spoutDistance: Infinity, spoutNoticeT: 0, spoutReactionDelay: 0.65 + this.rand() * 1.1, spoutReacted: false });
+      Object.assign(b, { profile, record, shelter, collision, navigation, navTargetBoat: null, navSignalTarget: '', shelterSlot: i, assisting: false, active: false, retiring: false, state: 'off', spawnT: 3 + i * 2.7, leg: 0, routeBias: 0, workT: 0, greetT: 0, wakeT: 0, x: 1e9, z: 1e9, heading: 0, speed: 0, turn: 0, roll: 0, pitch: 0, waterRoll: 0, waterPitch: 0, weatherSpeedScale: 1, hornT: 0, fogHornT: 6 + i * 16, fogSignalIndex: i, signalYield: 0, signalT: 0, signalSide: -1, signalReplyT: 0, signalReplyLong: false, navEvalT: i * 0.014, navSignalT: 0, navSignalState: 0, yellT: 0, ground: 0, shx: 0, shz: 0, pursuitYield: 0, pursuitNoticeT: 0, pursuitReactionDelay: 0.42 + this.rand() * 0.58, pursuitYieldSide: i & 1 ? 1 : -1, pursuitReacted: false, spoutAvoidance: 0, spoutDistance: Infinity, spoutNoticeT: 0, spoutReactionDelay: 0.65 + this.rand() * 1.1, spoutReacted: false, downburstResponse: 0, downburstDistance: Infinity, downburstNoticeT: 0, downburstReactionDelay: 0.45 + this.rand() * 0.9, downburstReacted: false });
+      b.wildlifeAvoidance = 0; b.wildlifeDistance = Infinity; b.wildlifeClosest = Infinity;
+      b.wildlifeNoticeT = 0; b.wildlifeReactionDelay = 0.45 + this.rand() * 0.65; b.wildlifeReacted = false;
+      b.wildlifeEvalT = i * 0.027; b.wildlifeHoldT = 0; b.wildlifeHoldStrength = 0; b.wildlifeTarget = null; b.wildlifePlan = createManateeAvoidance();
+      const divergence = b.kind === 'canoe' || b.kind === 'skiff' ? 15 : 20;
+      b.windage = b.kind === 'air' ? 0.027 : b.kind === 'canoe' ? 0.018 : b.kind === 'cruiser' ? 0.018 : 0.023;
+      b.windDivergence = divergence * Math.PI / 180 * (i & 1 ? 1 : -1);
+      b.windHeelScale = b.kind === 'air' ? 1.2 : b.kind === 'canoe' ? 0.55 : b.kind === 'cruiser' ? 0.8 : 0.9;
+      b.windDrift = { x: 0, z: 0, speed: 0 }; b.windHeel = 0;
+      b.downburstField = {}; b.localOutflow = { x: 0, z: 0 }; b.surfaceWind = { x: 0, z: 0, speed: 0 };
       this.addWorkingDetails(b, i);
       b.mesh.visible = false; scene.add(b.mesh); this.boats.push(b);
       b.obs = { tag: 'boat', r: b.kind === 'air' ? 1.35 : b.kind === 'cruiser' ? 1.3 : b.kind === 'canoe' ? 0.5 : 1.1, boat: b, onHit: (into, nx, nz) => {
+        if (b.driverPoseInput && into >= b.driverPoseInput.hit) { b.driverPoseInput.hit = into; b.driverPoseInput.hitNormal.set(nx, nz); }
         b.shx += -nx * into * 0.5; b.shz += -nz * into * 0.5; b.speed *= 0.5;
         let pursuit = false;
         if (b.yellT <= 0 && into > 2.5) { b.yellT = 8; b.record.collisions++; pursuit = fx.game.boatHit(b, into); fx.game.persist(); }
@@ -399,7 +456,11 @@ export class Traffic {
     this.idlePasses = 0; this._flow = new THREE.Vector2(); this._pf = new THREE.Vector2(); this._bob = new THREE.Vector3();
     this._navVisibility = { port: true, starboard: true, stern: true };
     this._navigationCandidate = createNavigationEncounter();
+    this._downburstProbe = {};
+    this.wildlife = null; this.wildlifeCallT = 0; this._wildlifeInput = {};
+    this._wildlifeCandidate = createManateeAvoidance();
   }
+  setWildlife(wildlife = null) { this.wildlife = wildlife; return this; }
   addWorkingDetails(b, profileIndex) {
     const deck = b.kind === 'air' ? 0.55 : b.kind === 'canoe' ? 0.3 : b.kind === 'cruiser' ? 0.85 : 0.42;
     const beam = b.kind === 'canoe' ? 0.35 : b.kind === 'air' ? 0.85 : 0.65;
@@ -440,7 +501,7 @@ export class Traffic {
       const patrol = b.profile.id === 'fwc-27', rig = new THREE.Group(); rig.name = `searchlight:${b.profile.id}`; rig.position.set(0, deck + 0.72, -0.65);
       const target = new THREE.Object3D(); target.position.set(0, -0.5, -70);
       const light = new THREE.SpotLight(patrol ? 0xd9efff : 0xffe1b5, 0, patrol ? 135 : 95, patrol ? 0.13 : 0.11, 0.52, 1.65); light.target = target;
-      const length = patrol ? 36 : 28, width = patrol ? 5.5 : 3.8, beam = new THREE.Mesh(SEARCH_BEAM_GEO, patrol ? SEARCH_BEAM_MATS.patrol : SEARCH_BEAM_MATS.courier); beam.rotation.x = -Math.PI / 2; beam.scale.set(width, length, 1); beam.renderOrder = 34; beam.visible = false;
+      const length = patrol ? 36 : 28, width = patrol ? 5.5 : 3.8, beam = makeSurfaceSearchBeam(patrol ? 0xd9efff : 0xffe1b5, `surface searchlight beam:${b.profile.id}`); beam.scale.set(width, length, 1);
       rig.add(light, target); rig.visible = false; b.mesh.add(rig); (this.fx.waterScene || this.scene).add(beam); b.searchRig = rig; b.searchLight = light; b.searchBeam = beam; b.searchLength = length; b.searchWidth = width;
     }
     if (b.profile.id === 'fwc-27') {
@@ -660,6 +721,11 @@ export class Traffic {
     if (b.collision?.active) this.restoreAfterCollision(b);
     this.clearShelter(b); b.assisting = false; b.active = false; b.retiring = false; b.state = 'off'; b.mesh.visible = false; b.x = b.z = 1e9; b.speed = 0; b.spawnT = delay + this.rand() * delay;
     b.signalYield = 0; b.signalT = 0; b.signalReplyT = 0; b.signalReplyLong = false;
+    b.wildlifeAvoidance = 0; b.wildlifeDistance = Infinity; b.wildlifeClosest = Infinity; b.wildlifeNoticeT = 0;
+    b.wildlifeReacted = false; b.wildlifeHoldT = 0; b.wildlifeHoldStrength = 0; b.wildlifeTarget = null; b.wildlifeEvalT = 0; clearManateeAvoidance(b.wildlifePlan);
+    b.downburstResponse = 0; b.downburstDistance = Infinity; b.downburstNoticeT = 0; b.downburstReacted = false;
+    downburstCraftUrgency(null, b.x, b.z, b.kind, b.downburstField); b.localOutflow.x = 0; b.localOutflow.z = 0;
+    b.surfaceWind.x = 0; b.surfaceWind.z = 0; b.surfaceWind.speed = 0; b.windDrift.x = 0; b.windDrift.z = 0; b.windDrift.speed = 0; b.windHeel = 0;
     clearNavigationEncounter(b.navigation); b.navTargetBoat = null; b.navEvalT = 0; b.navSignalT = 0; b.navSignalState = 0; b.navSignalTarget = '';
     if (b.workRig) b.workRig.visible = false; if (b.navLights) b.navLights.visible = false; if (b.deckLight) b.deckLight.intensity = 0;
     if (b.searchRig) { b.searchRig.visible = false; b.searchLight.intensity = 0; b.searchBeam.visible = false; }
@@ -676,6 +742,8 @@ export class Traffic {
       for (let i = 0; i < 12; i++) { const h = i / 12 * 6.283; const d = -hf.compute(x - Math.sin(h) * 40, z - Math.cos(h) * 40) - hf.compute(x - Math.sin(h) * 80, z - Math.cos(h) * 80); if (d > bd) { bd = d; best = h; } }
       if (best === null || bd < 3) continue;
       this.clearShelter(b); b.assisting = false; b.x = x; b.z = z; b.heading = best; b.speed = b.max * 0.45; b.mesh.visible = true; b.ground = 0; b.active = true; b.retiring = false;
+      b.wildlifeAvoidance = 0; b.wildlifeDistance = Infinity; b.wildlifeClosest = Infinity; b.wildlifeNoticeT = 0;
+      b.wildlifeReacted = false; b.wildlifeHoldT = 0; b.wildlifeHoldStrength = 0; b.wildlifeTarget = null; clearManateeAvoidance(b.wildlifePlan);
       clearNavigationEncounter(b.navigation); b.navTargetBoat = null; b.navEvalT = 0; b.navSignalT = 0; b.navSignalState = 0; b.navSignalTarget = ''; this.beginLeg(b, true);
       const key = this.shiftKey(b);
       if (b.record.lastShift !== key) { b.record.lastShift = key; b.record.shifts++; this.fx.game.persist(); }
@@ -773,6 +841,53 @@ export class Traffic {
       }
     }
   }
+  updateWildlifeResponse(b, dt, blocked) {
+    const manatees = this.wildlife?.manatees, plan = b.wildlifePlan;
+    b.wildlifeEvalT -= dt;
+    if (!blocked && manatees?.list?.length && b.wildlifeEvalT <= 0) {
+      b.wildlifeEvalT = Math.max(0.02, b.wildlifeEvalT + 0.2); // staggered 5 Hz visual appraisal
+      clearManateeAvoidance(plan); let target = null, bestUrgency = 0, bestClosest = Infinity;
+      const fog = Math.max(0, Math.min(1, Number(this.environment?.restrictedVisibility) || 0));
+      const night = Math.max(0, Math.min(1, Number(this.environment?.night) || 0));
+      const storm = Math.max(0, Math.min(1, Number(this.environment?.values?.storm) || 0));
+      const baseRange = b.kind === 'canoe' ? 66 : 96;
+      const visualRange = Math.max(28, baseRange * (1 - fog * 0.58) * (1 - night * 0.3) * (1 - storm * 0.16));
+      const input = this._wildlifeInput, candidate = this._wildlifeCandidate;
+      input.boatX = b.x; input.boatZ = b.z; input.boatHeading = b.heading; input.boatSpeed = b.speed;
+      input.sidePreference = b.profile.id === 'fwc-27' ? 1 : (b.shelterSlot & 1 ? 1 : -1);
+      for (let i = 0; i < manatees.list.length; i++) {
+        const m = manatees.list[i]; if (!m?.pos || m.held || m.mesh?.visible === false) continue;
+        const footprintOnly = !m.surfaced;
+        input.visible = Boolean(m.surfaced || m.zoneT > 0.1); input.sightRange = visualRange * (footprintOnly ? 0.72 : 1);
+        input.animalX = m.pos.x; input.animalZ = m.pos.z; input.animalHeading = m.heading; input.animalSpeed = m.speed;
+        evaluateManateeApproach(input, candidate);
+        if (!candidate.active || candidate.urgency < bestUrgency || (candidate.urgency === bestUrgency && candidate.closestApproach >= bestClosest)) continue;
+        copyManateeAvoidance(candidate, plan); target = m; bestUrgency = candidate.urgency; bestClosest = candidate.closestApproach;
+      }
+      if (target !== b.wildlifeTarget) { b.wildlifeNoticeT = 0; b.wildlifeReacted = false; }
+      b.wildlifeTarget = target;
+    }
+    if (!manatees?.list?.length) { clearManateeAvoidance(plan); b.wildlifeTarget = null; }
+    b.wildlifeDistance = plan.active ? plan.distance : Infinity; b.wildlifeClosest = plan.active ? plan.closestApproach : Infinity;
+    b.wildlifeNoticeT = !blocked && plan.active ? b.wildlifeNoticeT + dt : Math.max(0, b.wildlifeNoticeT - dt * 1.8);
+    const aware = !blocked && manateeReactionReady(plan, b.wildlifeNoticeT, b.wildlifeReactionDelay);
+    b.wildlifeHoldT = Math.max(0, (Number(b.wildlifeHoldT) || 0) - dt);
+    if (aware) { b.wildlifeHoldStrength = Math.min(1, plan.urgency * 1.35 + 0.14); b.wildlifeHoldT = 3.5; }
+    const desired = blocked ? 0 : (aware || b.wildlifeHoldT > 0 ? b.wildlifeHoldStrength : 0);
+    const rate = desired > b.wildlifeAvoidance ? 3.1 : 1.35;
+    b.wildlifeAvoidance += (desired - b.wildlifeAvoidance) * (1 - Math.exp(-dt * rate));
+    if (aware && !b.wildlifeReacted) {
+      b.wildlifeReacted = true; if (b.state === 'work') this.beginLeg(b);
+      const listenerDistance = Math.hypot(b.x - this.phys.pos.x, b.z - this.phys.pos.y);
+      if (this.wildlifeCallT <= 0 && listenerDistance < 520 && this.radio?.transmit({
+        channel: b.profile.channel, speaker: `${b.profile.callsign} · ${b.profile.operator}`,
+        text: b.kind === 'canoe' ? 'Manatee footprint ahead. Holding the paddle and passing wide.' : 'Manatee footprint ahead. Coming off plane and giving it fifty feet.',
+        priority: 1, key: `traffic:manatee:${b.profile.id}`, cooldown: 35,
+      })) this.wildlifeCallT = 35;
+    }
+    if (!plan.active && b.wildlifeHoldT <= 0 && b.wildlifeAvoidance < 0.015) { b.wildlifeNoticeT = 0; b.wildlifeReacted = false; b.wildlifeHoldStrength = 0; b.wildlifeTarget = null; }
+    return b.wildlifeAvoidance;
+  }
   updatePursuitResponse(b, d, pf, dt, blocked) {
     const active = Boolean(this.law?.pursuit);
     const target = blocked ? 0 : pursuitYieldStrength(active, this.law?.attention || 0, d, this.phys.speed, b.kind, b.profile.id === 'fwc-27');
@@ -811,6 +926,27 @@ export class Traffic {
     if (aware && !b.spoutReacted) { b.spoutReacted = true; if (b.state === 'work') this.beginLeg(b); }
     if (!active && b.spoutAvoidance < 0.015) { b.spoutNoticeT = 0; b.spoutReacted = false; }
     return b.spoutAvoidance;
+  }
+  updateDownburstResponse(b, dt, blocked) {
+    const cell = this.hazards?.downburst, active = Boolean(cell?.active);
+    const field = downburstCraftUrgency(cell, b.x, b.z, b.kind, b.downburstField);
+    const target = blocked ? 0 : field.urgency * (b.profile?.essential ? 0.88 : 1);
+    b.downburstDistance = field.distance;
+    b.downburstNoticeT = target > 0.025 ? b.downburstNoticeT + dt : Math.max(0, b.downburstNoticeT - dt * 1.7);
+    const aware = !blocked && downburstReactionReady(field, b.downburstNoticeT, b.downburstReactionDelay), desired = aware ? target : 0;
+    const rate = desired > b.downburstResponse ? 2.8 : 1.2;
+    b.downburstResponse += (desired - b.downburstResponse) * (1 - Math.exp(-dt * rate));
+    if (aware && !b.downburstReacted) { b.downburstReacted = true; if (b.state === 'work') this.beginLeg(b); }
+    if (!active && b.downburstResponse < 0.015) { b.downburstNoticeT = 0; b.downburstReacted = false; }
+    return b.downburstResponse;
+  }
+  updateSurfaceWind(b, baseDirection, baseSpeed) {
+    b.localOutflow.x = Number.isFinite(b.downburstField.windX) ? b.downburstField.windX : 0;
+    b.localOutflow.z = Number.isFinite(b.downburstField.windZ) ? b.downburstField.windZ : 0;
+    const wind = combinedSurfaceWind(baseDirection, baseSpeed, b.localOutflow, b.surfaceWind);
+    vesselLeeway(wind, wind.speed, b.windage, b.windDivergence, b.windDrift);
+    b.windHeel = vesselWindHeel(wind, wind.speed, b.heading, b.windHeelScale);
+    return wind;
   }
   updateNavigationResponse(b, d, dt, blocked) {
     const nav = b.navigation;
@@ -911,7 +1047,7 @@ export class Traffic {
     return this.fx.waveFn(x, z, t) + this.playerWakeAt(x, z, t) + this.wakeHeightAt(x, z, t, excludeBoat);
   }
   snapshot() {
-    return this.boats.map(b => ({ id: b.profile.id, callsign: b.profile.callsign, operator: b.profile.operator, job: b.profile.job, onDuty: this.onDuty(b), shouldOperate: this.shouldOperate(b), stormLimit: b.profile.maxStorm, active: b.active, assisting: b.assisting, retiring: b.retiring, state: b.state, x: b.x, z: b.z, speed: b.speed, weatherSpeedScale: b.weatherSpeedScale, pursuitYield: b.pursuitYield, waterspoutAvoidance: b.spoutAvoidance, waterspoutDistance: b.spoutDistance, hornYield: b.signalYield, hornReplyIn: b.signalReplyT, fogSignalIn: b.fogHornT, navigation: b.navigation.role === NAVIGATION_ROLE.CLEAR ? null : { kind: b.navigation.kind, role: b.navigation.role, target: b.navTargetBoat ? b.navTargetBoat.profile.id : 'player', risk: b.navigation.risk, emergency: b.navigation.emergency, closestApproach: b.navigation.closestApproach, timeToClosest: b.navigation.timeToClosest, signalBlasts: b.navigation.signalBlasts }, shelter: b.shelter.active ? { kind: b.shelter.kind, key: b.shelter.key, name: b.shelter.name, x: b.shelter.x, z: b.shelter.z, heading: b.shelter.heading, distance: b.shelter.distance, arrived: b.shelter.arrived } : null, collision: b.collision.active ? { stage: b.collision.stage, impact: b.collision.impact, hold: b.collision.hold, distance: b.collision.distance } : null, shifts: b.record.shifts, passes: b.record.passes, collisions: b.record.collisions, seriousCollisions: b.record.seriousCollisions, aidedAfterCollision: b.record.aidedAfterCollision, leftDisabled: b.record.leftDisabled, wakeComplaints: b.record.wakeComplaints, wakeReports: b.record.wakeReports, shiftWakeComplaints: b.record.wakeShiftComplaints }));
+    return this.boats.map(b => ({ id: b.profile.id, callsign: b.profile.callsign, operator: b.profile.operator, job: b.profile.job, onDuty: this.onDuty(b), shouldOperate: this.shouldOperate(b), stormLimit: b.profile.maxStorm, active: b.active, assisting: b.assisting, retiring: b.retiring, state: b.state, x: b.x, z: b.z, speed: b.speed, weatherSpeedScale: b.weatherSpeedScale, wind: { speed: b.surfaceWind.speed, leeway: b.windDrift.speed, x: b.windDrift.x, z: b.windDrift.z, divergence: b.windDivergence, heel: b.windHeel, localOutflow: b.downburstField.speed || 0 }, pursuitYield: b.pursuitYield, wildlifeAvoidance: b.wildlifeAvoidance, wildlifeDistance: b.wildlifeDistance, wildlifeClosestApproach: b.wildlifeClosest, waterspoutAvoidance: b.spoutAvoidance, waterspoutDistance: b.spoutDistance, downburstResponse: b.downburstResponse, downburstDistance: b.downburstDistance, hornYield: b.signalYield, hornReplyIn: b.signalReplyT, fogSignalIn: b.fogHornT, navigation: b.navigation.role === NAVIGATION_ROLE.CLEAR ? null : { kind: b.navigation.kind, role: b.navigation.role, target: b.navTargetBoat ? b.navTargetBoat.profile.id : 'player', risk: b.navigation.risk, emergency: b.navigation.emergency, closestApproach: b.navigation.closestApproach, timeToClosest: b.navigation.timeToClosest, signalBlasts: b.navigation.signalBlasts }, shelter: b.shelter.active ? { kind: b.shelter.kind, key: b.shelter.key, name: b.shelter.name, x: b.shelter.x, z: b.shelter.z, heading: b.shelter.heading, distance: b.shelter.distance, arrived: b.shelter.arrived } : null, collision: b.collision.active ? { stage: b.collision.stage, impact: b.collision.impact, hold: b.collision.hold, distance: b.collision.distance } : null, shifts: b.record.shifts, passes: b.record.passes, collisions: b.record.collisions, seriousCollisions: b.record.seriousCollisions, aidedAfterCollision: b.record.aidedAfterCollision, leftDisabled: b.record.leftDisabled, wakeComplaints: b.record.wakeComplaints, wakeReports: b.record.wakeReports, shiftWakeComplaints: b.record.wakeShiftComplaints }));
   }
   // ---- anglers ----
   anglerAt(ci, cj) {
@@ -944,9 +1080,10 @@ export class Traffic {
   update(dt, t, fish) {
     const P = this.phys, bx = P.pos.x, bz = P.pos.y;
     const pf = P.forward(this._pf);
+    this.wildlifeCallT = Math.max(0, this.wildlifeCallT - dt);
     if (this.law?.pursuit) this.pursuitClearT = 0;
     else { this.pursuitClearT += dt; if (this.pursuitClearT > 4) this.pursuitCallMade = false; }
-    this.obs.length = 0; let ob = 0, obp = 1;
+    this.obs.length = 0; let ob = 0, obp = 1, obx = 0, obz = 0;
     for (const b of this.boats) {
       b.yellT = Math.max(0, b.yellT - dt); b.hornT = Math.max(0, b.hornT - dt); b.greetT = Math.max(0, b.greetT - dt); b.wakeT = Math.max(0, b.wakeT - dt);
       if (b.signalT > 0) b.signalT = Math.max(0, b.signalT - dt); else b.signalYield *= Math.exp(-dt * 2.2);
@@ -997,13 +1134,15 @@ export class Traffic {
       else if (b.state === 'work') { b.workT -= dt; if (b.workT <= 0) this.beginLeg(b); }
       else { b.leg -= b.speed * dt; if (b.leg <= 0) { if (this.rand() < b.profile.work[2]) this.beginWork(b); else this.beginLeg(b); } }
       const maneuverBlocked = b.collision.active || assisting || b.shelter.active;
+      const wildlifeAvoidance = this.updateWildlifeResponse(b, dt, maneuverBlocked);
       const pursuitYield = this.updatePursuitResponse(b, d, pf, dt, maneuverBlocked);
       const spout = this.hazards?.spout, spoutAvoidance = this.updateWaterspoutResponse(b, dt, b.collision.active || assisting || b.state === 'sheltered');
+      const downburst = this.hazards?.downburst, downburstResponse = this.updateDownburstResponse(b, dt, b.collision.active || assisting || b.state === 'sheltered');
       const signalYield = maneuverBlocked ? 0 : b.signalYield, maneuverYield = Math.max(pursuitYield, signalYield);
       const maneuverSide = pursuitYield >= signalYield ? b.pursuitYieldSide : b.signalSide;
       // Ordinary skippers apply the Inland meeting/crossing/overtaking hierarchy. Active emergencies and severe fog
       // retain priority; in restricted visibility the existing Rule 19 safe-speed and Rule 35 sound logic takes over.
-      const navigationBlocked = maneuverBlocked || pursuitYield > 0.08 || spoutAvoidance > 0.08 || P.airborne || P.wipeT > 0 || (fogRisk > 0.75 && d > 55);
+      const navigationBlocked = maneuverBlocked || wildlifeAvoidance > 0.08 || pursuitYield > 0.08 || spoutAvoidance > 0.08 || downburstResponse > 0.08 || P.airborne || P.wipeT > 0 || (fogRisk > 0.75 && d > 55);
       const navigation = this.updateNavigationResponse(b, d, dt, navigationBlocked);
       const navigationActive = navigation.role !== NAVIGATION_ROLE.CLEAR;
       const navigationTargetX = b.navTargetBoat ? b.navTargetBoat.x : bx;
@@ -1037,7 +1176,9 @@ export class Traffic {
         } else if (b.state === 'sheltered') sc -= Math.abs(wrapAngle(h - b.shelter.heading)) * 3.4;
         // Prefer probes that increase separation so an off-duty boat visibly runs out of the local channel.
         if (b.retiring) sc += (dp - d) * 0.16;
+        if (wildlifeAvoidance > 0.01) sc += manateeProbeScore(b.wildlifePlan, px2, pz2, da, wildlifeAvoidance);
         if (spoutAvoidance > 0.01 && spout?.active) sc += waterspoutProbeScore(spout.x, spout.z, spout.motionX, spout.motionZ, b.x, b.z, px2, pz2, spoutAvoidance);
+        if (downburstResponse > 0.01 && downburst?.active) sc += downburstProbeScore(downburst, b.downburstField, px2, pz2, -Math.sin(h), -Math.cos(h), b.kind, downburstResponse, this._downburstProbe);
         const trafficClear = 18 + fogRisk * 20;
         for (const o of this.boats) if (o !== b && o.active) { const dd = Math.hypot(px - o.x, pz - o.z); if (dd < trafficClear) sc -= (trafficClear - dd) * (0.4 + fogRisk * 0.22); }
         if (sc > bs) { bs = sc; best = da; }
@@ -1053,7 +1194,13 @@ export class Traffic {
       want *= pursuitYieldSpeedScale(pursuitYield, b.kind);
       want *= hornYieldSpeedScale(signalYield, b.kind);
       if (navigationActive) want *= navigation.speedScale;
+      want *= manateeSpeedScale(wildlifeAvoidance, b.kind);
       if (spoutAvoidance > 0.01) want = Math.max(want, b.max * b.weatherSpeedScale * (b.kind === 'canoe' ? 0.38 + spoutAvoidance * 0.2 : 0.48 + spoutAvoidance * 0.3));
+      if (downburstResponse > 0.01) {
+        const cautious = b.kind === 'canoe' ? 0.45 : b.kind === 'cruiser' ? 0.62 : 0.7;
+        const steerage = b.kind === 'canoe' ? 0.16 : b.kind === 'cruiser' ? 0.28 : 0.34;
+        want = Math.max(want * (1 - downburstResponse * (1 - cautious)), b.max * b.weatherSpeedScale * steerage * downburstResponse);
+      }
       if (b.state === 'shelter-run') { const desired = Math.atan2(-(b.shelter.x - b.x), -(b.shelter.z - b.z)), alignment = 1 - Math.min(1, Math.abs(wrapAngle(desired - b.heading)) / 1.25); want *= 0.04 + alignment * 0.96; }
       const playerWake = d < 100 ? wakeSampleAt(bx, bz, P.heading, P.speed, 18, 0.2, b.x, b.z, t) : 0;
       const wakeLevel = !b.collision.active && !assisting ? wakeSeverity({ kind: b.kind, working: Boolean(b.workRig?.visible), playerSpeed: P.speed, wakeHeight: playerWake }) : 0;
@@ -1064,12 +1211,14 @@ export class Traffic {
       b.turn += ((b.collision.active ? 0 : best * 2.2) - b.turn) * (1 - Math.exp(-dt * 3)); b.heading += b.turn * dt;
       if (b.state === 'tow-alongside') { const settle = 1 - Math.exp(-dt * 1.8); b.heading += wrapAngle(P.heading + this.assist.headingOffset - b.heading) * settle; b.turn *= Math.exp(-dt * 3); }
       else if (b.state === 'sheltered') { const settle = 1 - Math.exp(-dt * 1.5); b.heading += wrapAngle(b.shelter.heading - b.heading) * settle; b.turn *= Math.exp(-dt * 2.6); }
-      b.speed += (want - b.speed) * (1 - Math.exp(-dt * 0.7));
+      const speedResponse = wildlifeAvoidance > 0.05 && want < b.speed ? 1.55 : 0.7;
+      b.speed += (want - b.speed) * (1 - Math.exp(-dt * speedResponse));
       const fx = -Math.sin(b.heading), fz = -Math.cos(b.heading);
       const flow = this.fx.currents ? this.fx.currents.flowAt(b.x, b.z, this._flow) : null;
-      const windDir = this.environment?.windDir, leeway = (b.kind === 'canoe' ? 0.018 : b.kind === 'air' ? 0.006 : 0.009) * (weather?.wind || 0);
-      b.x += (fx * b.speed + (flow ? flow.x : 0) + (windDir ? windDir.x * leeway : 0)) * dt + b.shx * dt;
-      b.z += (fz * b.speed + (flow ? flow.y : 0) + (windDir ? windDir.z * leeway : 0)) * dt + b.shz * dt;
+      const windDir = this.environment?.windDir, windSpeed = (weather?.wind || 0) * (this.environment?.gust || 1);
+      this.updateSurfaceWind(b, windDir, windSpeed);
+      b.x += (fx * b.speed + (flow ? flow.x : 0) + b.windDrift.x) * dt + b.shx * dt;
+      b.z += (fz * b.speed + (flow ? flow.y : 0) + b.windDrift.z) * dt + b.shz * dt;
       if (b.state === 'tow-alongside') {
         const hold = 1 - Math.exp(-dt * 1.65); b.x += (this.assist.targetX - b.x) * hold; b.z += (this.assist.targetZ - b.z) * hold; b.speed *= Math.exp(-dt * 2.4);
       } else if (b.state === 'sheltered') {
@@ -1089,17 +1238,17 @@ export class Traffic {
       const leftH = this.surfaceHeightAt(b.x - rx * halfBeam, b.z - rz * halfBeam, t, b);
       b.waterPitch = Math.max(-0.2, Math.min(0.2, Math.atan2(bowH - sternH, halfLength * 2)));
       b.waterRoll = Math.max(-0.2, Math.min(0.2, Math.atan2(rightH - leftH, halfBeam * 2)));
-      b.roll += ((-b.turn * b.speed * 0.02 + b.waterRoll) - b.roll) * (1 - Math.exp(-dt * 4));
+      b.roll += ((-b.turn * b.speed * 0.02 + b.waterRoll + b.windHeel) - b.roll) * (1 - Math.exp(-dt * 4));
       b.pitch += ((b.speed * (b.kind === 'air' ? 0.004 : 0.007) + b.waterPitch) - b.pitch) * (1 - Math.exp(-dt * 3));
       b.mesh.position.set(b.x, wy + (b.kind === 'air' ? -0.27 : b.kind === 'john' || b.kind === 'canoe' ? -0.05 : 0), b.z); b.mesh.rotation.set(b.pitch, b.heading, b.roll, 'YXZ');
-      if (b.kind === 'air') { if (!b.collision.active) b.prop.rotation.z += dt * (8 + b.speed * 8); b.blur.material.opacity = b.collision.active ? 0 : Math.min(0.35, b.speed / b.max * 0.4); for (const r of b.rudders) r.rotation.y = -b.turn * 0.25; }
+      if (b.kind === 'air') { if (!b.collision.active) b.prop.rotation.z += dt * (8 + b.speed * 8); b.blur.material.opacity = b.collision.active ? 0 : Math.min(0.35, b.speed / b.max * 0.4); for (const r of b.rudders) r.rotation.y = -b.turn * 0.25; updateTrafficDriverPose(b, dt, t, d); }
       else if (b.kind === 'john') { const motor = b.mesh.userData.motor; motor.rotation.y = -b.turn * 0.3; if (!b.collision.active) motor.userData.prop.rotation.z += dt * (6 + b.speed * 5); }
       else if (b.kind === 'canoe') paddleAnim(b.mesh, t, Math.min(1, b.speed / b.max));
       if (b.people && d < 90) for (const pp of b.people) animatePerson(pp, t, dt, { x: bx, z: bz, speed: P.speed }, null);
       this.updateCrew(b, t, dt, d, playerWake);
       this.updateWorkingDetails(b, t); this.identify(b, d, P.speed);
       // the closest running motor is what you hear
-      if (!b.collision.active && b.kind !== 'air' && b.kind !== 'canoe' && d < 130) { const l = (0.3 + 0.7 * b.speed / b.max) * (1 - d / 130); if (l > ob) { ob = l; obp = b.kind === 'cruiser' ? 0.8 : b.kind === 'skiff' ? 1.25 : 1; } }
+      if (!b.collision.active && b.kind !== 'air' && b.kind !== 'canoe' && d < 130) { const l = (0.3 + 0.7 * b.speed / b.max) * (1 - d / 130); if (l > ob) { ob = l; obp = b.kind === 'cruiser' ? 0.8 : b.kind === 'skiff' ? 1.25 : 1; obx = b.x; obz = b.z; } }
       // Rule 35(a): a power-driven vessel making way in restricted visibility sounds one prolonged blast.
       const fogFishing = fogRisk > 0.45 && !b.collision.active && !assisting && b.profile.id === 'net-nine' && b.state === 'work';
       const fogMakingWay = fogRisk > 0.45 && !b.collision.active && !assisting && b.kind !== 'canoe' && !fogFishing && b.state !== 'sheltered' && b.state !== 'tow-alongside' && b.speed > 0.75;
@@ -1121,7 +1270,7 @@ export class Traffic {
         for (let i = 0; i < n * 5; i++) spray.emit(b.x - fx * 2.4 + jitter() * 1.2, 0.05, b.z - fz * 2.4 + jitter() * 1.2, -fx * (1 + Math.random() * 3) + jitter() * 1.5, 0.5 + Math.random() * 2, -fz * (1 + Math.random() * 3) + jitter() * 1.5, 0.012 + Math.random() * 0.03, 0.4 + Math.random() * 0.5, 0.5);
       }
     }
-    this.obLevel = ob; this.obPitch = obp;
+    this.obLevel = ob; this.obPitch = obp; this.obX = obx; this.obZ = obz;
     // anglers come and go with distance
     this.checkT -= dt;
     if (this.checkT <= 0) {
@@ -1224,7 +1373,7 @@ export class Life {
     this.folk = new Folk(o.terrain, o.scene, fx);
     this.audio = o.audio; this.waveFn = o.waveFn; this.phys = o.phys; this.fx = fx;
     this.context = { bx: 0, bz: 0, speed: 0, dt: 0, emitStamp: this.emitStamp, plume: o.plume, spray: o.spray, audio: o.audio, fish: this.fish, ob: 0, truck: 0, heightAt: (x, z) => o.terrain.heightAt(x, z) };
-    this.obLevel = 0; this.obPitch = 1;
+    this.obLevel = 0; this.obPitch = 1; this.obX = 0; this.obZ = 0;
   }
   update(dt, t) {
     this.stampPool.reset();
@@ -1233,7 +1382,7 @@ export class Life {
     this.traffic.update(dt, t, this.fish);
     const ctx = this.context; ctx.bx = this.phys.pos.x; ctx.bz = this.phys.pos.y; ctx.speed = this.phys.speed; ctx.dt = dt; ctx.ob = 0; ctx.truck = 0;
     this.folk.update(dt, t, ctx);
-    this.obLevel = this.traffic.obLevel; this.obPitch = this.traffic.obPitch;
+    this.obLevel = this.traffic.obLevel; this.obPitch = this.traffic.obPitch; this.obX = this.traffic.obX; this.obZ = this.traffic.obZ;
   }
   stamps(out) { this.stampPool.appendTo(out); }
 }

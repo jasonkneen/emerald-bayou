@@ -7,6 +7,7 @@ import { WORLD_HALF } from './heightfield.js';
 import { cachedResource, sharedResource } from './cache.js';
 import { emitWakeStamp } from './wakestamps.js';
 import { emitMapMarker } from './mapmarkers.js';
+import { clampWakeHeight, wakeSampleAt } from './wakefield.js';
 
 const MPH = 2.23694;
 const clamp = (v, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
@@ -75,7 +76,7 @@ function makeReceiverAgent(mesh) {
   return {
     mesh, role: 'storm-recovery', x: 0, z: 0, heading: 0, navHeading: 0, speed: 0, turn: 0, choice: 0,
     decisionT: 0, targetX: 0, targetZ: 0, safeX: 0, safeZ: 0, active: false, backing: false,
-    shx: 0, shz: 0, groundT: 0, safe: true,
+    shx: 0, shz: 0, groundT: 0, safe: true, navigationLights: true,
   };
 }
 
@@ -178,7 +179,7 @@ export class StormRecovery {
     this.enabled = false; this.interact = false; this.alternate = false; this.prompting = false; this.interactiveNear = null;
     this.towSite = null; this.passengerSite = null; this.persistT = 6; this.weatherPersistT = 12; this.hitCd = 0; this.cleanupT = 20;
     this.disposedResources = { geometries: 0, materials: 0 };
-    this.obLevel = 0; this.obPitch = 0.96; this._f = new THREE.Vector2(); this._flow = new THREE.Vector2();
+    this.obLevel = 0; this.obPitch = 0.96; this.obX = 0; this.obZ = 0; this._f = new THREE.Vector2(); this._flow = new THREE.Vector2();
     for (const site of this.sites) this.buildRig(site);
     this.restoreActiveStates();
     this.keyHandler = e => {
@@ -631,13 +632,13 @@ export class StormRecovery {
   }
 
   updateAudio() {
-    this.obLevel = 0; this.obPitch = 0.96;
+    this.obLevel = 0; this.obPitch = 0.96; this.obX = 0; this.obZ = 0;
     for (const site of this.sites) {
       const movingWorkboat = site.type === 'blockage' && site.stage === 'marked';
       const movingRecovery = site.type === 'survivor' && site.stage === 'reported';
       if (!movingWorkboat && !movingRecovery) continue;
       const rig = this.rigs.get(site.id), A = rig.agent, d = Math.hypot(A.x - this.phys.pos.x, A.z - this.phys.pos.y);
-      if (A.active && d < 160) this.obLevel = Math.max(this.obLevel, (0.25 + 0.7 * Math.min(1, A.speed / 9)) * (1 - d / 160));
+      if (A.active && d < 160) { const level = (0.25 + 0.7 * Math.min(1, A.speed / 9)) * (1 - d / 160); if (level > this.obLevel) { this.obLevel = level; this.obX = A.x; this.obZ = A.z; } }
     }
   }
 
@@ -667,6 +668,32 @@ export class StormRecovery {
       this.persistT -= dt; if (this.persistT <= 0) { this.persistT = 6; this.persist(); }
     }
     this.cleanupT -= dt; if (this.cleanupT <= 0) { this.cleanupT = 20; this.prune(); }
+  }
+
+  wakeHeightAt(x, z, t) {
+    let height = 0;
+    for (let i = 0; i < this.sites.length; i++) {
+      const site = this.sites[i];
+      const movingWorkboat = site.type === 'blockage' && site.stage === 'marked';
+      const movingRecovery = site.type === 'survivor' && site.stage === 'reported';
+      if (!movingWorkboat && !movingRecovery) continue;
+      const A = this.rigs.get(site.id)?.agent;
+      if (!A?.active || A.backing || A.speed <= 2.2) continue;
+      const dx = x - A.x, dz = z - A.z; if (dx * dx + dz * dz > 10609) continue;
+      height += wakeSampleAt(A.x, A.z, A.heading, A.speed, 9, 0.095, x, z, t);
+    }
+    return clampWakeHeight(height, 0.2);
+  }
+
+  visitActiveVessels(visitor) {
+    for (let i = 0; i < this.sites.length; i++) {
+      const site = this.sites[i];
+      const movingWorkboat = site.type === 'blockage' && site.stage === 'marked';
+      const movingRecovery = site.type === 'survivor' && site.stage === 'reported';
+      if (!movingWorkboat && !movingRecovery) continue;
+      const agent = this.rigs.get(site.id)?.agent;
+      if (agent?.active) visitor(agent.x, agent.z, agent.speed, 'skiff', agent);
+    }
   }
 
   stamps(out) {
