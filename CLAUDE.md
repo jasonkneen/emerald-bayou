@@ -37,6 +37,11 @@ Rendering / world (the hot path):
   `startup.js` maps the tier to a loading plan (blocking models, warm-up on/off, terrain-readiness gates).
 - `particles.js` — Spray/Plume ring buffers; `models.js` — GLB cache with a deferred queue (low tiers trickle
   optional models in idle time); `textures.js` — canvas-generated textures.
+- `scenelightpool.js` — the fixed pool of proxy point/spot lights gameplay lamps bind to (three.js bakes light
+  counts into programs, so the visible count never changes); `lightshader.js` patches three's light loops to
+  skip zero-radiance lights; `particlelighting.js` — shared sun/sky/spotlight uniforms for spray and mist.
+- `renderersize.js` — single drawing-surface resize (`setPixelRatio` + `setSize` collapse to one canvas reset);
+  `staticinstances.js` — collapses a static GLB subtree's identical meshes into one InstancedMesh.
 
 Gameplay (all orchestrated from `main.js` `init()`): `game.js` (missions, save, HUD), `story.js`,
 `encounters.js`, `incidents.js`, `aftermath.js`, `contracts.js` (events), `life.js` + `residents.js` +
@@ -45,7 +50,8 @@ chases), `reputation.js`, `radio.js`, `condition.js`, `regions.js`, `currents.js
 `stormline.js`/`stormhazards.js`, `wakeconduct.js` (wake-violation escalation), `discoveries.js` (rare
 finds), `navigationaids.js` (channel markers) + `navigationrules.js` (sound-signal geometry),
 `racecourse.js` + `raceformats.js` (races), `fishing.js` (catch-and-release), `dolphins.js`,
-`nocturnal.js` (fireflies), `trafficresponse.js` (how traffic yields to pursuits),
+`pelicans.js` (flocks with an authored GLB flight pose), `nocturnal.js` (fireflies),
+`trafficresponse.js` (how traffic yields to pursuits),
 `wakestamps.js` (pooled stamps). `cache.js` holds the shared cell-trim / attribute-prefix helpers.
 `hud.js` is the radar; `worldmap.js` the Tab chart — both are 2D canvases fed by worker-rendered tiles.
 
