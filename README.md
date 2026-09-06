@@ -56,13 +56,12 @@ The GitHub Pages workflow downloads and verifies this archive before it builds t
 | `V` | switch between chase and helm cameras |
 | `E` | interact (job posts, docks, traps, field notes, aid reports) |
 | `C` | cast, set the hook, and reel while held |
-| `X` | reel in or cut the line |
+| `X` | reel in, cut the fishing line, or cut cage debris after the prop settles |
 | `G` | set or weigh the anchor while nearly stopped |
 | `M` | jobs board |
 | `Tab` | chart |
 | `L` | spotlight |
 | `H` | horn; one prolonged blast in dense fog |
-| `X` | cut a fishing line, or cut cage debris after the prop settles |
 | `R` | reset the boat |
 | controller `RT` / `LT` | analogue throttle and reverse |
 | controller left stick | rudder; pitch and spin while airborne; click to switch camera |
@@ -107,6 +106,14 @@ The water is the part that took longest. Real reflection and refraction passes, 
 
 At idle, `G` drops the bow anchor. Water depth sets the amount of rode, and the hull drifts within that scope before the line comes tight. Firm mud holds best; soft muck, shell and sawgrass give sooner. Current, storm load or too much throttle can make the anchor drag while the bow swings into the load. The rode is one fixed 12-point line, reused for every drop.
 
+Spray leaves the hull along the local water slope and settles at the current tide height. Fish jumps, gator splashes, working-boat wakes and ramp launches rise with surge too. Gusts carry droplets, mist and engine smoke downwind. These effects reuse the existing particle buffers, while the hull shares the five wave samples already used for buoyancy and attitude. Pausing stops the player and chase-skiff spray emitters.
+
+Spray and mist take their light from the scene. Moonlight leaves a faint blue return, cloud cover dims the sheets, and lightning catches them for the duration of the flash. The bow spotlight picks out droplets inside its cone; spray beside or behind the lamp stays dark. Blue-fire wakes keep their own glow. Both particle shaders share the light uniforms and retain their existing geometry and textures.
+
+The water column and duckweed now follow that light too. Unlit cuts go dark at night, while the bow lamp reveals a moving patch of disturbed water, foam and floating vegetation ahead. The water and spray share the lamp's position, direction, range and fog loss. Blue fire stays emissive. The change uses the existing water pass and adds no texture or render target.
+
+Camp lamps, patrol strobes and mission searchlights feed a fixed rendering pool of twelve point lights and four spotlights. Hidden or extinguished sources release their slots, with nearby bright lamps taking priority when the pool is full. The renderer keeps unused slots at zero intensity, so switching a rescue strobe on changes uniforms instead of recompiling the swamp's materials. New storm-recovery rigs register their lamps when they enter the scene and release those records when they leave.
+
 Rain stays on the world after the curtain passes. Banks and tidal mud keep a dark wet film, while roofs, dock timber, trees and sawgrass lose roughness and catch sharper light until the sun and wind dry them. Hail melt and dense night fog can leave moisture too. The pass changes two terrain uniforms and the existing cached materials; it creates no textures, meshes, draw calls, render targets or shader programs.
 
 Severe tropical bands can now lift loose planks and sheet metal over the channel. They move with the gusts, tumble, become solid only as they drop to cage height, then splash down and remain as floating hull hazards. Logs stay in the water. The behavior follows National Weather Service and National Hurricane Center guidance that tropical-storm and hurricane winds can turn loose outdoor material into [windborne debris](https://www.weather.gov/mhx/hurricaneprep) and [flying missiles](https://www.nhc.noaa.gov/prepare/hazards.php); the debris left obstructing shallow channels follows [NOAA's account of storm-driven marine debris](https://oceanservice.noaa.gov/facts/disaster-debris.html).
@@ -131,6 +138,14 @@ The Moon advances through a 29.531-day cycle. Its rise time, crescent or quarter
 
 The renderer budgets its internal drawing buffer instead of blindly doubling every Retina dimension. Performance profiles release the full-size optional post targets, reduce reflection and shadow work, and defer optional GLB decoding until the dock scene is playable. The map, streaming distance and simulation stay unchanged while the largest HDR and depth attachments remain bounded.
 
+Repeated cage bars, rails and engine fittings now share static instance batches, removing 76 draw submissions from each airboat pass while keeping every piece of geometry. Reflection and opaque rendering share one world-transform update per frame. The fixed light pool skips lamps with zero contribution at the shaded pixel, including switched-off lamps and surfaces outside a light's range.
+
+Shaders are prepared for the HDR targets used in play, including the first-use driver queries. Fish also prepare their instanced draw variant before replacing the stand-in. Both fullscreen antialiasing paths and the empty wake solver are ready before the title opens, so riding out or changing profiles does not compile those passes during a run.
+
+The surface-current flecks prepare both sides of their material before play too. Auto adjusts the internal render targets while keeping the displayed canvas stable. Antialiasing runs at the internal resolution and reuses the finished composite target for the copy to the display, without another attachment. Explicit graphics changes, window resizing and returning to the title reconcile the canvas size; backgrounding still collapses it to one pixel.
+
+Waterspouts leave a darker center surrounded by uneven foam streaks and fine airborne spray. Foam and funnel wisps follow the scene's light level. Their footprint fades with the funnel and reuses five wake records.
+
 The sky reflection convolution follows the same budget. Fallback, Performance, Balanced and Cinematic use 32, 64, 128 and 128 px environment maps. The map is convolved behind loading or at the title and then held through active play, because rebuilding it on an idle callback can still stop the main thread. Cinematic now retains about 2.25 MiB of half-float colour and capture depth instead of the old 9 MiB target.
 
 Navigation aids are streamed from seeded 360 m cells and capped at 36 around the boat. Six instanced meshes draw the whole local network, including the flashing lanterns, with no per-marker light objects or model downloads. Collision objects only enter physics inside a roughly 100 m working set, and the persistent fault ledger is capped at twelve records.
@@ -143,11 +158,15 @@ The same spotlight now shows the wet air it is cutting through. Clear air holds 
 
 On a moving tide, pelicans and the osprey can find a mullet school in open water. Hold 25–65 m off at idle and the bait stays up; drive through it or let your wake reach it and the birds lift while the school goes deep. The event redirects two existing bird flocks and borrows from the fixed fish and spray pools instead of creating another set of wildlife.
 
+The ten brown pelicans now share a textured Blender model with separate gliding, wingbeat and dive poses. Its head and long bill stay rigid while the wings move. One instanced draw handles both flocks, and a procedural stand-in stays visible until the model and its shaders are ready. The [editable source, image prompts and rebuild instructions](assets/wildlife/README.md) are included. Other flying birds keep their procedural models, with tapered wingtips, corrected scale and noses facing along their flight path.
+
 Bring the airboat to idle and press `C` to cast. Florida bass, bluegill and bowfin hold in the freshwater backwaters; common snook, juvenile tarpon and red drum work the mangrove and broad-river water. Depth, murk, current, time of day, tide, weather and recent prop wash all change the wait and the species on the line. During the fight, hold `C` to reel and let go when a hard run pushes the tension into the red. Every fish is measured over the gunwale, released, and written into the boat log with its region and personal best.
 
 The habitat split follows Florida Fish and Wildlife Conservation Commission profiles for [Florida bass](https://myfwc.com/wildlifehabitats/profiles/freshwater/largemouth-bass/), [bowfin](https://myfwc.com/wildlifehabitats/profiles/freshwater/bowfin/), [snook](https://myfwc.com/wildlifehabitats/profiles/saltwater/snook/snook/), [tarpon](https://myfwc.com/wildlifehabitats/profiles/saltwater/tarpon/tarpon/) and [red drum](https://myfwc.com/wildlifehabitats/profiles/saltwater/drums/red-drum/). The release animation follows the agency’s [catch-and-release handling guidance](https://myfwc.com/fishing/freshwater/fishing-tips/): short air exposure and head-first return to the water.
 
 Fishing owns one rod, one dynamic line buffer, one lure and one landing fish. Those resources are reused on every cast, and the recent-catch ledger stops at twelve entries.
+
+The ambient fish pool only draws active jumps. Its shaders prepare without launching animals into the world, and the pool starts empty when the title opens.
 
 A hooked fish can now pull a nearby swimming alligator into the fight. A hard run carries farther than a small splash; one eligible animal may turn, throw a visible wake and close on the fish. Pull it clear or press `X` to cut the line. Banks block the approach, while basking, submerged, handled and recently fed animals stay out of it. If the alligator gets there first, the fish is gone and the boat log keeps the loss.
 
@@ -165,7 +184,7 @@ Calm banks now carry fireflies after sunset, with the thickest displays in cypre
 
 The timing and wet-bank placement draw on [University of Florida field notes](https://entnemdept.ufl.edu/lloyd/firefly/ffcomp1-1.pdf). The mangrove bias follows the documented habitat of the [Florida intertidal firefly](https://xerces.org/press/first-conservation-status-assessments-published-for-north-american-fireflies), and the weather and light response follows [National Park Service viewing guidance](https://home.nps.gov/cong/fireflies.htm).
 
-Power at the camps is no longer perfect. Squalls make weak circuits sag. Thunderstorms and tropical weather can black out individual houses, and a close lightning strike can leave one address dark after the rain moves on. Each place keeps the same vulnerability for the day, and restored power comes back slowly instead of snapping on. The effect still uses five pooled point lights. Those lights now share one bulb geometry and material, and nearest-site selection reuses five fixed records instead of rebuilding and sorting a candidate list every 0.6 seconds.
+Power at the camps is no longer perfect. Squalls make weak circuits sag. Thunderstorms and tropical weather can black out individual houses, and a close lightning strike can leave one address dark after the rain moves on. Each place keeps the same vulnerability for the day, and restored power comes back slowly instead of snapping on. Five retained lamp sources feed the scene light pool. They share one bulb geometry and material, and nearest-site selection reuses five fixed records instead of rebuilding and sorting a candidate list every 0.6 seconds.
 
 People are jointed figures driven by a pose target system rather than baked animation, so a man on a dock will track you as you go past, drink his beer, check his rod, cast, and reel in a fish. Boat ramps run a 150 second cycle where a truck backs down the slab, floats a boat off the trailer, motors out and comes back to winch it on.
 
@@ -232,6 +251,7 @@ __dbg.fishing.resourceStats()            // fixed rod, line, lure and landing-fi
 __dbg.nocturnal.setActivityOverride(1, true) // force bank fireflies for inspection
 __dbg.nocturnal.resourceStats()           // point count, draw count and geometry bytes
 __dbg.gators.resourceStats()               // 18 animals and the fixed 36-eye instanced pool
+__dbg.birds.resourceStats()                // 77 birds, authored pelican load state and shared draw budget
 Alt+Shift+U                                // stage one resident-boat/manatee crossing in development
 __dbg.environment.setRainbow(1)            // force both bows; pass null to restore live weather
 __dbg.environment.settlementPowerSnapshot() // five-light pool, live grid stress and saved strike outages

@@ -8,6 +8,8 @@ import { airboatSprayExposure, buildAirboat, AirboatPhysics, installDriver, upda
 import { Birds, Waders, Manatees, Gators } from './wildlife.js';
 import { SkiffAI } from './npc.js';
 import { Spray, Plume } from './particles.js';
+import { createParticleLighting, shareSpotlightUniforms, updateParticleLighting } from './particlelighting.js';
+import { SceneLightPool } from './scenelightpool.js';
 import { Pipeline } from './post.js';
 import { Minimap } from './hud.js';
 import { EngineAudio, selectOutboardSource } from './audio.js';
@@ -55,8 +57,9 @@ import {
 } from './chasecamera.js';
 import { environmentCaptureAllowed, SkyEnvironmentMap } from './environmentmap.js';
 import { sampleWakeFields } from './wakefield.js';
-import { warmDeferredShaders, warmRetainedObject } from './shaderwarmup.js';
+import { prepareRenderShaders, warmDeferredShaders, warmRetainedObject } from './shaderwarmup.js';
 import { GAMEPAD_BUTTON, STANDARD_GAMEPAD_BUTTONS, StandardGamepadInput, gamepadActionCode, gamepadBoatInput } from './gamepad.js';
+import { resizeDrawingSurface } from './renderersize.js';
 
 const app = document.getElementById('app');
 const loadingProgress = (message, value) => window.__loadingScreen?.progress?.(message, value);
@@ -73,8 +76,8 @@ const hardwareQualityLevel = initialQualityLevel({
 let qualityPreference = readQualityPreference();
 const qualityController = new AdaptiveQualityController(qualityControllerConfig(qualityPreference, hardwareQualityLevel));
 let renderProfile = qualityController.profile;
-renderer.setPixelRatio(pixelRatioFor(window.innerWidth, window.innerHeight, window.devicePixelRatio, renderProfile.maxDrawPixels, renderProfile.maxDevicePixelRatio));
-renderer.setSize(window.innerWidth, window.innerHeight);
+let renderPixelRatio = pixelRatioFor(window.innerWidth, window.innerHeight, window.devicePixelRatio, renderProfile.maxDrawPixels, renderProfile.maxDevicePixelRatio);
+resizeDrawingSurface(renderer, window.innerWidth, window.innerHeight, renderPixelRatio);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFShadowMap;
 renderer.shadowMap.autoUpdate = false;
@@ -86,6 +89,8 @@ app.appendChild(renderer.domElement);
 const camera = new THREE.PerspectiveCamera(52, window.innerWidth / window.innerHeight, 0.3, 7500);
 camera.layers.enable(1); // layer 1: small foliage (grass, reeds, moss) drawn by the main camera only, not in the reflection
 const scene = new THREE.Scene();
+// Reflection and opaque passes share one world transform update after simulation, instead of walking it twice.
+scene.matrixWorldAutoUpdate = false;
 const fxScene = new THREE.Scene();
 
 const SUN_DIR = new THREE.Vector3(-0.42, 0.72, -0.55).normalize();
@@ -100,6 +105,7 @@ async function init() {
   let terrainReadinessState = { ready: false, timedOut: false, visibleAtStart: false, settled: false, queued: 0, finalizing: 0, inFlight: 0, visible: 0, building: '' };
   const markStartup = key => { startupTiming[key] = performance.now() - startupStartedAt; };
   const startup = startupPlan(renderProfile.id, { constrainedTransfer: constrainedAssetTransfer(navigator.connection) });
+  let sceneShaderTarget = null;
   configureModelLoading({
     deferOptional: startup.deferOptionalModels,
     concurrency: startup.modelConcurrency,
@@ -107,7 +113,7 @@ async function init() {
     idleTimeoutMs: startup.modelIdleTimeoutMs,
     pressureMaxWaitMs: startup.modelPressureMaxWaitMs,
     disabled: startup.disabledModels,
-    prepare: (root) => typeof renderer.compileAsync === 'function' ? renderer.compileAsync(root, camera, scene) : renderer.compile(root, camera, scene),
+    prepare: root => prepareRenderShaders(renderer, camera, scene, root, sceneShaderTarget),
   });
   // ---- sky & lighting ----
   const sky = new Sky(SUN_DIR, renderProfile);
@@ -211,6 +217,7 @@ async function init() {
   // ---- wildlife ----
   const birds = new Birds(terrain, new THREE.Vector3(startX, 0, startZ - 120));
   scene.add(birds.mesh);
+  birds.loadPelicans(root => prepareRenderShaders(renderer, camera, scene, root, sceneShaderTarget));
   const waders = new Waders(terrain, 16, startX, startZ - 60);
   for (const w of waders.list) scene.add(w.mesh);
   const manatees = new Manatees(terrain, 4, new THREE.Vector3(startX, 0, startZ));
@@ -220,12 +227,16 @@ async function init() {
   scene.add(gators.eyeshine);
 
   // ---- fx ----
-  const spray = new Spray(startup.effectBudget.spray);
-  const plume = new Plume(startup.effectBudget.plume);
+  const particleLighting = createParticleLighting();
+  shareSpotlightUniforms(water.uniforms, particleLighting);
+  const spray = new Spray(startup.effectBudget.spray, particleLighting);
+  const plume = new Plume(startup.effectBudget.plume, particleLighting);
   fxScene.add(plume.mesh, spray.points);
 
   // ---- post ----
   const pipeline = new Pipeline(renderer, camera, renderProfile);
+  pipeline.setDisplaySize(renderer.domElement.width, renderer.domElement.height);
+  sceneShaderTarget = pipeline.sceneRT;
   pipeline.grade.material.uniforms.tNoise.value = groundTex.noise;
   pipeline.grade.material.uniforms.sunDir.value.copy(SUN_DIR);
   pipeline.reflTexture = water.reflRT.texture;
@@ -236,7 +247,7 @@ async function init() {
   plume.mat.uniforms.resolution.value.copy(pipeline.size);
   plume.mat.uniforms.near.value = camera.near; plume.mat.uniforms.far.value = camera.far;
   markStartup('renderTargetsReadyMs');
-  const sunView = new THREE.Vector3(); const camVel = new THREE.Vector3(); const camPrev = new THREE.Vector3();
+  const camVel = new THREE.Vector3(); const camPrev = new THREE.Vector3();
   // wind: slowly veering direction, gusty strength
   const wind = new THREE.Vector3(0.8, 1.0, 0.6);
 
@@ -265,7 +276,7 @@ async function init() {
   birds.audio = audio; gators.audio = audio;
   gators.onCharge = (g) => game.gatorCharge(g);
   gators.onSlide = (g, d, source = 'player') => { if (source === 'player') game.bounties.event('spook', 1); };
-  gators.onSplash = (x, z, sc) => { for (let i = 0; i < 14; i++) plume.emit(x + jitter() * 1.2, 0.1, z + jitter() * 1.2, jitter() * 2, 0.8 + Math.random() * 1.8, jitter() * 2, 0.2 + Math.random() * 0.25, 1.0, 0.6 + Math.random() * 0.4, 0.3); for (let i = 0; i < 40; i++) spray.emit(x + jitter() * 1.2, 0.05, z + jitter() * 1.2, jitter() * 3, 1 + Math.random() * 2.5, jitter() * 3, 0.015 + Math.random() * 0.03, 0.4 + Math.random() * 0.4, 0.6); audio.splash(0.5 * sc); };
+  gators.onSplash = (x, z, sc) => { const surface = water.waveHeight(x, z, time); for (let i = 0; i < 14; i++) plume.emit(x + jitter() * 1.2, surface + 0.1, z + jitter() * 1.2, jitter() * 2, 0.8 + Math.random() * 1.8, jitter() * 2, 0.2 + Math.random() * 0.25, 1.0, 0.6 + Math.random() * 0.4, 0.3); for (let i = 0; i < 40; i++) spray.emit(x + jitter() * 1.2, surface + 0.05, z + jitter() * 1.2, jitter() * 3, 1 + Math.random() * 2.5, jitter() * 3, 0.015 + Math.random() * 0.03, 0.4 + Math.random() * 0.4, 0.6); audio.splash(0.5 * sc); };
   waders.onFlush = (w, d, source = 'player') => { if (source === 'player') game.bounties.event('flush', 1); if (Math.random() < 0.5) audio.squawk(0.25 * Math.max(0, 1 - d / 40), w.x, w.z); };
   const environment = new Environment({ scene, fxScene, camera, terrain, world, water, sky, sun, hemi, pipeline, wind, boat: boat.group, audio, game, phys, sunDir: SUN_DIR, effectBudget: startup.effectBudget, profile: renderProfile });
   life.traffic.environment = environment; environment.traffic = life.traffic;
@@ -409,10 +420,11 @@ async function init() {
       mapMarkers: game.mapMarkerPool.stats(game.mapMarkers.length),
     },
   }) : null;
+  const sceneLightPool = new SceneLightPool(scene);
   let deferredShaderWarmup = { objects: 0, materials: 0, variants: 0, completed: 0, failures: 0, retainedObjects: 0, retainedCompleted: 0, retainedFailures: 0, durationMs: 0 };
   let controller = null, cameraView = BOAT_CAMERA_CHASE, setCameraView = () => false;
-  window.__dbg = { renderer, camera, scene, terrain, phys, water, pipeline, sky, veg, boat, audio, spray, plume, game, tricks, gators, skiff, waders, manatees, dolphins, fishing, anchor, nocturnal, marshFire, world, worldMap, life, birds, environment, environmentReflections, currents, regions, encounters, incidents, story, contracts: story.contracts, aftermath, discoveries, navigationAids, directedNavigationLights, outboardMix, condition, ecology, reputation, law, hazards, radio, startup, modelStats: modelLoadingStats, startupMetrics: () => ({ ...startupTiming, terrainPrime, terrainRetarget, terrainFocus: { ...terrainFocus }, terrainReadiness: { ...terrainReadinessState }, environmentMap: environmentReflections.resourceStats(), deferredShaderWarmup: { ...deferredShaderWarmup } }), debugSceneGraphStats, debugResourceSnapshot, mode: 'full', renderQuality: () => ({
-    profile: renderProfile.id, preference: qualityPreference, gpuRenderer, pixelRatio: renderer.getPixelRatio(), maxDrawPixels: renderProfile.maxDrawPixels, cinematicMaxDrawPixels: MAX_DRAW_PIXELS,
+  window.__dbg = { renderer, camera, scene, sceneLightPool, terrain, phys, water, pipeline, sky, veg, boat, audio, spray, plume, game, tricks, gators, skiff, waders, manatees, dolphins, fishing, anchor, nocturnal, marshFire, world, worldMap, life, birds, environment, environmentReflections, currents, regions, encounters, incidents, story, contracts: story.contracts, aftermath, discoveries, navigationAids, directedNavigationLights, outboardMix, condition, ecology, reputation, law, hazards, radio, startup, modelStats: modelLoadingStats, startupMetrics: () => ({ ...startupTiming, terrainPrime, terrainRetarget, terrainFocus: { ...terrainFocus }, terrainReadiness: { ...terrainReadinessState }, environmentMap: environmentReflections.resourceStats(), deferredShaderWarmup: { ...deferredShaderWarmup } }), debugSceneGraphStats, debugResourceSnapshot, mode: 'full', renderQuality: () => ({
+    profile: renderProfile.id, preference: qualityPreference, gpuRenderer, pixelRatio: renderPixelRatio, displayPixelRatio: renderer.getPixelRatio(), displayPixels: renderer.domElement.width * renderer.domElement.height, maxDrawPixels: renderProfile.maxDrawPixels, cinematicMaxDrawPixels: MAX_DRAW_PIXELS,
     hibernated: pageHibernated, adaptive: qualityController.snapshot(), ...pipeline.memoryStats(), reflection: water.memoryStats(), estimatedShadowBytes: sun.shadow.map ? renderProfile.shadowMapSize ** 2 * 4 : 0,
   }), controllerStats: () => controller?.snapshot?.() || { connected: false }, cameraStats: () => ({ mode: cameraView, fov: camera.fov, driverVisible: playerDriver?.visible !== false }) };
 
@@ -549,18 +561,19 @@ async function init() {
   });
   window.addEventListener('wheel', e => { setInputMode('keyboard'); if (cameraView === BOAT_CAMERA_CHASE) camDist = Math.max(5, Math.min(20, camDist + e.deltaY * 0.01)); });
   let resizeTimer = 0; const drawingSize = new THREE.Vector2();
-  const resize = () => {
+  const resize = (updateCanvas = true) => {
     if (pageHibernated) return false;
-    renderer.setPixelRatio(pixelRatioFor(window.innerWidth, window.innerHeight, window.devicePixelRatio, renderProfile.maxDrawPixels, renderProfile.maxDevicePixelRatio));
-    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderPixelRatio = pixelRatioFor(window.innerWidth, window.innerHeight, window.devicePixelRatio, renderProfile.maxDrawPixels, renderProfile.maxDevicePixelRatio);
+    if (updateCanvas) resizeDrawingSurface(renderer, window.innerWidth, window.innerHeight, renderPixelRatio);
     camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix();
-    renderer.getDrawingBufferSize(drawingSize);
+    drawingSize.set(Math.floor(window.innerWidth * renderPixelRatio), Math.floor(window.innerHeight * renderPixelRatio));
+    pipeline.setDisplaySize(renderer.domElement.width, renderer.domElement.height);
     pipeline.resize(drawingSize.x, drawingSize.y); water.resize(drawingSize.x, drawingSize.y); plume.mat.uniforms.resolution.value.copy(drawingSize);
     qualityController.reset();
     return true;
   };
   let renderFrameNo = 0;
-  const applyRenderQuality = profile => {
+  const applyRenderQuality = (profile, updateCanvas = !started || game.paused) => {
     renderProfile = profile; pipeline.setQuality(profile); water.setQuality(profile); sky.setQuality(profile); condition.setQuality(profile); minimap.setQuality(profile); nocturnal.setQuality(profile); environment.setQuality(profile); environmentReflections.setProfile(profile);
     if (sun.shadow.mapSize.x !== profile.shadowMapSize) {
       sun.shadow.mapSize.set(profile.shadowMapSize, profile.shadowMapSize);
@@ -573,7 +586,7 @@ async function init() {
       // turn one missed frame into a multi-second quality-change cascade.
       if (!started) scheduleEnvironmentReflections('quality');
     }
-    renderFrameNo = 0; resize();
+    renderFrameNo = 0; resize(updateCanvas);
   };
   window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = window.setTimeout(resize, 120); });
   const startEl = document.getElementById('start');
@@ -610,7 +623,7 @@ async function init() {
   const cycleRenderQuality = () => {
     qualityPreference = writeQualityPreference(nextQualityPreference(qualityPreference));
     const profile = qualityController.configure(qualityControllerConfig(qualityPreference, hardwareQualityLevel));
-    applyRenderQuality(profile); renderTitle();
+    applyRenderQuality(profile, true); renderTitle();
     if (started && !game.menuOpen) game.toast('Graphics changed', qualityPreferenceLabel(qualityPreference, profile.id), 1.8);
     return profile;
   };
@@ -625,6 +638,7 @@ async function init() {
     fishing.cancel('', false);
     setCameraView(BOAT_CAMERA_CHASE, false);
     started = false; game.playing = false; game.paused = true;
+    resize(); // Reconcile the display surface at the title, outside an active run.
     for (const key in keys) keys[key] = false;
     if (persist) game.persist();
     renderTitle(); startEl.classList.remove('hidden'); startEl.setAttribute('aria-hidden', 'false');
@@ -715,11 +729,12 @@ async function init() {
   const clock = new THREE.Timer(); clock.connect(document);
   let time = 0, splashStamp = 0, slowT = 0, slowK = 1, fovKick = 0, airCam = 0, cameraBoom = 1, frameNo = 0;
   const stamps = new WakeStampPool(MAX_WAKE_STAMPS);
-  const hullPoint = { x: 0, z: 0 };
-  const splashPts = [{ x: 0, z: 0 }, { x: 0, z: 0 }, { x: 0, z: 0 }];
+  const hullPoint = { x: 0, y: 0, z: 0 };
+  const splashPts = [{ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 0 }];
   const hullPt = (px, pz, out = hullPoint) => {
     out.x = phys.pos.x + rgt2.x * px + fwd2.x * -pz;
     out.z = phys.pos.y + rgt2.y * px + fwd2.y * -pz;
+    out.y = phys.waterH + px * phys.waterSlopeRight - pz * phys.waterSlopeForward;
     return out;
   };
   const addPlayerStamp = (p, radius, height, foam = 0, foamRadius = 0) => {
@@ -735,21 +750,21 @@ async function init() {
     for (let i = 0; i < sheets; i++) {
       const side = Math.random() < 0.5 ? -1 : 1; const z = along(-2.6, 2.2); const p0 = hullPt(side * 1.2, z);
       const out = (1.5 + Math.random() * 3.5) * (0.6 + s * 0.5); const up = (1.2 + Math.random() * 3.0) * (0.5 + s * 0.6);
-      plume.emit(p0.x, 0.08, p0.z, rgt2.x * side * out + phys.vel.x * 0.35 + jitter() * 0.6, up, rgt2.y * side * out + phys.vel.y * 0.35 + jitter() * 0.6,
+      plume.emit(p0.x, p0.y + 0.08, p0.z, rgt2.x * side * out + phys.vel.x * 0.35 + jitter() * 0.6, up, rgt2.y * side * out + phys.vel.y * 0.35 + jitter() * 0.6,
         0.3 + Math.random() * 0.45 * s, 1.3 + s * 0.6, 0.7 + Math.random() * 0.7, 0.35 + 0.15 * s);
-      spray.emit(p0.x, 0.05, p0.z, rgt2.x * side * out * 1.6 + phys.vel.x * 0.5, up * 1.5, rgt2.y * side * out * 1.6 + phys.vel.y * 0.5, 0.018 + Math.random() * 0.045, 0.5 + Math.random() * 0.6, 0.75);
+      spray.emit(p0.x, p0.y + 0.05, p0.z, rgt2.x * side * out * 1.6 + phys.vel.x * 0.5, up * 1.5, rgt2.y * side * out * 1.6 + phys.vel.y * 0.5, 0.018 + Math.random() * 0.045, 0.5 + Math.random() * 0.6, 0.75);
     }
     // bow crown
     const crown = Math.floor(30 + s * 50);
     for (let i = 0; i < crown; i++) {
       const p0 = hullPt(jitter() * 1.6, -2.4 + Math.random() * 1.2);
-      plume.emit(p0.x, 0.1, p0.z, phys.vel.x * 0.55 + fwd2.x * (1 + s) + jitter() * 1.5, 2.0 + Math.random() * 3.5 * (0.5 + s * 0.5), phys.vel.y * 0.55 + fwd2.y * (1 + s) + jitter() * 1.5,
+      plume.emit(p0.x, p0.y + 0.1, p0.z, phys.vel.x * 0.55 + fwd2.x * (1 + s) + jitter() * 1.5, 2.0 + Math.random() * 3.5 * (0.5 + s * 0.5), phys.vel.y * 0.55 + fwd2.y * (1 + s) + jitter() * 1.5,
         0.35 + Math.random() * 0.5, 1.4, 0.9 + Math.random() * 0.6, 0.4);
     }
     // stern slap column
     for (let i = 0; i < 20 + s * 25; i++) {
       const p0 = hullPt(jitter() * 2.0, 1.5 + Math.random() * 1.5);
-      plume.emit(p0.x, 0.1, p0.z, -fwd2.x * (1 + Math.random() * 2) + jitter(), 1.5 + Math.random() * 3 * s, -fwd2.y * (1 + Math.random() * 2) + jitter(), 0.4 + Math.random() * 0.4, 1.2, 0.8 + Math.random() * 0.5, 0.35);
+      plume.emit(p0.x, p0.y + 0.1, p0.z, -fwd2.x * (1 + Math.random() * 2) + jitter(), 1.5 + Math.random() * 3 * s, -fwd2.y * (1 + Math.random() * 2) + jitter(), 0.4 + Math.random() * 0.4, 1.2, 0.8 + Math.random() * 0.5, 0.35);
     }
     if (quality === 'stuffed' || quality === 'wipeout') {
       // wall of water thrown forward and over the deck
@@ -757,8 +772,8 @@ async function init() {
       for (let i = 0; i < n; i++) {
         const p0 = hullPt(jitter() * 2.2, -2.9 + Math.random() * 1.0);
         const fwdV = 2 + Math.random() * 5 + spd * 4;
-        plume.emit(p0.x, 0.1, p0.z, fwd2.x * fwdV + jitter() * 2.0, 2.5 + Math.random() * 4.5, fwd2.y * fwdV + jitter() * 2.0, 0.45 + Math.random() * 0.6, 1.6, 1.0 + Math.random() * 0.7, 0.5);
-        spray.emit(p0.x, 0.2, p0.z, fwd2.x * fwdV * 0.5 + jitter() * 3, 3 + Math.random() * 5, fwd2.y * fwdV * 0.5 + jitter() * 3, 0.02 + Math.random() * 0.05, 0.6 + Math.random() * 0.6, 0.8);
+        plume.emit(p0.x, p0.y + 0.1, p0.z, fwd2.x * fwdV + jitter() * 2.0, 2.5 + Math.random() * 4.5, fwd2.y * fwdV + jitter() * 2.0, 0.45 + Math.random() * 0.6, 1.6, 1.0 + Math.random() * 0.7, 0.5);
+        spray.emit(p0.x, p0.y + 0.2, p0.z, fwd2.x * fwdV * 0.5 + jitter() * 3, 3 + Math.random() * 5, fwd2.y * fwdV * 0.5 + jitter() * 3, 0.02 + Math.random() * 0.05, 0.6 + Math.random() * 0.6, 0.8);
       }
     }
     hullPt(0, -2.2, splashPts[0]); hullPt(0, 0, splashPts[1]); hullPt(0, 2, splashPts[2]);
@@ -802,7 +817,7 @@ async function init() {
       currents.flowAt(phys.pos.x, phys.pos.y, currentFlow);
       phys.update(dt, input, playerWater, time, currentFlow);
     }
-    else { phys.impact = 0; phys.hit = 0; phys.landedFrame = false; }
+    else { phys.impact = 0; phys.hit = 0; phys.bottomStrike = 0; phys.landedFrame = false; phys.takeoffFrame = false; }
     environment.applyPhysics(dt, hazards.surfaceWindAtPlayer());
     anchor.update(dt, time, started && !game.paused);
     phys.forward(fwd2); phys.right(rgt2);
@@ -827,15 +842,15 @@ async function init() {
     }
     if (phys.takeoffFrame && phys.speed > 6 && phys.wet < 0.5) {
       // sheet of water leaving the lip with the hull
-      for (let i = 0; i < 40; i++) { const p0 = hullPt(jitter() * 2.4, 1.6 + Math.random() * 1.4); plume.emit(p0.x, 0.1, p0.z, phys.vel.x * 0.5 + jitter() * 1.5, 1.5 + Math.random() * 2.5, phys.vel.y * 0.5 + jitter() * 1.5, 0.3 + Math.random() * 0.4, 1.1, 0.7 + Math.random() * 0.5, 0.3); }
+      for (let i = 0; i < 40; i++) { const p0 = hullPt(jitter() * 2.4, 1.6 + Math.random() * 1.4); plume.emit(p0.x, p0.y + 0.1, p0.z, phys.vel.x * 0.5 + jitter() * 1.5, 1.5 + Math.random() * 2.5, phys.vel.y * 0.5 + jitter() * 1.5, 0.3 + Math.random() * 0.4, 1.1, 0.7 + Math.random() * 0.5, 0.3); }
     }
     if (phys.hit > 3) {
       audio.thud(Math.min(1.5, phys.hit / 6)); fovKick = Math.min(14, fovKick + phys.hit * 0.6);
       controller.rumble(Math.min(1, 0.28 + phys.hit * 0.065), Math.min(0.85, 0.18 + phys.hit * 0.045), Math.min(260, 80 + phys.hit * 12));
       // bark and leaf litter knocked loose, plus the water thrown up by the hull slewing sideways
       const nx = phys.hitNormal.x, nz = phys.hitNormal.y; const n = Math.floor(10 + phys.hit * 4);
-      for (let i = 0; i < n; i++) plume.emit(phys.pos.x - nx * 1.6 + jitter() * 1.2, 0.3 + Math.random() * 1.2, phys.pos.y - nz * 1.6 + jitter() * 1.2, nx * (1 + Math.random() * 2) + jitter() * 2, 0.5 + Math.random() * 2, nz * (1 + Math.random() * 2) + jitter() * 2, 0.2 + Math.random() * 0.3, 0.9, 0.5 + Math.random() * 0.4, 0.28);
-      if (phys.wet > 0.3) for (let i = 0; i < n * 3; i++) spray.emit(phys.pos.x + jitter() * 2.4, 0.05, phys.pos.y + jitter() * 2.4, nx * (2 + Math.random() * 4) + jitter() * 3, 1 + Math.random() * 3, nz * (2 + Math.random() * 4) + jitter() * 3, 0.015 + Math.random() * 0.03, 0.4 + Math.random() * 0.4, 0.6);
+      for (let i = 0; i < n; i++) plume.emit(phys.pos.x - nx * 1.6 + jitter() * 1.2, phys.waterH + 0.3 + Math.random() * 1.2, phys.pos.y - nz * 1.6 + jitter() * 1.2, nx * (1 + Math.random() * 2) + jitter() * 2, 0.5 + Math.random() * 2, nz * (1 + Math.random() * 2) + jitter() * 2, 0.2 + Math.random() * 0.3, 0.9, 0.5 + Math.random() * 0.4, 0.28);
+      if (phys.wet > 0.3) for (let i = 0; i < n * 3; i++) spray.emit(phys.pos.x + jitter() * 2.4, phys.waterH + 0.05, phys.pos.y + jitter() * 2.4, nx * (2 + Math.random() * 4) + jitter() * 3, 1 + Math.random() * 3, nz * (2 + Math.random() * 4) + jitter() * 3, 0.015 + Math.random() * 0.03, 0.4 + Math.random() * 0.4, 0.6);
     }
     if (phys.bottomStrike > 5) {
       audio.thud(Math.min(1.6, phys.bottomStrike / 7)); fovKick = Math.min(14, fovKick + phys.bottomStrike * 0.42);
@@ -985,75 +1000,78 @@ async function init() {
     }
 
     // ---- spray ----
-    // sun direction in view space drives the lighting of droplets / plume
-    sunView.copy(environment.lightDir).transformDirection(camera.matrixWorldInverse);
-    spray.mat.uniforms.sunView.value.copy(sunView); plume.mat.uniforms.sunView.value.copy(sunView);
+    updateParticleLighting(particleLighting, environment, camera);
+    const emissionDt = started && !game.paused ? dt : 0;
     const washF = Math.max(0, rpm - 0.2) * wet; // prop wash strength (0 at idle, nothing to blow when out of the water)
     camVel.subVectors(camera.position, camPrev).multiplyScalar(1 / Math.max(dt, 1e-3)); camPrev.copy(camera.position);
     plume.mat.uniforms.camVel.value.copy(camVel);
     // (a) prop-wash sheet: a low, wide fan of vapour blasted off the surface just behind the transom
     {
-      const n = Math.floor(washF * (0.35 + spF) * 380 * dt + Math.random());
+      const n = Math.floor(washF * (0.35 + spF) * 380 * emissionDt + Math.random());
       for (let i = 0; i < n; i++) {
         const lat = jitter() * 2.4; const p0 = hullPt(lat, 2.7 + Math.random() * 1.4);
         const back = 1.0 + Math.random() * 3.0 * (0.3 + spF);
-        plume.emit(p0.x, 0.1 + Math.random() * 0.35, p0.z,
+        plume.emit(p0.x, p0.y + 0.1 + Math.random() * 0.35, p0.z,
           -fwd2.x * back + rgt2.x * lat * (1.4 + spF) + jitter() * 0.8, 0.4 + Math.random() * 1.2 * (0.5 + spF), -fwd2.y * back + rgt2.y * lat * (1.4 + spF) + jitter() * 0.8,
           0.28 + Math.random() * 0.35, 0.7 + Math.random() * 0.7, 0.55 + Math.random() * 0.6, 0.16 + 0.12 * spF);
       }
     }
     // (b) rooster tail: at speed the wash lifts a plume 1-4 m behind the transom
     if (sp > 3) {
-      const n = Math.floor(spF * spF * washF * 200 * dt + Math.random());
+      const n = Math.floor(spF * spF * washF * 200 * emissionDt + Math.random());
       for (let i = 0; i < n; i++) {
         const lat = jitter() * 1.4; const p0 = hullPt(lat, 3.4 + Math.random() * 2.6);
         const back = 0.5 + Math.random() * 1.5;
-        plume.emit(p0.x, 0.2 + Math.random() * 0.8, p0.z,
+        plume.emit(p0.x, p0.y + 0.2 + Math.random() * 0.8, p0.z,
           -fwd2.x * back + rgt2.x * lat * 0.8 + jitter() * 0.8, 1.2 + Math.random() * 2.4 * spF, -fwd2.y * back + rgt2.y * lat * 0.8 + jitter() * 0.8,
           0.35 + Math.random() * 0.4, 0.8 + Math.random() * 0.8, 0.7 + Math.random() * 0.6, 0.14 + 0.12 * spF);
       }
     }
     // (c) chine sheets: thin fans of water peeling off the bow chines, travelling with the boat
     if (sp > 4.5) {
-      const n = Math.floor((spF - 0.3) * 300 * dt + Math.random());
+      const n = Math.floor((spF - 0.3) * 300 * emissionDt + Math.random());
       for (let i = 0; i < n; i++) {
         const side = Math.random() < 0.5 ? -1 : 1; const p0 = hullPt(side * 1.25, -2.4 + Math.random() * 2.4);
         const out = 1.5 + Math.random() * 2.6 * spF;
-        plume.emit(p0.x, 0.05 + Math.random() * 0.15, p0.z,
+        plume.emit(p0.x, p0.y + 0.05 + Math.random() * 0.15, p0.z,
           rgt2.x * side * out + phys.vel.x * 0.5 + jitter() * 0.5, 0.7 + Math.random() * 1.6 * spF, rgt2.y * side * out + phys.vel.y * 0.5 + jitter() * 0.5,
           0.14 + Math.random() * 0.18, 0.7 + Math.random() * 0.6, 0.35 + Math.random() * 0.35, 0.22);
       }
-      const m = Math.floor(spF * 2200 * dt + Math.random());
+      const m = Math.floor(spF * 2200 * emissionDt + Math.random());
       for (let i = 0; i < m; i++) {
         const side = Math.random() < 0.5 ? -1 : 1; const p0 = hullPt(side * 1.15, -2.2 + Math.random() * 2.5);
-        spray.emit(p0.x, 0.02 + Math.random() * 0.12, p0.z, rgt2.x * side * (1.0 + Math.random() * 2.2) + phys.vel.x * 0.5, 0.6 + Math.random() * 1.6, rgt2.y * side * (1.0 + Math.random() * 2.2) + phys.vel.y * 0.5, 0.012 + Math.random() * 0.03, 0.3 + Math.random() * 0.35, 0.55);
+        spray.emit(p0.x, p0.y + 0.02 + Math.random() * 0.12, p0.z, rgt2.x * side * (1.0 + Math.random() * 2.2) + phys.vel.x * 0.5, 0.6 + Math.random() * 1.6, rgt2.y * side * (1.0 + Math.random() * 2.2) + phys.vel.y * 0.5, 0.012 + Math.random() * 0.03, 0.3 + Math.random() * 0.35, 0.55);
       }
     }
     // (d) droplets thrown back by the wash (the glittery part of the spray)
     {
-      const n = Math.floor(washF * (0.25 + spF) * 5200 * dt + Math.random());
+      const n = Math.floor(washF * (0.25 + spF) * 5200 * emissionDt + Math.random());
       for (let i = 0; i < n; i++) {
         const lat = jitter() * 2.2; const p0 = hullPt(lat, 2.4 + Math.random() * 1.4);
         const back = 1.5 + Math.random() * 6.0 * (0.3 + spF);
-        spray.emit(p0.x, 0.02 + Math.random() * 0.3, p0.z,
+        spray.emit(p0.x, p0.y + 0.02 + Math.random() * 0.3, p0.z,
           -fwd2.x * back + rgt2.x * lat * 1.4 + jitter() * 1.2 + phys.vel.x * 0.1, 0.6 + Math.random() * 2.4 * (0.4 + spF), -fwd2.y * back + rgt2.y * lat * 1.4 + jitter() * 1.2 + phys.vel.y * 0.1,
           0.012 + Math.random() * 0.035, 0.4 + Math.random() * 0.6, 0.5);
       }
     }
     // (e) the poachers' outboard throws its own small rooster tail
     if (skiff.active && skiff.speed > 3) {
-      const sf = skiff.forward(skiffForward); const n = Math.floor(90 * dt * Math.min(1, skiff.speed / 11) + Math.random());
-      for (let i = 0; i < n; i++) plume.emit(skiff.pos.x + sf.x * 2.4 + jitter() * 0.6, 0.1, skiff.pos.y + sf.y * 2.4 + jitter() * 0.6, sf.x * (1 + Math.random()) + jitter(), 0.8 + Math.random() * 1.6, sf.y * (1 + Math.random()) + jitter(), 0.25 + Math.random() * 0.3, 0.9, 0.6 + Math.random() * 0.5, 0.3);
-      for (let i = 0; i < n * 6; i++) spray.emit(skiff.pos.x + sf.x * 2.2 + jitter() * 0.8, 0.05, skiff.pos.y + sf.y * 2.2 + jitter() * 0.8, sf.x * (1 + Math.random() * 3) + jitter() * 1.5, 0.5 + Math.random() * 2, sf.y * (1 + Math.random() * 3) + jitter() * 1.5, 0.012 + Math.random() * 0.03, 0.4 + Math.random() * 0.5, 0.5);
+      const sf = skiff.forward(skiffForward), surface = water.waveHeight(skiff.pos.x, skiff.pos.y, time); const n = Math.floor(90 * emissionDt * Math.min(1, skiff.speed / 11) + Math.random());
+      for (let i = 0; i < n; i++) plume.emit(skiff.pos.x + sf.x * 2.4 + jitter() * 0.6, surface + 0.1, skiff.pos.y + sf.y * 2.4 + jitter() * 0.6, sf.x * (1 + Math.random()) + jitter(), 0.8 + Math.random() * 1.6, sf.y * (1 + Math.random()) + jitter(), 0.25 + Math.random() * 0.3, 0.9, 0.6 + Math.random() * 0.5, 0.3);
+      for (let i = 0; i < n * 6; i++) spray.emit(skiff.pos.x + sf.x * 2.2 + jitter() * 0.8, surface + 0.05, skiff.pos.y + sf.y * 2.2 + jitter() * 0.8, sf.x * (1 + Math.random() * 3) + jitter() * 1.5, 0.5 + Math.random() * 2, sf.y * (1 + Math.random() * 3) + jitter() * 1.5, 0.012 + Math.random() * 0.03, 0.4 + Math.random() * 0.5, 0.5);
     }
-    spray.update(dt);
-    plume.update(dt, time);
+    const air = environment.surfaceWind, windX = air.x * air.speed, windZ = air.z * air.speed;
+    spray.update(dt, water.level, windX, windZ);
+    plume.update(dt, time, water.level, windX, windZ);
 
     audio.update(started ? phys.rpm : 0, started ? Math.max(0, phys.throttle) : 0, started ? phys.speed : 0, time);
     if ((frameNo & 1) === 0) minimap.update(phys, yaw, game.mapMarkers); // a radar reads fine at 30 Hz; the full-canvas redraw is real CPU on old machines
     game.projectMarker(camera, window.innerWidth, window.innerHeight);
 
     // render
+    scene.updateMatrixWorld();
+    sceneLightPool.sync(camera);
+    sceneLightPool.group.updateMatrixWorld();
     if (renderFrameNo % renderProfile.reflectionInterval === 0) water.renderReflection(scene, camera);
     water.setShadow(sun);
     const mode = window.__dbg.mode;
@@ -1073,7 +1091,7 @@ async function init() {
     pipeline.hibernate(); water.hibernate();
     minimap.releaseTiles(); worldMap.hibernate();
     if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; water.uniforms.shadowOn.value = 0; }
-    renderer.setPixelRatio(1); renderer.setSize(1, 1, false); qualityController.reset(); void audio.suspend();
+    resizeDrawingSurface(renderer, 1, 1, 1, false); qualityController.reset(); void audio.suspend();
     pageLifecycle.hibernated = true; pageLifecycle.hiddenAt = Date.now(); pageLifecycle.releasedAttachmentBytes = Math.max(0, before - attachmentBytes());
     pageLifecycle.releasedCanvasBytes = Math.max(0, canvasBefore - minimap.memoryStats().estimatedBackingBytes - worldMap.memoryStats().estimatedBackingBytes); pageLifecycle.activations++;
     return true;
@@ -1118,7 +1136,6 @@ async function init() {
         b.mesh.visible = true; b.mesh.position.set(startX + 8, 0, startZ - 10);
         if (b.searchRig) { b.searchRig.visible = true; b.searchLight.intensity = 0.01; b.searchBeam.visible = true; b.searchBeam.position.set(startX + 8, 0.05, startZ - 10); b.searchBeam.scale.set(b.searchWidth * 0.004, b.searchLength * 0.004, 1); }
       }
-      for (let k = 0; k < 6; k++) life.fish.launch(startX + k, startZ - 6, 3, 0, 0, 1, 0, true);
       { const pr = mulberry32(11); let k = 0; for (const pose of ['stand', 'sit', 'sitEdge', 'crouch']) { const pp = person(pr, { pose, rod: k % 2 === 0, gun: k === 3 }); pp.position.set(startX - 8 + k * 2, 0.4, startZ - 6); warm.add(pp); k++; } const cn = canoe(pr); cn.position.set(startX + 6, 0, startZ - 8); warm.add(cn); }
       // Deferred model callbacks belong only to live stand-ins. Attaching one to this soon-disposed warm-up tree
       // would retain the detached group until the late model request completed.
@@ -1148,14 +1165,25 @@ async function init() {
   // includes zero-count collision spray/plume buffers and hidden mission, fire and pursuit visuals, without walking
   // or retaining shader variants for the complete streamed map.
   loadingProgress('Checking the emergency gear', 0.93);
-  deferredShaderWarmup = await warmDeferredShaders(renderer, camera, [scene, water.scene, fxScene]);
-  const propWrapWarmup = await warmRetainedObject(renderer, camera, scene, boat.propWrap);
-  deferredShaderWarmup.retainedObjects = propWrapWarmup.attempted;
-  deferredShaderWarmup.retainedCompleted = propWrapWarmup.completed;
-  deferredShaderWarmup.retainedFailures = propWrapWarmup.failures;
-  deferredShaderWarmup.durationMs += propWrapWarmup.durationMs;
+  deferredShaderWarmup = await warmDeferredShaders(renderer, camera, [scene, water.scene, fxScene, water.simScene], undefined, pipeline.sceneRT);
+  const propWrapWarmup = await warmRetainedObject(renderer, camera, scene, boat.propWrap, undefined, pipeline.sceneRT);
+  const currentWarmup = await warmRetainedObject(renderer, camera, fxScene, currents.mesh, undefined, pipeline.sceneRT);
+  const fishWarmup = await warmRetainedObject(renderer, camera, scene, life.fish.mesh, undefined, pipeline.sceneRT);
+  deferredShaderWarmup.retainedObjects = propWrapWarmup.attempted + currentWarmup.attempted + fishWarmup.attempted;
+  deferredShaderWarmup.retainedCompleted = propWrapWarmup.completed + currentWarmup.completed + fishWarmup.completed;
+  deferredShaderWarmup.retainedFailures = propWrapWarmup.failures + currentWarmup.failures + fishWarmup.failures;
+  deferredShaderWarmup.durationMs += propWrapWarmup.durationMs + currentWarmup.durationMs + fishWarmup.durationMs;
   startupTiming.deferredShaderWarmupMs = deferredShaderWarmup.durationMs;
-  spray.clear(); plume.clear(); game.beacon.hide(); game.beacon2.hide();
+  const postWarmupStartedAt = performance.now();
+  await pipeline.prepareShaders();
+  startupTiming.postShaderWarmupMs = performance.now() - postWarmupStartedAt;
+  // The wake solver does not run at the title. Allocate and draw its empty buffers now so riding out cannot pay for
+  // a new simulation shader, framebuffer pair and vertex upload in the first gameplay frame.
+  const wakeWarmupStartedAt = performance.now(), previousWakeTarget = renderer.getRenderTarget();
+  try { stamps.reset(); wakeCenter.set(terrainFocus.x, terrainFocus.z); water.simulate(wakeCenter, stamps, 0); }
+  finally { renderer.setRenderTarget(previousWakeTarget); }
+  startupTiming.wakeWarmupMs = performance.now() - wakeWarmupStartedAt;
+  spray.clear(); plume.clear(); life.fish.clear(); game.beacon.hide(); game.beacon2.hide();
   loadingProgress('Pulling the boat off the trailer', 0.96);
   if (startup.compileDelayMs) await new Promise(r => setTimeout(r, startup.compileDelayMs));
   if (warm) {

@@ -8,6 +8,7 @@ import { person } from './folk.js';
 import { mulberry32 } from './noise.js';
 import { registerWetMaterial } from './surfacewetness.js';
 import { bottomStrikeSeverity } from './boatdamage.js';
+import { instanceStaticChildren } from './staticinstances.js';
 
 // Boat local frame: +X starboard, +Y up, -Z forward (bow at -Z).
 // The player boat and scheduled traffic use the same detailed hull. Keep one immutable render template so its
@@ -307,6 +308,7 @@ function createAirboatTemplate() {
   for (const sx of [-1, 1]) for (const sz of [-2.0, 2.2]) { const c = new THREE.Mesh(boxGeo(0.16, 0.05, 0.05), steel); c.position.set(sx * 1.05, 0.66, sz); g.add(c); }
 
   g.traverse(o => { if (o.isMesh) { o.castShadow = o.castShadow || true; o.receiveShadow = true; } });
+  g.userData.batchedDraws = instanceStaticChildren(g, new Set([prop, ...rudders]));
   return { group: g, prop, blur, rudders, cage };
 }
 
@@ -513,6 +515,7 @@ export class AirboatPhysics {
     this.bottomStrike = 0; // fast first contact with a submerged bed
     this.hit = 0; this.hitNormal = new THREE.Vector2(); // collision speed into an obstacle this frame
     this.surfH = 0; this.prevFloor = null; this.groundH = 0; this.waterH = 0;
+    this.waterSlopeForward = 0; this.waterSlopeRight = 0;
     this.grounded = 0; this.bob = 0;
     this.obstacles = []; // [{x,z,r}] or [{ax,az,bx,bz,r}] capsules
     this.trunkGrid = new Map(); this.cell = 10; this.nearTrunks = [];
@@ -737,6 +740,8 @@ export class AirboatPhysics {
     // ---- attitude ----
     const wb = waveFn(px + fwd.x * 2.5, pz + fwd.y * 2.5, t), ws = waveFn(px - fwd.x * 2.3, pz - fwd.y * 2.3, t);
     const wl = waveFn(px - rgt.x * 1.1, pz - rgt.y * 1.1, t), wr = waveFn(px + rgt.x * 1.1, pz + rgt.y * 1.1, t);
+    // Spray follows the same local water plane without sampling waves for thousands of emitted droplets.
+    this.waterSlopeForward = (wb - ws) / 4.8; this.waterSlopeRight = (wr - wl) / 2.2;
     const wavePitch = Math.atan2(wb - ws, 4.8) * wet, waveRoll = Math.atan2(wr - wl, 2.2) * wet;
     const landPitch = Math.atan2(hBow - hStern, 4.9) * land, landRoll = Math.atan2(hR - hL, 2.2) * land;
     const accelF = thrust + df;

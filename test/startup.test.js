@@ -47,7 +47,9 @@ test('older-hardware profiles do not block on optional models or the full shader
   assert.deepEqual(performance.disabledModels, fallback.disabledModels);
   assert.deepEqual(balanced.disabledModels, ['tree_c']);
   assert.equal(balanced.modelConcurrency, 1);
-  assert.equal(fallback.disabledModels.length, 10);
+  assert.equal(fallback.disabledModels.length, 11);
+  assert.ok(fallback.disabledModels.includes('brown_pelican'));
+  assert.equal(balanced.disabledModels.includes('brown_pelican'), false);
   assert.deepEqual([fallback.solidGrass, performance.solidGrass, balanced.solidGrass], ['off', 'off', 'deferred']);
   assert.deepEqual([fallback.modelPressureMaxWaitMs, performance.modelPressureMaxWaitMs, balanced.modelPressureMaxWaitMs], [12000, 8000, 6000]);
   assert.deepEqual(['fallback', 'performance', 'balanced', 'cinematic'].map(id => startupPlan(id).blockingModels), [[], [], [], []]);
@@ -196,7 +198,9 @@ test('a finished ground mesh is selectable while its vegetation is still buildin
   assert.equal(visible.has(chunk), true);
 });
 
-test('a dock-scale result interrupts coarse foliage without retaining another build', () => {
+test('a dock-scale result interrupts coarse foliage without retaining another build', t => {
+  // Test priority and resumption, not whether the host happens to finish inside a wall-clock frame budget.
+  let now = 0; t.mock.method(performance, 'now', () => (now += 0.05));
   const endless = function* () { while (true) yield; };
   const quick = function* () { yield; };
   const coarse = { key: '4:0:0', prio: 0, level: 4, groundReady: true, ready: false, mesh: {}, build: endless() };
