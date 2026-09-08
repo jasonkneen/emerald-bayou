@@ -17,16 +17,20 @@ const deferredQueue = [];
 const deferredByName = new Map();
 const DEFERRED_PRIORITY = Object.freeze({
   driver: 0, beau_boat: 0, boat_dreams: 0, sandbox_boat: 1,
-  fish_a: 2, turtle_boat: 2, realistic_alligator: 3,
+  fish_a: 2, turtle_boat: 2, realistic_alligator: 3, brown_pelican: 3, great_egret: 3,
   grass_a: 4, grass_d: 4,
   tree_c: 10,
 });
 let deferOptionalModels = false, modelConcurrency = 2, modelBatchDelayMs = 0, modelIdleTimeoutMs = 900, modelPressureMaxWaitMs = 8000, drainingDeferred = false, drainPromise = null, requestOrder = 0;
 let modelPressureStartedAt = 0, modelPressureUntil = 0, pressureForcedBatches = 0;
+let prepareModel = null;
+let modelPreparation = { attempted: 0, completed: 0, failures: 0, totalMs: 0, maxMs: 0 };
 let disabledModels = new Set();
 const skippedModels = new Set();
 const modelRoot = `${import.meta.env?.BASE_URL || '/'}models/`;
 export const SPEC = {
+  brown_pelican: { scale: 1, yaw: 0, y: 0, path: '../wildlife/brown-pelican.glb' },
+  great_egret: { scale: 1, yaw: 0, y: 0, path: '../wildlife/great-egret.glb' },
   beau_boat: { scale: 2.3, yaw: -Math.PI / 2, y: 0.27, len: 4.4 },
   boat_dreams: { scale: 2.7, yaw: -Math.PI / 2, y: 0.62, len: 5.4 },
   sandbox_boat: { scale: 2.1, yaw: -Math.PI / 2, y: 0.37, len: 4.0 },
@@ -48,14 +52,41 @@ function fit(name, root) {
 export function modelBox(name) { const r = cacheDone.get(name); return r ? fit(name, r) : null; }
 const cacheDone = new Map();
 
-export function configureModelLoading({ deferOptional = false, concurrency = 2, batchDelayMs = 0, idleTimeoutMs = 900, pressureMaxWaitMs = 8000, disabled = [] } = {}) {
+export function configureModelLoading({ deferOptional = false, concurrency = 2, batchDelayMs = 0, idleTimeoutMs = 900, pressureMaxWaitMs = 8000, disabled = [], prepare = null } = {}) {
   deferOptionalModels = Boolean(deferOptional);
   modelConcurrency = Math.max(1, Math.min(4, Math.round(Number(concurrency) || 1)));
   modelBatchDelayMs = Math.max(0, Math.min(5000, Math.round(Number(batchDelayMs) || 0)));
   modelIdleTimeoutMs = Math.max(250, Math.min(5000, Math.round(Number(idleTimeoutMs) || 900)));
   const maxWait = Number(pressureMaxWaitMs); modelPressureMaxWaitMs = Number.isFinite(maxWait) ? Math.max(0, Math.min(30000, Math.round(maxWait))) : 8000;
   modelPressureStartedAt = 0; modelPressureUntil = 0; pressureForcedBatches = 0;
+  prepareModel = typeof prepare === 'function' ? prepare : null;
+  modelPreparation = { attempted: 0, completed: 0, failures: 0, totalMs: 0, maxMs: 0 };
   disabledModels = new Set(Array.isArray(disabled) ? disabled : []);
+}
+
+export async function prepareModelForSwap(prepare, root, name, now = () => performance.now()) {
+  if (typeof prepare !== 'function' || !root) return { attempted: false, completed: false, failed: false, durationMs: 0 };
+  const startedAt = now();
+  try {
+    await prepare(root, name);
+    return { attempted: true, completed: true, failed: false, durationMs: Math.max(0, now() - startedAt) };
+  } catch (error) {
+    return { attempted: true, completed: false, failed: true, durationMs: Math.max(0, now() - startedAt) };
+  }
+}
+
+export async function prepareInstancedModelForSwap(prepare, geometry, material, name) {
+  if (typeof prepare !== 'function') return prepareModelForSwap(null, null, name);
+  const instance = new THREE.InstancedMesh(geometry, material, 1); instance.receiveShadow = true;
+  try { return await prepareModelForSwap(prepare, instance, name); }
+  finally { instance.dispose(); } // Only the temporary instance buffer is owned here; geometry and material stay shared.
+}
+
+function recordPreparation(prepared) {
+  if (!prepared.attempted) return;
+  modelPreparation.attempted++; modelPreparation.totalMs += prepared.durationMs;
+  modelPreparation.maxMs = Math.max(modelPreparation.maxMs, prepared.durationMs);
+  if (prepared.completed) modelPreparation.completed++; else modelPreparation.failures++;
 }
 
 // Optional GLBs replace procedural stand-ins. A bad gameplay frame therefore buys the renderer some quiet time before
@@ -91,9 +122,13 @@ export function orderDeferredModelNames(names) {
 }
 
 function fetchModel(name) {
-  return loader.loadAsync(`${modelRoot}${name}.glb`).then(g => {
+  return loader.loadAsync(`${modelRoot}${SPEC[name]?.path || `${name}.glb`}`).then(async g => {
     const root = g.scene;
     root.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; const m = o.material; if (m) { if (m.map) { m.map.anisotropy = 4; m.map.colorSpace = THREE.SRGBColorSpace; } m.roughness = Math.max(m.roughness ?? 1, 0.55); } } });
+    // The clone shares these materials. Prepare their programs while the authored model is still detached so its
+    // first visible replacement cannot turn an ordinary gameplay frame into a shader-compilation pause.
+    const prepared = await prepareModelForSwap(prepareModel, root, name);
+    recordPreparation(prepared);
     cacheDone.set(name, root); fit(name, root);
     return root;
   }).catch(e => { console.warn('model', name, e); return null; });
@@ -178,6 +213,7 @@ export function modelLoadingStats() {
   return {
     cached: cache.size, ready: cacheDone.size, queued: deferredByName.size, skipped: skippedModels.size, concurrency: modelConcurrency, deferred: deferOptionalModels,
     pressure: { paused: remaining > 0, remainingMs: remaining, maxWaitMs: modelPressureMaxWaitMs, forcedBatches: pressureForcedBatches },
+    preparation: { ...modelPreparation },
   };
 }
 
@@ -210,12 +246,13 @@ export function spawn(name, placeholder = null, onReady = null) {
   return g;
 }
 // a single merged geometry + material out of a loaded model, for instancing (the models are one mesh each)
-export async function loadGeo(name, { releaseSource = false } = {}) {
+export async function loadGeo(name, { releaseSource = false, instanced = false } = {}) {
   const root = await loadModel(name); if (!root) return null;
   let mesh = null; root.traverse(o => { if (o.isMesh && !mesh) mesh = o; });
   const sp = fit(name, root); const geo = mesh.geometry.clone();
   geo.rotateY(sp.yaw); geo.scale(sp.scale, sp.scale, sp.scale); geo.translate(0, sp.y, 0); geo.computeBoundingBox();
   const result = { geo, mat: mesh.material, height: geo.boundingBox.max.y };
+  if (instanced) recordPreparation(await prepareInstancedModelForSwap(prepareModel, geo, mesh.material, `${name}:instanced`));
   // Instanced-only assets retain the baked geometry and texture, not an unused GLTF scene plus its source geometry.
   if (releaseSource) { cache.delete(name); cacheDone.delete(name); }
   return result;

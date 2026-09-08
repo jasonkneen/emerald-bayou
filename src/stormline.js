@@ -3,6 +3,7 @@ import { buildSkiff } from './npc.js';
 import { regionAt } from './regions.js';
 import { emitWakeStamp } from './wakestamps.js';
 import { emitMapMarker } from './mapmarkers.js';
+import { sampleVesselWake } from './wakefield.js';
 
 const MPH = 2.23694;
 const clamp = (v, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
@@ -63,7 +64,7 @@ function makeAgent(mesh, role) {
   return {
     mesh, role, x: 0, z: 0, heading: 0, navHeading: 0, speed: 0, turn: 0, choice: 0, decisionT: 0,
     targetX: 0, targetZ: 0, safeX: 0, safeZ: 0, active: false, backing: false, shx: 0, shz: 0,
-    groundT: 0, safe: true,
+    groundT: 0, safe: true, navigationLights: false,
   };
 }
 
@@ -87,12 +88,13 @@ export class StormLine {
     this._f = new THREE.Vector2(); this._r = new THREE.Vector2();
     this.convoy = makeAgent(this.convoyMesh(), 'convoy');
     this.chaser = makeAgent(this.chaserMesh(), 'chaser');
+    this.agents = [this.convoy, this.chaser];
     this.rigs = this.makeRigs(); this.P.scene.add(this.rigs.result, this.rigs.generator);
     this.obs = []; this.P.phys.addObs('story-high-water', this.obs);
     this.convoyObs = { ax: 0, az: 0, bx: 0, bz: 0, r: 1.08, tag: 'storm convoy', onHit: (into, nx, nz) => this.convoyHit(into, nx, nz) };
     this.chaserObs = { ax: 0, az: 0, bx: 0, bz: 0, r: 1.08, tag: 'pursuing skiff', onHit: (into, nx, nz) => this.chaserHit(into, nx, nz) };
     this.resultObs = { ax: 0, az: 0, bx: 0, bz: 0, r: 1.08, tag: 'storm power skiff' };
-    this.obLevel = 0; this.obPitch = 0.9;
+    this.obLevel = 0; this.obPitch = 0.9; this.obX = 0; this.obZ = 0;
     if (this.eligible() && !this.state.offerAt && this.state.stage === 'dormant') this.arm(90000);
     this.restore(); this.persist();
   }
@@ -126,6 +128,7 @@ export class StormLine {
     const runner = this.state.branch === 'runner', color = runner ? 0x4f8fff : 0xf4d989;
     this.rigs.lamp.mat.color.setHex(color); this.rigs.lamp.light.color.setHex(color);
     this.convoy.mesh = this.convoyMesh(); this.chaser.mesh = this.chaserMesh();
+    this.convoy.navigationLights = !runner; this.chaser.navigationLights = runner;
     this.convoyObs.tag = runner ? 'Cal Rook storm convoy' : 'Split Pine evacuation skiff';
     this.chaserObs.tag = runner ? 'FWC patrol' : 'runner skiff';
   }
@@ -418,7 +421,7 @@ export class StormLine {
   triggerConsequence(force = false) {
     if (this.state.stage !== 'complete' || this.state.consequence || (!force && Date.now() < this.state.consequenceAt)) return false;
     this.state.consequence = true;
-    this.P.startDeparture(this.convoyMesh(), this.destination(), this.departureCargo(), this.state.branch === 'runner' ? 0.82 : 0.9);
+    this.P.startDeparture(this.convoyMesh(), this.destination(), this.departureCargo(), this.state.branch === 'runner' ? 0.82 : 0.9, this.state.branch !== 'runner');
     if (this.P.environment.key === 'hurricane') this.P.environment.setWeather('tropical', false, false);
     if (this.state.branch === 'runner') this.P.call('CH 16', 'MARA KEENE · TOWER', 'Lost Key has power somewhere in the mangroves. Split Pine is running on lanterns. FWC will sort out the rest after the water falls.', 3, 'high-water-aftermath-runner');
     else this.P.call('CH 16', 'MARA KEENE · TOWER', 'Old Mill storm light is on and Split Pine’s people are accounted for. That berth stays on the chart.', 3, 'high-water-aftermath-rescue');
@@ -501,16 +504,18 @@ export class StormLine {
   }
 
   updateAudio() {
-    this.obLevel = 0; this.obPitch = this.state.branch === 'runner' ? 0.84 : 0.94;
+    this.obLevel = 0; this.obPitch = this.state.branch === 'runner' ? 0.84 : 0.94; this.obX = 0; this.obZ = 0;
     for (const A of [this.convoy, this.chaser]) {
       if (!A.active) continue;
       const d = Math.hypot(A.x - this.P.phys.pos.x, A.z - this.P.phys.pos.y);
-      if (d < 155) this.obLevel = Math.max(this.obLevel, (0.22 + 0.72 * Math.min(1, A.speed / 12)) * (1 - d / 155));
+      if (d < 155) { const level = (0.22 + 0.72 * Math.min(1, A.speed / 12)) * (1 - d / 155); if (level > this.obLevel) { this.obLevel = level; this.obX = A.x; this.obZ = A.z; } }
     }
   }
 
+  wakeHeightAt(x, z, t) { return sampleVesselWake(this.agents, x, z, t, 12.7, 0.11); }
+
   stamps(out) {
-    for (const A of [this.convoy, this.chaser]) {
+    for (const A of this.agents) {
       if (!A.active || A.backing || A.speed < 2 || Math.hypot(A.x - this.P.phys.pos.x, A.z - this.P.phys.pos.y) > 95) continue;
       const fx = -Math.sin(A.heading), fz = -Math.cos(A.heading), sp = Math.min(1, A.speed / 11);
       emitWakeStamp(out, A.x - fx * 1.8, A.z - fz * 1.8, 1.1, 0.54 * sp, 1.7 * sp, 1);

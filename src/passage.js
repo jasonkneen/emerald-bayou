@@ -3,6 +3,7 @@ import { buildSkiff } from './npc.js';
 import { regionAt } from './regions.js';
 import { emitWakeStamp } from './wakestamps.js';
 import { emitMapMarker } from './mapmarkers.js';
+import { wakeSampleAt } from './wakefield.js';
 
 const MPH = 2.23694;
 const clamp = (v, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
@@ -89,7 +90,7 @@ export class FalsePassage {
     this.rigs = this.makeRigs();
     this.P.scene.add(this.rigs.wreck, this.rigs.aid, this.rigs.cache, this.rigs.runner, this.rigs.patrol, this.rigs.cooler);
     this.agent = { mesh: this.rigs.runner, active: false };
-    this.obLevel = 0; this.obPitch = 0.92;
+    this.obLevel = 0; this.obPitch = 0.92; this.obX = 0; this.obZ = 0;
     if (this.eligible() && !this.state.offerAt && this.state.stage === 'dormant') this.arm(60000);
     this.restore(); this.persist();
   }
@@ -277,7 +278,7 @@ export class FalsePassage {
     if (this.chaseActive || this.state.stage !== 'delivery') return false;
     const at = this.chaserSpawn(); if (!at) { this.chaseDelay = 2; return false; }
     const patrol = this.state.branch === 'runner', mesh = patrol ? this.rigs.patrol : this.rigs.runner;
-    this.rigs.runner.visible = !patrol; this.rigs.patrol.visible = patrol; this.agent.mesh = mesh;
+    this.rigs.runner.visible = !patrol; this.rigs.patrol.visible = patrol; this.agent.mesh = mesh; this.agent.navigationLights = patrol;
     this.P.incidents.setAgent(this.agent, at.x, at.z, at.heading, 3.2); this.chaseActive = true; this.chasePressure = 0; this.lostT = 0;
     this.state.chaseStarted = true; this.state.chaseCleared = false; this.persist();
     if (patrol) {
@@ -344,7 +345,7 @@ export class FalsePassage {
     else this.rigs.survivor.visible = false;
     Object.assign(this.state, { stage: 'complete', ending: branch, completedAt: Date.now(), consequenceAt: Date.now() + 75000, consequence: false, cargoUntil: 0, chaseCleared: true });
     this.rigs.wreck.visible = false; this.P.phys.loaded = 0; this.P.clearPrompt(); this.P.game.wpTarget = null; this.P.law.hotCargoT = 0; this.P.law.cool(0.3);
-    this.P.startDeparture(recipient, berth, cargo, branch === 'runner' ? 0.82 : 0.9);
+    this.P.startDeparture(recipient, berth, cargo, branch === 'runner' ? 0.82 : 0.9, branch !== 'runner');
     if (branch === 'runner') {
       this.P.game.addCash(1100); this.P.reputation.change('runners', 1.8, 'false-passage-sale', 'You sold Cal Rook a clinic cooler taken from a wreck.', true);
       this.P.reputation.change('locals', -1.15, 'false-passage-sale', 'The camps heard Nolan was left on the wreck while the cooler went south.', false);
@@ -401,15 +402,21 @@ export class FalsePassage {
   }
 
   updateAudio() {
-    this.obLevel = 0; this.obPitch = this.state.branch === 'runner' ? 0.84 : 0.94;
+    this.obLevel = 0; this.obPitch = this.state.branch === 'runner' ? 0.84 : 0.94; this.obX = 0; this.obZ = 0;
     if (this.state.stage === 'delivery') {
       const dpt = this.destination(), d = Math.hypot(dpt.x - this.P.phys.pos.x, dpt.z - this.P.phys.pos.y);
-      if (d < 140) this.obLevel = 0.15 * (1 - d / 140);
+      if (d < 140) { this.obLevel = 0.15 * (1 - d / 140); this.obX = dpt.x; this.obZ = dpt.z; }
     }
     if (this.chaseActive) {
       const d = Math.hypot(this.agent.x - this.P.phys.pos.x, this.agent.z - this.P.phys.pos.y);
-      if (d < 150) this.obLevel = Math.max(this.obLevel, (0.25 + 0.7 * Math.min(1, this.agent.speed / 13)) * (1 - d / 150));
+      if (d < 150) { const level = (0.25 + 0.7 * Math.min(1, this.agent.speed / 13)) * (1 - d / 150); if (level > this.obLevel) { this.obLevel = level; this.obX = this.agent.x; this.obZ = this.agent.z; } }
     }
+  }
+
+  wakeHeightAt(x, z, t) {
+    const A = this.agent;
+    if (!this.chaseActive || !A.active || A.backing || A.speed <= 2.2) return 0;
+    return wakeSampleAt(A.x, A.z, A.heading, A.speed, 13.4, 0.11, x, z, t);
   }
 
   stamps(out) {

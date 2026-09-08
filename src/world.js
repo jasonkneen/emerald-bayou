@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { mulberry32 } from './noise.js';
-import { shack, crabFloat, fuelDrum } from './markers.js';
+import { shack, crabFloat, fuelDrum, heroTreeFallback } from './markers.js';
 import { buildDock } from './tower.js';
 import { buildSkiff } from './npc.js';
 import { HOME_X, HOME_Z, WORLD_HALF } from './heightfield.js';
@@ -15,6 +15,7 @@ import { WakeStampPool } from './wakestamps.js';
 // generated from the cell seed on demand and only built as meshes when the boat is near.
 const CAMP_CELL = 1600, TRAP_CELL = 700;
 const CAMP_CACHE_LIMIT = 160, SITE_CACHE_LIMIT = 384, TRAP_CACHE_LIMIT = 256;
+const BLOCK_RADIUS = 30, BLOCK_RADIUS_SQ = BLOCK_RADIUS * BLOCK_RADIUS;
 const FIRST = ['Turner', 'Cooter', 'Mullet', 'Lostman', 'Chokoloskee', 'Sawgrass', 'Gator Hole', 'Possum', 'Broad River', 'Hell\'s Bay', 'Whitewater', 'Shark Point', 'Tarpon', 'Buzzard', 'Cane Patch', 'Rookery', 'Onion Key', 'Lopez', 'Watson', 'Panther', 'Kingfisher', 'Snake Bight', 'Cormorant', 'Moss Hammock', 'Cypress Knee', 'Otter', 'Bream Hole', 'Halfway', 'Ten Mile', 'Dead River'];
 const SECOND = ['Camp', 'Landing', 'Fish Camp', 'Station', 'Bend', 'Dock', 'Camp', 'Landing'];
 const hash2 = (i, j) => { let h = (i * 374761393 + j * 668265263) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); return (h ^ (h >>> 16)) >>> 0; };
@@ -45,9 +46,9 @@ export class World {
     this.cellCacheEvictions = { camps: 0, sites: 0, traps: 0 };
     this.checkT = 0; this.collected = new Set(); this.phys = null; this.wind = null;
     this.fx = null; // { plume, spray, audio, fish, playerWakeAt } from main
-    this.stampPool = new WakeStampPool(24); this.obLevel = 0; this.truckLevel = 0; this.onShot = null;
+    this.stampPool = new WakeStampPool(24); this.obLevel = 0; this.obPitch = 1; this.obX = 0; this.obZ = 0; this.truckLevel = 0; this.onShot = null;
     this.emitStamp = (x, z, radius, height, foam, foamRadius) => this.stampPool.emit(x, z, radius, height, foam, foamRadius);
-    this.context = { bx: 0, bz: 0, speed: 0, dt: 0, emitStamp: this.emitStamp, plume: null, spray: null, audio: null, fish: null, playerWakeAt: null, ob: 0, truck: 0, onShot: null, humanActivity: 1, heightAt: (x, z) => this.T.heightAt(x, z) };
+    this.context = { bx: 0, bz: 0, speed: 0, dt: 0, emitStamp: this.emitStamp, plume: null, spray: null, audio: null, fish: null, playerWakeAt: null, ob: 0, obPitch: 1, obX: 0, obZ: 0, truck: 0, onShot: null, humanActivity: 1, heightAt: (x, z) => this.T.heightAt(x, z) };
     this.disposedGeometries = 0;
   }
   releaseGeometry(root) { const n = disposeDetachedGeometries(root, this.scene); this.disposedGeometries += n; return n; }
@@ -113,7 +114,7 @@ export class World {
     for (let i = 0; i < 2 + Math.floor(rr() * 3); i++) { const d = fuelDrum(); const a = c.ang + (rr() - 0.5) * 1.6, r = 4 + rr() * 5; const px = c.x + Math.cos(a) * r, pz = c.z + Math.sin(a) * r; d.position.set(px, T.heightAt(px, pz) - 0.05, pz); d.rotation.y = rr() * 6; g.add(d); }
     for (let i = 0; i < 3; i++) { const f = crabFloat(); const a = rr() * 6.28, r = 2 + rr() * 3; const px = c.x + Math.cos(a) * r, pz = c.z + Math.sin(a) * r; f.position.set(px, T.heightAt(px, pz) + 0.1, pz); f.rotation.z = 1.2; f.rotation.y = rr() * 6; g.add(f); }
     // a hero tree over the shack
-    if (rr() < 0.7) { const a = c.ang + (rr() - 0.5) * 1.0; const px = c.x + Math.cos(a) * (7 + rr() * 3), pz = c.z + Math.sin(a) * (7 + rr() * 3); const tr = spawn('tree_c'); tr.position.set(px, T.heightAt(px, pz) - 0.1, pz); tr.rotation.y = rr() * 6.28; tr.scale.setScalar(0.8 + rr() * 0.4); g.add(tr); }
+    if (rr() < 0.7) { const a = c.ang + (rr() - 0.5) * 1.0; const px = c.x + Math.cos(a) * (7 + rr() * 3), pz = c.z + Math.sin(a) * (7 + rr() * 3); const tr = spawn('tree_c', heroTreeFallback()); tr.position.set(px, T.heightAt(px, pz) - 0.1, pz); tr.rotation.y = rr() * 6.28; tr.scale.setScalar(0.8 + rr() * 0.4); g.add(tr); }
     // the camp's people: somebody fishing off the dock, somebody at the shack sorting gear
     g.userData.people = []; g.userData.site = c;
     if (rr() < 0.6) { const p = person(rr, { pose: 'sitEdge', rod: true }); p.position.set(0.72, 0.81, -12.6); p.rotation.y = Math.PI / 2; dock.add(p); g.userData.people.push(p); const bk = bucket(); bk.position.set(-0.4, 0.81, -12.0); dock.add(bk); }
@@ -146,8 +147,35 @@ export class World {
   }
   // ground the vegetation must leave alone: around every camp and homestead
   blockedAt(x, z) {
-    for (const st of this.sitesNear(x, z, 30)) { const r = st.kind === 'house' ? 16 : st.kind === 'ramp' ? 22 : 9; if (Math.hypot(st.x - x, st.z - z) < r) return true; if (st.kind === 'house' && Math.hypot(st.bank.x - x, st.bank.z - z) < 8) return true; if (st.kind === 'ramp') { const ux = -Math.cos(st.ang), uz = -Math.sin(st.ang); const px = st.x + ux * 14, pz = st.z + uz * 14; if (Math.hypot(px - x, pz - z) < 12) return true; } }
-    for (const c of this.campsNear(x, z, 30)) { if (Math.hypot(c.x - x, c.z - z) < 12 || Math.hypot(c.bank.x - x, c.bank.z - z) < 7) return true; }
+    // This predicate is used by placement and navigation loops, so walk the cells directly and stop at the first hit.
+    const siteI0 = Math.floor((x - BLOCK_RADIUS) / SITE_CELL), siteI1 = Math.floor((x + BLOCK_RADIUS) / SITE_CELL);
+    const siteJ0 = Math.floor((z - BLOCK_RADIUS) / SITE_CELL), siteJ1 = Math.floor((z + BLOCK_RADIUS) / SITE_CELL);
+    for (let j = siteJ0; j <= siteJ1; j++) for (let i = siteI0; i <= siteI1; i++) {
+      const st = this.siteAt(i, j); if (!st) continue;
+      let dx = st.x - x, dz = st.z - z, dSq = dx * dx + dz * dz;
+      if (dSq > BLOCK_RADIUS_SQ) continue;
+      const radius = st.kind === 'house' ? 16 : st.kind === 'ramp' ? 22 : 9;
+      if (dSq < radius * radius) return true;
+      if (st.kind === 'house') {
+        dx = st.bank.x - x; dz = st.bank.z - z;
+        if (dx * dx + dz * dz < 64) return true;
+      } else if (st.kind === 'ramp') {
+        const px = st.x - Math.cos(st.ang) * 14, pz = st.z - Math.sin(st.ang) * 14;
+        dx = px - x; dz = pz - z;
+        if (dx * dx + dz * dz < 144) return true;
+      }
+    }
+
+    const campI0 = Math.floor((x - BLOCK_RADIUS) / CAMP_CELL), campI1 = Math.floor((x + BLOCK_RADIUS) / CAMP_CELL);
+    const campJ0 = Math.floor((z - BLOCK_RADIUS) / CAMP_CELL), campJ1 = Math.floor((z + BLOCK_RADIUS) / CAMP_CELL);
+    for (let j = campJ0; j <= campJ1; j++) for (let i = campI0; i <= campI1; i++) {
+      const c = this.campAt(i, j); if (!c) continue;
+      let dx = c.x - x, dz = c.z - z, dSq = dx * dx + dz * dz;
+      if (dSq > BLOCK_RADIUS_SQ) continue;
+      if (dSq < 144) return true;
+      dx = c.bank.x - x; dz = c.bank.z - z;
+      if (dx * dx + dz * dz < 49) return true;
+    }
     return false;
   }
   campColliders(c) {
@@ -204,9 +232,9 @@ export class World {
     for (const [key, m] of this.liveTraps) { const tr = this.trapCells.get(key); m.position.y = this.waveFn(tr.x, tr.z, t) - 0.12; m.rotation.z = Math.sin(t * 1.3 + tr.ph) * 0.12; m.rotation.x = Math.cos(t * 0.9 + tr.ph) * 0.1; }
     this.stampPool.reset();
     const P = this.phys; const fx = this.fx || {};
-    const ctx = this.context; ctx.bx = bx; ctx.bz = bz; ctx.speed = P ? P.speed : 0; ctx.dt = dt; ctx.plume = fx.plume; ctx.spray = fx.spray; ctx.audio = fx.audio; ctx.fish = fx.fish; ctx.playerWakeAt = fx.playerWakeAt; ctx.ob = 0; ctx.truck = 0; ctx.onShot = this.onShot; ctx.humanActivity = this.humanActivity ?? 1;
+    const ctx = this.context; ctx.bx = bx; ctx.bz = bz; ctx.speed = P ? P.speed : 0; ctx.dt = dt; ctx.plume = fx.plume; ctx.spray = fx.spray; ctx.audio = fx.audio; ctx.fish = fx.fish; ctx.playerWakeAt = fx.playerWakeAt; ctx.ob = 0; ctx.obPitch = 1; ctx.obX = 0; ctx.obZ = 0; ctx.truck = 0; ctx.onShot = this.onShot; ctx.humanActivity = this.humanActivity ?? 1;
     for (const g of this.liveCamps.values()) animateSite(g, t, this.waveFn, this.wind, ctx);
     for (const l of this.liveSites.values()) animateSite(l.g, t, this.waveFn, this.wind, ctx);
-    this.obLevel = ctx.ob; this.truckLevel = ctx.truck;
+    this.obLevel = ctx.ob; this.obPitch = ctx.obPitch; this.obX = ctx.obX; this.obZ = ctx.obZ; this.truckLevel = ctx.truck;
   }
 }

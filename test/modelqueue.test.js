@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { configureModelLoading, loadModel, modelFrameBackoffMs, modelLoadingStats, modelPressureStep, orderDeferredModelNames, reportModelFramePressure } from '../src/models.js';
+import * as THREE from 'three';
+import { configureModelLoading, loadModel, modelFrameBackoffMs, modelLoadingStats, modelPressureStep, orderDeferredModelNames, prepareInstancedModelForSwap, prepareModelForSwap, reportModelFramePressure } from '../src/models.js';
 
 test('orders small visible hull upgrades ahead of the heavyweight tree replacement', () => {
   const requested = ['tree_c', 'realistic_alligator', 'fish_a', 'boat_dreams', 'driver', 'beau_boat', 'turtle_boat', 'sandbox_boat'];
@@ -19,12 +20,22 @@ test('backs deferred model work away from bad frames without starving the queue'
   assert.deepEqual(modelPressureStep(10000, 10000, 1000, 8000), { waitMs: 0, forced: false });
 });
 
+test('prepares an authored model before its visible swap and contains compiler failure', async () => {
+  const root = {}, calls = []; let clock = 10;
+  const prepared = await prepareModelForSwap(async (value, name) => { calls.push([value, name]); }, root, 'beau_boat', () => (clock += 4));
+  assert.deepEqual(calls, [[root, 'beau_boat']]);
+  assert.deepEqual(prepared, { attempted: true, completed: true, failed: false, durationMs: 4 });
+  const failed = await prepareModelForSwap(async () => { throw new Error('compile failed'); }, root, 'driver', () => 20);
+  assert.deepEqual(failed, { attempted: true, completed: false, failed: true, durationMs: 0 });
+  assert.deepEqual(await prepareModelForSwap(null, root, 'tree_c'), { attempted: false, completed: false, failed: false, durationMs: 0 });
+});
+
 test('deduplicates optional model requests without fetching before release', () => {
   configureModelLoading({ deferOptional: true, concurrency: 1 });
   const first = loadModel('queued-test-model');
   const second = loadModel('queued-test-model');
   assert.equal(first, second);
-  assert.deepEqual(modelLoadingStats(), { cached: 1, ready: 0, queued: 1, skipped: 0, concurrency: 1, deferred: true, pressure: { paused: false, remainingMs: 0, maxWaitMs: 8000, forcedBatches: 0 } });
+  assert.deepEqual(modelLoadingStats(), { cached: 1, ready: 0, queued: 1, skipped: 0, concurrency: 1, deferred: true, pressure: { paused: false, remainingMs: 0, maxWaitMs: 8000, forcedBatches: 0 }, preparation: { attempted: 0, completed: 0, failures: 0, totalMs: 0, maxMs: 0 } });
   assert.equal(reportModelFramePressure(0.12, true), 2200);
   const pressure = modelLoadingStats().pressure;
   assert.equal(pressure.paused, true); assert.ok(pressure.remainingMs > 2000 && pressure.remainingMs <= 2200);
@@ -38,4 +49,20 @@ test('skips disabled heavyweight models without queueing or fetching them', asyn
   assert.equal(stats.ready, 0);
   assert.equal(stats.queued, 1);
   assert.equal(stats.skipped, 1);
+});
+
+test('instanced fish preparation waits for the actual draw family without disposing shared assets', async () => {
+  const geometry = new THREE.BoxGeometry(), material = new THREE.MeshStandardMaterial();
+  let disposedAssets = 0, disposedInstances = 0, release, observed = false;
+  geometry.addEventListener('dispose', () => disposedAssets++); material.addEventListener('dispose', () => disposedAssets++);
+  const ready = new Promise(resolve => { release = resolve; });
+  const preparing = prepareInstancedModelForSwap(async (object, name) => {
+    observed = true; assert.equal(name, 'fish_a:instanced'); assert.equal(object.isInstancedMesh, true);
+    assert.equal(object.count, 1); assert.equal(object.geometry, geometry); assert.equal(object.material, material);
+    object.addEventListener('dispose', () => disposedInstances++); await ready;
+  }, geometry, material, 'fish_a:instanced');
+  assert.equal(observed, true); assert.equal(disposedInstances, 0);
+  release(); const result = await preparing;
+  assert.equal(result.completed, true); assert.equal(disposedInstances, 1); assert.equal(disposedAssets, 0);
+  geometry.dispose(); material.dispose();
 });

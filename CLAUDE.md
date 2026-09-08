@@ -18,24 +18,33 @@ Rendering / world (the hot path):
 - `heightfield.js` — the terrain function. **Plain JS, no three.js import**: the main thread and the
   `terrain.worker.js` pool evaluate the same code. Never import three (or anything DOM-touching) here.
 - `terrain.js` — quadtree streaming: 100 m level-0 chunks out to 3200 m tiles, 7.2 km radius. Workers return
-  height/normal/biome grids; the main thread turns them into geometry inside a 4 ms/frame budget.
+  height/normal/biome grids; the main thread turns them into geometry inside a per-tier frame budget.
   Level-0 chunks keep their height grid after build (physics samples it); higher levels drop theirs.
 - `vegetation.js` — per-chunk instanced foliage, built by a generator that yields per 100 m cell.
   Instances are compact attributes (float3 position, snorm16 quaternion, half-float scale/colour/crown).
 - `water.js` — reflection pass, wake heightfield sim (ping-pong RT, resolution set by the quality profile),
   murk map, tide. `waveHeight(x,z,t)` is the one analytic surface: renderer, boat physics and every floating
-  prop read the same function.
+  prop read the same function — `waterwaves.js` holds its frozen coefficients, which the surface shader also
+  evaluates (never add a second swell field). `watergrid.js` builds the ringed surface mesh; `vesselwakesurface.js`
+  feeds retained powered hulls to the wake shader; `shorefoam.js` sets foam response; `hullsurface.js` samples
+  the surface under small hulls for buoyancy.
 - `sky.js`, `environment.js` — procedural sky; clock, weather, lunar/tide state (persisted in the save).
 - `post.js` — HDR pipeline: MSAA scene RT → composite (+water/fx overlays) → bloom → grade (fog/ACES) →
   FXAA → DoF+sharpen; bloom and the final pass switch off at the lower quality tiers (`setQuality`).
 - `renderquality.js` — the quality system: `QUALITY_PROFILES` (fallback → cinematic; pixel budget, DPR cap,
-  MSAA, shadow size, reflection scale/interval/mipmaps, bloom/final toggles), hardware-signal initial tier
+  MSAA, shadow size, reflection scale/interval/mipmaps, wake sim resolution/stamps, mist/lens/firefly
+  budgets, minimap cache, bloom/final toggles), hardware-signal initial tier
   (`initialQualityLevel` + `gpuQualityCeiling` from the WebGL renderer string), and the runtime
   `AdaptiveQualityController` (windowed frame sampling with cooldowns). `displaysettings.js` persists the
   player's auto/pinned preference (title-screen "graphics" action, key `emeraldBayou.renderQuality`);
   `startup.js` maps the tier to a loading plan (blocking models, warm-up on/off, terrain-readiness gates).
 - `particles.js` — Spray/Plume ring buffers; `models.js` — GLB cache with a deferred queue (low tiers trickle
   optional models in idle time); `textures.js` — canvas-generated textures.
+- `scenelightpool.js` — the fixed pool of proxy point/spot lights gameplay lamps bind to (three.js bakes light
+  counts into programs, so the visible count never changes); `lightshader.js` patches three's light loops to
+  skip zero-radiance lights; `particlelighting.js` — shared sun/sky/spotlight uniforms for spray and mist.
+- `renderersize.js` — single drawing-surface resize (`setPixelRatio` + `setSize` collapse to one canvas reset);
+  `staticinstances.js` — collapses a static GLB subtree's identical meshes into one InstancedMesh.
 
 Gameplay (all orchestrated from `main.js` `init()`): `game.js` (missions, save, HUD), `story.js`,
 `encounters.js`, `incidents.js`, `aftermath.js`, `contracts.js` (events), `life.js` + `residents.js` +
@@ -44,7 +53,8 @@ chases), `reputation.js`, `radio.js`, `condition.js`, `regions.js`, `currents.js
 `stormline.js`/`stormhazards.js`, `wakeconduct.js` (wake-violation escalation), `discoveries.js` (rare
 finds), `navigationaids.js` (channel markers) + `navigationrules.js` (sound-signal geometry),
 `racecourse.js` + `raceformats.js` (races), `fishing.js` (catch-and-release), `dolphins.js`,
-`nocturnal.js` (fireflies), `trafficresponse.js` (how traffic yields to pursuits),
+`pelicans.js` + `egrets.js` (authored GLB birds), `nocturnal.js` (fireflies),
+`trafficresponse.js` (how traffic yields to pursuits),
 `wakestamps.js` (pooled stamps). `cache.js` holds the shared cell-trim / attribute-prefix helpers.
 `hud.js` is the radar; `worldmap.js` the Tab chart — both are 2D canvases fed by worker-rendered tiles.
 
@@ -88,7 +98,7 @@ finds), `navigationaids.js` (channel markers) + `navigationrules.js` (sound-sign
 - Spray/Plume keep their live particles packed in [0, count): dead ones are swap-removed, the draw range
   tracks `count`, and only the live prefix of each attribute uploads (`updateAttributePrefix` in `cache.js`).
   Preserve the compaction if you touch their buffers — cost must stay bounded by live particles, not capacity.
-- Heavy work streams: terrain finalize has a 4 ms budget, vegetation yields per cell, the radar redraws at
+- Heavy work streams: terrain finalize has a per-tier budget (4 ms at cinematic), vegetation yields per cell, the radar redraws at
   30 Hz and the chart at 15 Hz (`frameNo` cadence in `main.js`). Match that pattern for new systems.
 - Quality tiers own every screen-space budget: the initial tier comes from hardware signals at boot, the
   `AdaptiveQualityController` steps it at runtime after sustained missed budgets, and every change funnels
