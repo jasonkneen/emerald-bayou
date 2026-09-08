@@ -24,7 +24,10 @@ Rendering / world (the hot path):
   Instances are compact attributes (float3 position, snorm16 quaternion, half-float scale/colour/crown).
 - `water.js` — reflection pass, wake heightfield sim (ping-pong RT, resolution set by the quality profile),
   murk map, tide. `waveHeight(x,z,t)` is the one analytic surface: renderer, boat physics and every floating
-  prop read the same function.
+  prop read the same function — `waterwaves.js` holds its frozen coefficients, which the surface shader also
+  evaluates (never add a second swell field). `watergrid.js` builds the ringed surface mesh; `vesselwakesurface.js`
+  feeds retained powered hulls to the wake shader; `shorefoam.js` sets foam response; `hullsurface.js` samples
+  the surface under small hulls for buoyancy.
 - `sky.js`, `environment.js` — procedural sky; clock, weather, lunar/tide state (persisted in the save).
 - `post.js` — HDR pipeline: MSAA scene RT → composite (+water/fx overlays) → bloom → grade (fog/ACES) →
   FXAA → DoF+sharpen; bloom and the final pass switch off at the lower quality tiers (`setQuality`).
@@ -50,7 +53,7 @@ chases), `reputation.js`, `radio.js`, `condition.js`, `regions.js`, `currents.js
 `stormline.js`/`stormhazards.js`, `wakeconduct.js` (wake-violation escalation), `discoveries.js` (rare
 finds), `navigationaids.js` (channel markers) + `navigationrules.js` (sound-signal geometry),
 `racecourse.js` + `raceformats.js` (races), `fishing.js` (catch-and-release), `dolphins.js`,
-`pelicans.js` (flocks with an authored GLB flight pose), `nocturnal.js` (fireflies),
+`pelicans.js` + `egrets.js` (authored GLB birds), `nocturnal.js` (fireflies),
 `trafficresponse.js` (how traffic yields to pursuits),
 `wakestamps.js` (pooled stamps). `cache.js` holds the shared cell-trim / attribute-prefix helpers.
 `hud.js` is the radar; `worldmap.js` the Tab chart — both are 2D canvases fed by worker-rendered tiles.
