@@ -9,9 +9,14 @@ export function clampWakeHeight(height, maxHeight = MAX_COMBINED_WAKE_HEIGHT) {
 
 export function wakeSampleAt(sx, sz, heading, speed, maxSpeed, scale, x, z, t) {
   const strength = Math.max(0, Math.min(1, (speed - 2.2) / Math.max(1, maxSpeed - 2.2))); if (strength <= 0) return 0;
-  const fx = -Math.sin(heading), fz = -Math.cos(heading), rx = -Math.cos(heading), rz = Math.sin(heading);
-  const dx = x - sx, dz = z - sz, aft = -(dx * fx + dz * fz); if (aft < 1.5 || aft > 95) return 0;
-  const lateral = Math.abs(dx * rx + dz * rz), arm = 1.1 + aft * 0.34, width = 0.7 + aft * 0.025;
+  return wakeSampleFromPose(sx, sz, Math.sin(heading), Math.cos(heading), strength, scale, x, z, t);
+}
+
+// The rendering snapshot already retains heading sine/cosine and speed fraction. Sampling those values avoids
+// recalculating them for every bow/stern/beam probe, while keeping one CPU definition of the physical wake.
+export function wakeSampleFromPose(sx, sz, sh, ch, strength, scale, x, z, t) {
+  const dx = x - sx, dz = z - sz, aft = dx * sh + dz * ch; if (aft < 1.5 || aft > 95) return 0;
+  const lateral = Math.abs(-dx * ch + dz * sh), arm = 1.1 + aft * 0.34, width = 0.7 + aft * 0.025;
   const edge = Math.abs(lateral - arm), ridge = Math.exp(-(edge * edge) / (width * width));
   const centerWidth = 1.4 + aft * 0.055, trough = Math.exp(-(lateral * lateral) / (centerWidth * centerWidth));
   if (ridge < 0.002 && trough < 0.002) return 0;
@@ -21,6 +26,13 @@ export function wakeSampleAt(sx, sz, heading, speed, maxSpeed, scale, x, z, t) {
 
 export function trafficWakeScale(kind) {
   return kind === 'air' ? 0.18 : kind === 'cruiser' ? 0.13 : 0.105;
+}
+
+export function playerWakeScale(player) {
+  // The airborne hull cannot keep pushing a travelling wake through the boats beneath it. Match the contact
+  // fraction already used by the player's wash stamps, retaining full contact for older callers without telemetry.
+  const wet = Number.isFinite(player.wet) ? Math.max(0, Math.min(1, player.wet)) : 1;
+  return 0.22 * wet;
 }
 
 // Mission, police, race, story, and recovery craft already live in small retained agent pools. Sampling those

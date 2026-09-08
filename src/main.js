@@ -227,8 +227,9 @@ async function init() {
   const birds = new Birds(terrain, new THREE.Vector3(startX, 0, startZ - 120));
   scene.add(birds.mesh);
   birds.loadPelicans(root => prepareRenderShaders(renderer, camera, scene, root, sceneShaderTarget));
-  const waders = new Waders(terrain, 16, startX, startZ - 60);
-  for (const w of waders.list) scene.add(w.mesh);
+  const waders = new Waders(terrain, 16, startX, startZ - 60, water.level);
+  scene.add(waders.group);
+  waders.loadEgrets(root => prepareRenderShaders(renderer, camera, scene, root, sceneShaderTarget));
   const manatees = new Manatees(terrain, 4, new THREE.Vector3(startX, 0, startZ));
   for (const m of manatees.list) scene.add(m.mesh);
   const gators = new Gators(terrain, 18);
@@ -263,7 +264,7 @@ async function init() {
   const minimap = new Minimap(terrain, renderProfile);
   const audio = new EngineAudio();
   const tricks = new Tricks(phys);
-  const skiff = new SkiffAI((x, z, t) => water.waveHeight(x, z, t)); skiff.mesh.visible = false; scene.add(skiff.mesh);
+  const skiff = new SkiffAI((x, z, t, receiver) => water.boatWaveHeight(x, z, t, receiver)); skiff.mesh.visible = false; scene.add(skiff.mesh);
   const world = new World(terrain, scene, (x, z, t) => water.waveHeight(x, z, t)); world.phys = phys; world.wind = wind;
   veg.blocked = (x, z) => world.blockedAt(x, z);
   const game = new Game({ phys, T: terrain, scene, audio, tricks, manatees, gators, skiff, boat: boat.group, dockTie, startX, startZ, world });
@@ -276,7 +277,8 @@ async function init() {
   const terrainRetarget = terrainFocus.retargeted ? terrain.prime(terrainFocus.x, terrainFocus.z) : null;
   const worldMap = new WorldMap(terrain, minimap, game, world); game.map = worldMap;
   // the small life: fish, deadheads, other boats, anglers; birds and gators get their voices and their hooks into the game
-  const life = new Life({ terrain, scene, water, camera, phys, plume, spray, audio, waveFn: (x, z, t) => water.waveHeight(x, z, t), game }); game.life = life;
+  const life = new Life({ terrain, scene, water, camera, phys, plume, spray, audio, waveFn: (x, z, t) => water.waveHeight(x, z, t),
+    boatWaveFn: (x, z, t, receiver) => water.boatWaveHeight(x, z, t, receiver), game }); game.life = life;
   markStartup('livingWorldReadyMs');
   life.traffic.setWildlife({ manatees, gators, waders });
   const physicalWakeFields = [life.traffic];
@@ -322,6 +324,7 @@ async function init() {
   const outboardMix = { id: '', level: 0, pitch: 1, x: 0, z: 0 };
   const directedVesselSources = [skiff, encounters, incidents, story, aftermath];
   physicalWakeFields.push(...directedVesselSources);
+  water.vesselWakes.sources = { traffic: life.traffic, skiff, encounters, incidents, story, aftermath, player: phys };
   ecology.setDirectedVesselSources(directedVesselSources);
   const directedNavigationLights = new DirectedNavigationLights(scene);
   const discoveries = new FieldDiscoveryDirector({ scene, terrain, world, water, phys, game, audio, environment, regions, life, law, reputation, encounters, incidents, story, aftermath, radio });
@@ -381,7 +384,7 @@ async function init() {
     vegetation: veg.resourceStats(),
     minimap: minimap.memoryStats(),
     wildlife: {
-      waders: debugTreeResources(waders.list.map(w => w.mesh)),
+      waders: debugTreeResources([waders.group]),
       manatees: debugTreeResources(manatees.list.map(m => m.mesh)),
       gators: { ...debugTreeResources(gators.list.map(g => g.mesh)), ...gators.resourceStats() },
       dolphins: dolphins.resourceStats(),
@@ -615,20 +618,15 @@ async function init() {
     }, Math.max(0, Number(delayMs) || 0));
     return true;
   };
-  const cashLabel = value => '$' + Math.round(value).toLocaleString('en-US');
   const renderTitle = () => {
-    const progress = game.hasProgress(), region = regionAt(phys.pos.x, phys.pos.y), resetArmed = game.newGameArmed();
-    titlePrimary.querySelector('.action-name').textContent = progress ? 'Continue' : 'Ride out';
-    document.getElementById('titleContinueDetail').textContent = game.state
-      ? `${game.state.m.title} paused · ${region.name}`
-      : `${region.name} · day ${environment.day}, ${environment.clockLabel()} · ${cashLabel(game.save.cash)}`;
-    document.getElementById('titleJobsDetail').textContent = `${game.save.done.length} / ${game.missions.length} jobs finished · ${game.story?.menuLine() || 'Running Dark not started'}`;
-    document.getElementById('titleGraphicsDetail').textContent = qualityPreferenceLabel(qualityPreference, renderProfile.id);
-    document.getElementById('titleWorldDetail').textContent = `Day ${environment.day} · ${environment.weatherLabel()} · ${environment.tideLabel()}`;
+    const progress = game.hasProgress(), resetArmed = game.newGameArmed();
+    titlePrimary.querySelector('.action-name').textContent = progress ? 'Continue' : 'Play';
+    document.getElementById('titleGraphicsDetail').textContent = qualityPreference === 'auto' ? 'Auto' : renderProfile.label;
+    startEl.querySelector('[data-title-action="graphics"]').setAttribute('aria-label', `Graphics: ${qualityPreferenceLabel(qualityPreference, renderProfile.id)}`);
     titleNew.hidden = !progress;
     titleNew.classList.toggle('danger', resetArmed);
-    titleNew.querySelector('.action-name').textContent = resetArmed ? 'Confirm new game' : 'New game';
-    titleNew.querySelector('.action-detail').textContent = resetArmed ? 'Select again now to clear jobs, cash, records and world history' : 'Clear this hull and return to the tower dock';
+    titleNew.querySelector('.action-name').textContent = resetArmed ? 'Delete save?' : 'New game';
+    titleNew.setAttribute('aria-label', resetArmed ? 'Delete save? Select again to clear jobs, cash, records and world history.' : 'New game');
   };
   const cycleRenderQuality = () => {
     qualityPreference = writeQualityPreference(nextQualityPreference(qualityPreference));
@@ -707,6 +705,17 @@ async function init() {
     const current = options.indexOf(document.activeElement), next = current < 0 ? 0 : (current + options.length + direction) % options.length;
     options[next].focus({ preventScroll: true }); return true;
   };
+  startEl.addEventListener('pointerover', event => {
+    const option = event.target.closest('[data-title-action]');
+    if (option && !option.hidden) option.focus({ preventScroll: true });
+  });
+  window.addEventListener('keydown', event => {
+    if (started || startEl.classList.contains('hidden')) return;
+    if (event.code === 'ArrowDown' || event.code === 'ArrowUp') {
+      keys[event.code] = false;
+      moveTitleFocus(event.code === 'ArrowDown' ? 1 : -1); event.preventDefault();
+    }
+  });
   controller = new StandardGamepadInput({
     onUse: () => setInputMode('gamepad'),
     onDisconnect: () => { if (activeInputMode === 'gamepad') setInputMode('keyboard'); },
@@ -967,7 +976,7 @@ async function init() {
     birds.update(time, camera.position, dt);
     manatees.update(dt, time, phys.pos.x, phys.pos.y);
     gators.update(dt, time, phys.pos.x, phys.pos.y, phys.speed, phys.heading, environment.spotOn, environment.night, environment.restrictedVisibility, environment.values.storm, environment.waterLevel);
-    waders.update(dt, time, phys.pos.x, phys.pos.y, phys.speed);
+    waders.update(started && !game.paused ? dt : 0, time, phys.pos.x, phys.pos.y, phys.speed, environment.waterLevel);
     world.update(dt, time, phys.pos.x, phys.pos.y);
     // Do not start resident shifts or write their first-seen state while the title card is still open.
     if (started && !game.paused) life.update(dt, time);
@@ -979,7 +988,8 @@ async function init() {
     frameNo++; // cadence divider for the canvas HUDs (radar every 2nd frame, open chart every 4th)
     if (worldMap.open && (frameNo & 3) === 0) worldMap.render();
     water.update(time);
-    water.mesh.position.set(Math.round(camera.position.x / 50) * 50, water.level, Math.round(camera.position.z / 50) * 50);
+    water.followCamera(camera.position);
+    water.vesselWakes.update(camera.position, started);
 
     // wake stamps
     const wet = phys.wet;

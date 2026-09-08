@@ -1,6 +1,10 @@
 import * as THREE from 'three';
 import * as TEX from './textures.js';
 import { createSpotlightUniforms, SPOTLIGHT_FALLOFF_GLSL } from './particlelighting.js';
+import { SHORE_FOAM_GLSL } from './shorefoam.js';
+import { createWaterGrid } from './watergrid.js';
+import { waterWaveHeight, WATER_WAVES_GLSL } from './waterwaves.js';
+import { VesselWakeSurface, VESSEL_WAKE_GLSL } from './vesselwakesurface.js';
 
 export const MAX_WAKE_STAMPS = 20;
 const MURK_SIZE = 2400, MURK_PX = 240; // 10 m per texel
@@ -25,6 +29,7 @@ export class Water {
     this.hail = 0;
     this.windSpeed = 0;
     this.dormant = false;
+    this.vesselWakes = new VesselWakeSurface();
 
     // ---- reflection ----
     this.reflRT = new THREE.WebGLRenderTarget(Math.max(1, Math.floor(this.size.x * this.reflectionScale)), Math.max(1, Math.floor(this.size.y * this.reflectionScale)), {
@@ -87,6 +92,7 @@ export class Water {
 
     // ---- water surface ----
     this.uniforms = {
+      ...this.vesselWakes.uniforms,
       ...createSpotlightUniforms(),
       tRefr: { value: null }, tDepth: { value: null }, tRefl: { value: this.reflRT.texture },
       tNormal: { value: TEX.waterNormal() }, tFoam: { value: TEX.foam() }, tWake: { value: this.wakeA.texture },
@@ -100,6 +106,7 @@ export class Water {
       wakeOrigin: { value: this.wakeOrigin }, wakeSize: { value: WAKE_SIZE }, wakeTexel: { value: 1 / this.wakeResolution },
       rippleStrength: { value: 0.16 }, wakeStrength: { value: 6.0 }, dbg: { value: 0 },
       seaState: { value: 0 }, weatherWind: { value: new THREE.Vector2(1, 0) },
+      surfaceDisplacement: { value: 1 },
       rainAmount: { value: 0 }, hailAmount: { value: 0 }, precipitationRipples: { value: Math.max(0, Math.min(1, quality.precipitationRipples ?? 1)) },
       bioluminescence: { value: 0 }, bioColor: { value: new THREE.Color().setRGB(0.015, 0.38, 0.92) },
       tShadow: { value: null }, shadowMatrix: { value: new THREE.Matrix4() }, shadowTexel: { value: 1 / 4096 }, shadowOn: { value: 0 },
@@ -114,9 +121,19 @@ export class Water {
       uniforms: this.uniforms,
       vertexShader: `
         uniform mat4 reflMatrix;
+        uniform float uTime, seaState, rainAmount, surfaceDisplacement;
+        uniform vec2 weatherWind;
+        attribute float aWaveSpacing;
+        ${WATER_WAVES_GLSL}
+        ${VESSEL_WAKE_GLSL}
         varying vec3 vWorld; varying vec4 vRefl;
+        varying vec2 vWaveSlope;
         void main() {
           vec4 wp = modelMatrix * vec4(position, 1.0);
+          vec3 wave = waterWaveSample(wp.xz, uTime, seaState, weatherWind, rainAmount, aWaveSpacing) * surfaceDisplacement;
+          wave += vesselWakeSample(wp.xz, uTime, aWaveSpacing) * surfaceDisplacement;
+          wp.y += wave.x;
+          vWaveSlope = wave.yz;
           vWorld = wp.xyz;
           vRefl = reflMatrix * wp;
           gl_Position = projectionMatrix * viewMatrix * wp;
@@ -124,6 +141,7 @@ export class Water {
       fragmentShader: `
         precision highp float;
         ${SPOTLIGHT_FALLOFF_GLSL}
+        ${SHORE_FOAM_GLSL}
         uniform vec3 particleSpotColor;
         uniform sampler2D tRefr, tDepth, tRefl, tNormal, tFoam, tWake;
         uniform vec2 resolution; uniform float near, far, uTime;
@@ -134,6 +152,7 @@ export class Water {
         uniform sampler2DShadow tShadow; uniform mat4 shadowMatrix; uniform float shadowTexel, shadowOn, sunIntensity;
         uniform sampler2D tMurk; uniform vec2 murkOrigin; uniform float murkSize;
         varying vec3 vWorld; varying vec4 vRefl;
+        varying vec2 vWaveSlope;
         float linZ(float d) { float z = d * 2.0 - 1.0; return 2.0 * near * far / (far + near - z * (far - near)); }
         float ign(vec2 p) { return fract(52.9829189 * fract(0.06711056 * p.x + 0.00583715 * p.y)); }
         vec2 hash22(vec2 p) {
@@ -233,7 +252,7 @@ export class Water {
             float f = ef.x * ef.y; wg *= f; foam *= f; sediment *= f;
           }
           float silt = smoothstep(0.015, 0.68, sediment);
-          vec3 N = normalize(vec3(nt.x - wg.x, 1.0, nt.y - wg.y));
+          vec3 N = normalize(vec3(nt.x - wg.x - vWaveSlope.x, 1.0, nt.y - wg.y - vWaveSlope.y));
           // depth / thickness
           float fragZ = linZ(gl_FragCoord.z);
           float sceneZ = linZ(texture2D(tDepth, suv).r);
@@ -257,7 +276,12 @@ export class Water {
           vec3 scat = scCol * (1.0 - exp(-scK * pathLen));
           vec3 waterCol = under + scat;
           // reflection
-          vec4 rp = vRefl; rp.xy += N.xz * vec2(0.9, 0.9) * rp.w * (0.5 + 0.5 * distFade);
+          // Strong wash used to offset the reflection by most of the screen, stretching dark hulls into long bands.
+          // Keep ordinary ripple distortion unchanged while bounding this screen-space approximation's footprint.
+          vec4 rp = vRefl;
+          vec2 reflectionOffset = N.xz * 0.9 * (0.5 + 0.5 * distFade);
+          reflectionOffset *= 0.035 / max(0.035, length(reflectionOffset));
+          rp.xy += reflectionOffset * rp.w;
           vec2 rUv = rp.xy / rp.w;
           rUv = clamp(rUv, vec2(0.002), vec2(0.998));
           vec3 refl = texture2D(tRefl, rUv, 1.6 + (1.0 - distFade) * 1.5).rgb;
@@ -299,7 +323,7 @@ export class Water {
           float k = rough * 0.5; float G = (NdV / (NdV * (1.0 - k) + k)) * (NdL / (NdL * (1.0 - k) + k));
           vec3 spec = sunColor * sunIntensity * D * Fs * G / max(4.0 * NdV * NdL, 0.08) * NdL;
           spec = min(spec, vec3(8.0));
-          vec3 Nf = normalize(vec3(nt.x * 2.2 + (n3.x + n4.x) * 0.25 * rippleStrength * distFade, 1.0, nt.y * 2.2 + (n3.y + n4.y) * 0.25 * rippleStrength * distFade));
+          vec3 Nf = normalize(vec3(nt.x * 2.2 + (n3.x + n4.x) * 0.25 * rippleStrength * distFade - vWaveSlope.x, 1.0, nt.y * 2.2 + (n3.y + n4.y) * 0.25 * rippleStrength * distFade - vWaveSlope.y));
           float sparkle = pow(max(dot(Nf, H), 0.0), 1400.0) * 5.0 * distFade;
           spec += sunColor * sunIntensity * sparkle;
           spec *= shadow * (1.0 - dw);
@@ -312,13 +336,25 @@ export class Water {
           }
           // foam
           float fmRaw = clamp(foam, 0.0, 1.0);
+          // Shallow depth alone must not paint a white outline around every bank, trunk and wading leg. These wake
+          // inputs already fade at the simulation boundary; the wind response follows the existing sheltered-water map.
+          float shoreSlope = length(wg);
+          float shoreShelter = max(duck, murk * 0.65);
+          float shorePotential = shoreFoamDrive(seaState, fmRaw, shoreSlope, 1.0, shoreShelter);
           float fn = 0.0, fn2 = 0.0, shore = 0.0, fm = 0.0;
           // The normalized foam texture cannot exceed 1. Below this conservative bound its shaped wake term is zero.
           // Shore foam, storm caps and blue fire still use the complete original texture detail when they can appear.
-          if (fmRaw * ${FOAM_NOISE_SHAPE.maximum} > ${FOAM_NOISE_SHAPE.edge} || th < 0.55 || seaState > 0.45 || bioluminescence > 0.0) {
+          if (fmRaw * ${FOAM_NOISE_SHAPE.maximum} > ${FOAM_NOISE_SHAPE.edge} || (th < 0.55 && shorePotential > 0.0) || seaState > 0.45 || bioluminescence > 0.0) {
             fn = textureGrad(tFoam, w * 0.55 + vec2(t * 0.03, -t * 0.02), waterDx * 0.55, waterDy * 0.55).r;
             fn2 = textureGrad(tFoam, w * 1.7 - vec2(t * 0.05, t * 0.04), waterDx * 1.7, waterDy * 1.7).r;
-            shore = (1.0 - smoothstep(0.0, 0.55, th)) * smoothstep(0.35, 0.75, fn * 0.7 + fn2 * 0.5) * 0.6;
+            if (th < 0.55 && shorePotential > 0.0) {
+              // A travelling crest leaves broken wash, with quiet gaps between arrivals. Boat wash can still foam in
+              // a sheltered calm cut, independently of wind. Reuse both existing foam samples and the wake gradient.
+              float crestPhase = dot(w, weatherWind) * 0.28 - t * (1.1 + min(seaState, 2.5) * 0.35) + fn * 0.9;
+              float crest = smoothstep(0.25, 0.88, sin(crestPhase) * 0.5 + 0.5);
+              float shoreDrive = shoreFoamDrive(seaState, fmRaw, shoreSlope, crest, shoreShelter);
+              shore = (1.0 - smoothstep(0.0, 0.55, th)) * smoothstep(0.35, 0.75, fn * 0.7 + fn2 * 0.5) * 0.6 * shoreDrive;
+            }
             fm = smoothstep(${FOAM_NOISE_SHAPE.edge}, 0.85, fmRaw * (${FOAM_NOISE_SHAPE.base} + ${FOAM_NOISE_SHAPE.coarse} * fn + ${FOAM_NOISE_SHAPE.fine} * fn2)) * (0.75 + 0.25 * fn2) + shore;
             if (seaState > 0.45) {
               float capNoise = textureGrad(tFoam, w * 0.045 - weatherWind * t * 0.035, waterDx * 0.045, waterDy * 0.045).r * 0.7
@@ -343,8 +379,7 @@ export class Water {
         }`,
     });
     this.material = mat;
-    const geo = new THREE.PlaneGeometry(16000, 16000, 1, 1); // follows the camera; must reach past the far plane
-    geo.rotateX(-Math.PI / 2);
+    const geo = createWaterGrid();
     this.mesh = new THREE.Mesh(geo, mat);
     this.mesh.frustumCulled = false;
     this.mesh.name = 'water';
@@ -416,6 +451,9 @@ export class Water {
       width, height, pixels, dormant: this.dormant, mipmaps: this.reflectionMipmaps, reflectionAttachmentBytes,
       wakeResolution: this.wakeResolution, wakeWidth, wakeHeight, wakeMaxStamps: this.wakeMaxStamps, wakeAttachmentBytes,
       precipitationRipples: this.uniforms.precipitationRipples.value,
+      surface: { ...this.mesh.geometry.userData.waterGrid },
+      vesselWakeSources: this.vesselWakes.count, vesselWakeOverflow: this.vesselWakes.overflow,
+      vesselWakeUniformBytes: this.vesselWakes.pose.byteLength + this.vesselWakes.motion.byteLength,
       estimatedAttachmentBytes: reflectionAttachmentBytes + wakeAttachmentBytes,
     };
   }
@@ -423,13 +461,17 @@ export class Water {
   waveHeight(x, z, t) {
     // The same surface drives the render, every boat and every floating prop. Weather adds long wind swell beneath
     // the short chop; tide raises the actual support plane instead of faking a colour change at the shore.
-    const ca = Math.cos(this.windAngle), sa = Math.sin(this.windAngle);
-    const along = x * ca + z * sa, across = -x * sa + z * ca;
-    const sea = this.seaState;
-    const ambient = 0.04 * Math.sin(x * 0.18 + t * 0.9) * Math.cos(z * 0.15 + t * 0.7) + 0.025 * Math.sin(x * 0.4 - t * 1.3 + z * 0.3);
-    const swell = sea * 0.105 * Math.sin(along * 0.042 - t * (0.62 + sea * 0.12)) * (0.72 + 0.28 * Math.cos(across * 0.018 + t * 0.21));
-    const chop = sea * 0.038 * Math.sin(along * 0.24 - t * 1.8 + Math.sin(across * 0.11)) + this.rain * 0.012 * Math.sin(x * 1.7 + z * 1.3 + t * 5.2);
-    return this.level + ambient + swell + chop;
+    return this.level + waterWaveHeight(x, z, t, this.seaState, this.windAngle, this.rain);
+  }
+
+  boatWaveHeight(x, z, t, receiver = null) {
+    return this.waveHeight(x, z, t) + this.vesselWakes.heightAt(x, z, t, receiver);
+  }
+
+  followCamera(camera) {
+    // Keep the dense patch on a world-space half-metre lattice. Moving the camera does not scroll the wave phase or
+    // replace any vertex buffer, and the previous 50 m recenter jumps cannot cross the near-water patch.
+    this.mesh.position.set(Math.round(camera.x * 2) * 0.5, this.level, Math.round(camera.z * 2) * 0.5);
   }
 
   setConditions({ level = this.level, seaState = this.seaState, windAngle = this.windAngle, rain = this.rain, hail = this.hail, wind = this.windSpeed } = {}) {
